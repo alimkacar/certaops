@@ -1,0 +1,35 @@
+.env*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+build/
+output/
+*.log
+.DS_Store
+*.sqlite
+*.sqlite3
+*.pem
+*.key
+*.p12
+
+# Kalici durum: onay kayitlari, idempotency, oturum ve audit defteri.
+# Isletme verisidir; versiyon kontrolune girmez.
+state/
+
+# Gercek principal katalogu (token hash'leri). Ornek:
+# config/principals.example.json
+config/principals.json
+
+# Performans kapisi ciktilari
+perf.json
+schema-budget.txt

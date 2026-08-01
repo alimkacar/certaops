@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Kirpilmis $metadata: API_PRODUCT_SRV (OData V2). -->
+<edmx:Edmx Version="1.0" xmlns:edmx="http://schemas.microsoft.com/ado/2007/06/edmx">
+  <edmx:DataServices xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata" m:DataServiceVersion="2.0">
+    <Schema Namespace="API_PRODUCT_SRV" xmlns="http://schemas.microsoft.com/ado/2008/09/edm">
+      <EntityType Name="A_ProductType">
+        <Key><PropertyRef Name="Product"/></Key>
+        <Property Name="Product" Type="Edm.String" MaxLength="40"/>
+        <Property Name="ProductType" Type="Edm.String" MaxLength="4"/>
+        <Property Name="ProductGroup" Type="Edm.String" MaxLength="9"/>
+        <Property Name="BaseUnit" Type="Edm.String" MaxLength="3"/>
+        <Property Name="GrossWeight" Type="Edm.Decimal"/>
+        <NavigationProperty Name="to_Description" Relationship="API_PRODUCT_SRV.assoc_Desc"/>
+        <NavigationProperty Name="to_Plant" Relationship="API_PRODUCT_SRV.assoc_Plant"/>
+      </EntityType>
+      <EntityType Name="A_ProductDescriptionType">
+        <Key><PropertyRef Name="Product"/><PropertyRef Name="Language"/></Key>
+        <Property Name="Product" Type="Edm.String" MaxLength="40"/>
+        <Property Name="Language" Type="Edm.String" MaxLength="2"/>
+        <Property Name="ProductDescription" Type="Edm.String" MaxLength="40"/>
+      </EntityType>
+      <EntityType Name="A_ProductPlantType">
+        <Key><PropertyRef Name="Product"/><PropertyRef Name="Plant"/></Key>
+        <Property Name="Product" Type="Edm.String" MaxLength="40"/>
+        <Property Name="Plant" Type="Edm.String" MaxLength="4"/>
+        <Property Name="ProcurementType" Type="Edm.String" MaxLength="1"/>
+        <Property Name="PlndDelryDurnInDays" Type="Edm.Decimal"/>
+        <Property Name="MRPController" Type="Edm.String" MaxLength="3"/>
+        <Property Name="ABCIndicator" Type="Edm.String" MaxLength="1"/>
+        <Property Name="MinimumLotSizeQuantity" Type="Edm.Decimal"/>
+      </EntityType>
+      <EntityContainer Name="API_PRODUCT_SRV_Entities" m:IsDefaultEntityContainer="true">
+        <EntitySet Name="A_Product" EntityType="API_PRODUCT_SRV.A_ProductType"/>
+        <EntitySet Name="A_ProductDescription" EntityType="API_PRODUCT_SRV.A_ProductDescriptionType"/>
+        <EntitySet Name="A_ProductPlant" EntityType="API_PRODUCT_SRV.A_ProductPlantType"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

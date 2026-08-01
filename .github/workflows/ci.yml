@@ -1,0 +1,183 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+# Guvenlik: is akisi varsayilan olarak salt-okunur token kullanir.
+permissions:
+  contents: read
+
+env:
+  # CI hicbir kosulda gercek SAP'a yazmaz.
+  SAP_BACKEND: mock
+  SAP_DRY_RUN: "true"
+  APP_ENV: development
+  ANTHROPIC_API_KEY: sk-ci-not-used
+
+jobs:
+  quality:
+    name: Lint, tip ve test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Bagimliliklari kur
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,oidc]"
+
+      - name: Ruff (lint + import duzeni)
+        run: ruff check .
+
+      - name: Testler ve kapsam
+        run: |
+          pytest -q --cov --cov-report=term-missing --cov-report=xml
+
+      - name: Guvenlik, gizlilik ve eszamanlilik paketleri ayrica
+        # Bu paketler merge kapisidir: kirmizi ise PR birlestirilmez.
+        # tests/privacy: D0-D3 siniflandirmasi, DLP ve saklama politikasi.
+        run: pytest tests/policy tests/security tests/privacy tests/concurrency -q
+
+      - name: Demo dumani (API anahtari gerektirmez)
+        run: |
+          python demo.py > /dev/null
+          python demo.py --tokens > /dev/null
+          SAP_DRY_RUN=false python demo.py > /dev/null
+
+      - name: Paket kurulum dumani
+        run: |
+          python -m pip install --upgrade build
+          python -m build --wheel
+          pip install dist/*.whl --force-reinstall --no-deps
+          python -c "import certaops; print(certaops.__version__)"
+
+  security-scan:
+    name: Bagimlilik ve secret taramasi
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Kurulum
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e "." pip-audit
+
+      - name: Bilinen zafiyet taramasi (SCA)
+        run: pip-audit --strict --progress-spinner off
+
+      - name: SBOM uret
+        run: |
+          pip install cyclonedx-bom
+          cyclonedx-py environment -o sbom.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.json
+
+      - name: Secret taramasi
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  performance-gate:
+    name: Performans kapisi (token, SAP cagri, p95)
+    runs-on: ubuntu-latest
+    # Bu kapi basarisizsa production deploy yapilmaz.
+    #   - agent basina sema butcesi > 3.000 token  -> basarisiz
+    #   - tool sonucu bildirilen token butcesini asar -> basarisiz
+    #   - adapter SAP cagri butcesi asilir (N+1)  -> basarisiz
+    #   - salt okunur tool p95 hedefi asilir      -> basarisiz
+    #   - capraz-tenant cache/evidence sizintisi  -> basarisiz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Cache izolasyonu ve butce kapilari
+        run: pytest tests/performance -q
+
+      - name: Sema token butcesi
+        # `demo.py --tokens` butce asildiginda sifir disi kod doner.
+        # pipefail olmadan `tee` cikis kodunu yutar ve kapi sessizce yesil olur.
+        shell: bash
+        run: |
+          set -o pipefail
+          python demo.py --tokens | tee schema-budget.txt
+
+      - name: p95 gecikme benchmark'i
+        run: python scripts/perf_benchmark.py --json perf.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: performance-report
+          path: |
+            schema-budget.txt
+            perf.json
+
+  sap-contract:
+    name: SAP kontrat testleri (kaydedilmis $metadata)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Kontrat testleri
+        run: pytest tests/contract -q
+
+  sap-integration:
+    name: Gercek SAP quality tenant (manuel)
+    runs-on: ubuntu-latest
+    # Yalniz elle tetiklenir veya korumali bir ortamda calisir: gercek bir
+    # sisteme baglanir ve (ALLOW_WRITE ile) belge olusturabilir.
+    if: github.event_name == 'workflow_dispatch'
+    environment: sap-quality
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,oidc]"
+      - name: Okuma ve kontrat testleri
+        env:
+          SAP_INTEGRATION_TESTS: "1"
+          SAP_BACKEND: odata
+          SAP_BASE_URL: ${{ secrets.SAP_BASE_URL }}
+          SAP_AUTH_MODE: oauth2
+          SAP_OAUTH_TOKEN_URL: ${{ secrets.SAP_OAUTH_TOKEN_URL }}
+          SAP_OAUTH_CLIENT_ID: ${{ secrets.SAP_OAUTH_CLIENT_ID }}
+          SAP_OAUTH_CLIENT_SECRET: ${{ secrets.SAP_OAUTH_CLIENT_SECRET }}
+          SAP_ALLOWED_HOSTS: ${{ secrets.SAP_ALLOWED_HOSTS }}
+          SAP_INTEGRATION_MATERIAL: ${{ vars.SAP_INTEGRATION_MATERIAL }}
+        run: pytest tests/integration -v

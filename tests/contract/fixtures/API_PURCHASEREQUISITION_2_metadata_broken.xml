@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Bilincli olarak eksik bir kontrat: WBSElement ve PurchaseRequisitionPrice yok,
+  PurchaseRequisition entity set'i hic yayinlanmamis. Kontrat testi bu farki
+  yakalamak zorunda; aksi halde gercek sistemde sessiz hataya donusur.
+-->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="broken" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="PurchaseRequisitionItemType">
+        <Key><PropertyRef Name="PurchaseRequisitionItem"/></Key>
+        <Property Name="PurchaseRequisition" Type="Edm.String"/>
+        <Property Name="PurchaseRequisitionItem" Type="Edm.String"/>
+        <Property Name="Material" Type="Edm.String"/>
+        <Property Name="Plant" Type="Edm.String"/>
+        <Property Name="RequestedQuantity" Type="Edm.Decimal"/>
+        <Property Name="DeliveryDate" Type="Edm.Date"/>
+      </EntityType>
+      <EntityContainer Name="Container">
+        <EntitySet Name="PurchaseRequisitionItem" EntityType="broken.PurchaseRequisitionItemType"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

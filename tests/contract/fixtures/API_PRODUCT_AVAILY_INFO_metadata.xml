@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Kirpilmis $metadata: Product Availability Information (gercek ATP, OData V4). -->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="com.sap.gateway.srvd_a2x.api_productavailyinfo.v0001"
+            xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="ProductAvailabilityInformationType">
+        <Key>
+          <PropertyRef Name="Product"/>
+          <PropertyRef Name="Plant"/>
+        </Key>
+        <Property Name="Product" Type="Edm.String" MaxLength="40"/>
+        <Property Name="Plant" Type="Edm.String" MaxLength="4"/>
+        <Property Name="RequestedQuantity" Type="Edm.Decimal"/>
+        <Property Name="RequestedDeliveryDate" Type="Edm.Date"/>
+        <Property Name="ConfirmedQuantity" Type="Edm.Decimal"/>
+        <Property Name="ConfirmedDeliveryDate" Type="Edm.Date"/>
+        <Property Name="AvailabilityCheckType" Type="Edm.String" MaxLength="2"/>
+        <Property Name="MaterialBaseUnit" Type="Edm.String" MaxLength="3"/>
+      </EntityType>
+      <EntityType Name="AvailabilitySituationType">
+        <Key><PropertyRef Name="Product"/></Key>
+        <Property Name="Product" Type="Edm.String" MaxLength="40"/>
+        <Property Name="Plant" Type="Edm.String" MaxLength="4"/>
+        <Property Name="AvailableQuantity" Type="Edm.Decimal"/>
+      </EntityType>
+      <EntityContainer Name="Container">
+        <EntitySet Name="ProductAvailabilityInformation" EntityType="com.sap.gateway.srvd_a2x.api_productavailyinfo.v0001.ProductAvailabilityInformationType"/>
+        <EntitySet Name="AvailabilitySituation" EntityType="com.sap.gateway.srvd_a2x.api_productavailyinfo.v0001.AvailabilitySituationType"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

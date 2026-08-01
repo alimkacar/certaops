@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Kirpilmis $metadata anlik goruntusu: api_purchaserequisition_2 (OData V4).
+  Kontrat testleri bu fixture'a karsi calisir; gercek sistemde
+  sap_discover_capabilities ayni dogrulamayi canli $metadata uzerinde yapar.
+-->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="com.sap.gateway.srvd_a2x.api_purchaserequisition_2.v0001"
+            xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="PurchaseRequisitionType">
+        <Key><PropertyRef Name="PurchaseRequisition"/></Key>
+        <Property Name="PurchaseRequisition" Type="Edm.String" MaxLength="10"/>
+        <Property Name="PurchaseRequisitionType" Type="Edm.String" MaxLength="4"/>
+        <Property Name="PurchaseRequisitionHeaderText" Type="Edm.String" MaxLength="40"/>
+        <Property Name="CreationDate" Type="Edm.Date"/>
+        <Property Name="CreatedByUser" Type="Edm.String" MaxLength="12"/>
+        <NavigationProperty Name="_PurchaseRequisitionItem" Type="Collection(PurchaseRequisitionItemType)"/>
+      </EntityType>
+      <EntityType Name="PurchaseRequisitionItemType">
+        <Key>
+          <PropertyRef Name="PurchaseRequisition"/>
+          <PropertyRef Name="PurchaseRequisitionItem"/>
+        </Key>
+        <Property Name="PurchaseRequisition" Type="Edm.String" MaxLength="10"/>
+        <Property Name="PurchaseRequisitionItem" Type="Edm.String" MaxLength="5"/>
+        <Property Name="Material" Type="Edm.String" MaxLength="40"/>
+        <Property Name="Plant" Type="Edm.String" MaxLength="4"/>
+        <Property Name="RequestedQuantity" Type="Edm.Decimal"/>
+        <Property Name="BaseUnit" Type="Edm.String" MaxLength="3"/>
+        <Property Name="DeliveryDate" Type="Edm.Date"/>
+        <Property Name="PurchaseRequisitionPrice" Type="Edm.Decimal"/>
+        <Property Name="PurReqnItemCurrency" Type="Edm.String" MaxLength="5"/>
+        <Property Name="PurchasingGroup" Type="Edm.String" MaxLength="3"/>
+        <Property Name="PurchasingOrganization" Type="Edm.String" MaxLength="4"/>
+        <Property Name="CompanyCode" Type="Edm.String" MaxLength="4"/>
+        <Property Name="FixedSupplier" Type="Edm.String" MaxLength="10"/>
+        <Property Name="PurchaseRequisitionItemText" Type="Edm.String" MaxLength="40"/>
+        <Property Name="WBSElement" Type="Edm.String" MaxLength="24"/>
+        <Property Name="CostCenter" Type="Edm.String" MaxLength="10"/>
+      </EntityType>
+      <EntityContainer Name="Container">
+        <EntitySet Name="PurchaseRequisition" EntityType="com.sap.gateway.srvd_a2x.api_purchaserequisition_2.v0001.PurchaseRequisitionType"/>
+        <EntitySet Name="PurchaseRequisitionItem" EntityType="com.sap.gateway.srvd_a2x.api_purchaserequisition_2.v0001.PurchaseRequisitionItemType"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

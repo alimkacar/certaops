@@ -1,0 +1,46 @@
+{
+  "_comment": [
+    "AGENT_AUTH_MODE=static_token icin principal katalogu.",
+    "Token'lar burada DUZ METIN OLARAK TUTULMAZ; yalniz sha256 ozeti saklanir.",
+    "Ozet uretmek icin:  python -c \"from certaops.auth import hash_token; print(hash_token('TOKEN'))\"",
+    "Yetkiler roller uzerinden turetilir (contracts/actor.py:ROLE_SCOPES).",
+    "Gorevler ayrimi (SoD): PURCHASER hazirlar/yazar, APPROVER onaylar. Ayni",
+    "principal'a her iki rolu birlikte vermek onay zincirini anlamsizlastirir.",
+    "Bu dosya ornektir; gercek principals.json versiyon kontrolune girmemelidir."
+  ],
+  "principals": [
+    {
+      "token_sha256": "<sha256(purchaser-token)>",
+      "subject": "satinalmaci@firma.com",
+      "display_name": "Satinalma Uzmani",
+      "tenant": "100",
+      "roles": ["PURCHASER"],
+      "company_codes": ["1000"],
+      "plants": ["1100"],
+      "purchasing_orgs": ["1000"]
+    },
+    {
+      "token_sha256": "<sha256(approver-token)>",
+      "subject": "satinalma-muduru@firma.com",
+      "display_name": "Satinalma Muduru",
+      "tenant": "100",
+      "roles": ["APPROVER"],
+      "company_codes": ["1000"],
+      "plants": ["1100"],
+      "purchasing_orgs": ["1000"]
+    },
+    {
+      "token_sha256": "<sha256(engineer-token)>",
+      "subject": "proje-muhendisi@firma.com",
+      "tenant": "100",
+      "roles": ["ENGINEER"],
+      "plants": ["1100"]
+    },
+    {
+      "token_sha256": "<sha256(auditor-token)>",
+      "subject": "ic-denetim@firma.com",
+      "tenant": "100",
+      "roles": ["AUDITOR"]
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">CertaOps mark</title>
+  <desc id="desc">A shield-shaped C connected to three operational nodes</desc>
+  <defs>
+    <linearGradient id="g" x1="32" y1="24" x2="224" y2="232" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7967FF"/>
+      <stop offset="1" stop-color="#19B7C9"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="9" flood-color="#0B2239" flood-opacity=".22"/>
+    </filter>
+  </defs>
+  <rect x="20" y="20" width="216" height="216" rx="54" fill="#0B2239" filter="url(#shadow)"/>
+  <path d="M175 78c-13-17-32-26-54-26-39 0-70 32-70 72s31 72 70 72c22 0 42-10 55-27" fill="none" stroke="url(#g)" stroke-width="24" stroke-linecap="round"/>
+  <path d="M142 101h48M142 127h62M142 153h48" fill="none" stroke="#EAFBFF" stroke-width="9" stroke-linecap="round"/>
+  <circle cx="199" cy="101" r="10" fill="#7967FF"/>
+  <circle cx="214" cy="127" r="10" fill="#19B7C9"/>
+  <circle cx="199" cy="153" r="10" fill="#54E3A6"/>
+</svg>
