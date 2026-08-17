@@ -17,7 +17,7 @@ import re
 from datetime import date, datetime, timedelta, timezone
 
 from . import mock_data
-from .base import SAPBackend, SAPError
+from .base import SAPBackend, SAPError, effective_unit_price
 from .models import (
     AtpResult,
     AtpScheduleLine,
@@ -546,11 +546,14 @@ class MockSAPBackend(SAPBackend):
             if chosen is None and records:
                 chosen = min(records, key=lambda r: r.price_for_qty(item.quantity))
 
-            unit_price = (
-                item.net_price
-                if item.net_price is not None
-                else (chosen.price_for_qty(item.quantity) if chosen else master["moving_avg_price"])
-            )
+            unit_price, price_warning = effective_unit_price(item.net_price, chosen.price_for_qty(item.quantity) if chosen else master["moving_avg_price"])
+            if price_warning:
+                findings.append(
+                    ValidationFinding(
+                        severity="warning", field="net_price", item_no=item_no,
+                        message=f"Kalem {item_no}: {price_warning}",
+                    )
+                )
             line_total = round(unit_price * item.quantity, 2)
             total += line_total
 

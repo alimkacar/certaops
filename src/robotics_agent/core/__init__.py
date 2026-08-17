@@ -13,15 +13,29 @@ from .agents import (
     agent_catalogue,
     handoff_from_turn,
     plan_agents,
+    profiles_for_packs,
 )
 from .approvals import ApprovalError, ApprovalRecord, ApprovalStore, Approver, payload_hash
 from .audit import (
     AuditLedger,
+    CheckpointExporter,
+    FileCheckpointExporter,
     NullAuditLedger,
     get_audit_ledger,
     redact,
     reset_audit_cache,
     sha256_of,
+)
+from .direct import (
+    DIRECT_ANSWER_TOOLS,
+    SHORTCUTS,
+    DirectAnswer,
+    DirectAnswerSpec,
+    IntentShortcut,
+    ShortcutMatch,
+    direct_answer_for,
+    match_shortcut,
+    shortcut_catalogue,
 )
 from .execution import Verification, WriteGuard, WriteOutcome
 from .idempotency import (
@@ -67,6 +81,7 @@ from .router import (
 from .sessions import (
     SCOPE_SESSION_ADMIN,
     MemorySessionStore,
+    SessionBusy,
     SessionConflict,
     SessionOwnershipError,
     SessionRecord,
@@ -78,7 +93,13 @@ from .store import StateDatabase, get_state_db, reset_state_db_cache
 
 __all__ = [
     "AGENT_SPECS",
+    "DIRECT_ANSWER_TOOLS",
+    "SHORTCUTS",
     "AgentSpec",
+    "DirectAnswer",
+    "DirectAnswerSpec",
+    "IntentShortcut",
+    "ShortcutMatch",
     "BOOTSTRAP_PACK",
     "HandoffEnvelope",
     "OBLIGATION_BLOCK_EXPORT",
@@ -116,6 +137,7 @@ __all__ = [
     "RoutingDecision",
     "SCOPE_SESSION_ADMIN",
     "SQLiteSessionStore",
+    "SessionBusy",
     "SessionConflict",
     "SessionOwnershipError",
     "SessionRecord",
@@ -129,6 +151,8 @@ __all__ = [
     "build_idempotency_key",
     "build_session_store",
     "domains_for_packs",
+    "CheckpointExporter",
+    "FileCheckpointExporter",
     "get_audit_ledger",
     "get_state_db",
     "handoff_from_turn",
@@ -136,6 +160,7 @@ __all__ = [
     "pack_catalogue",
     "payload_hash",
     "plan_agents",
+    "profiles_for_packs",
     "redact",
     "reset_audit_cache",
     "reset_state_db_cache",
@@ -143,4 +168,7 @@ __all__ = [
     "schema_token_report",
     "sha256_of",
     "summarize_intent",
+    "direct_answer_for",
+    "match_shortcut",
+    "shortcut_catalogue",
 ]

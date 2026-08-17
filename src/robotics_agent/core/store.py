@@ -80,6 +80,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- Optimistic locking: iki worker ayni oturumu kaydederse son yazan
     -- digerinin turunu silmez.
     version      INTEGER NOT NULL DEFAULT 1,
+    -- Bir konusma turunun hydrate -> model/tool -> save zincirini ayni
+    -- session icin process'ler arasinda tek-yazici yapan, sureli lease.
+    turn_lease_owner TEXT NOT NULL DEFAULT '',
+    turn_lease_expires_at TEXT,
     -- Oturum sahipligi tenant + subject ile baglanir.
     PRIMARY KEY (tenant, subject, session_id)
 );
@@ -132,6 +136,8 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("idempotency", "lease_owner", "TEXT NOT NULL DEFAULT ''"),
     ("idempotency", "lease_expires_at", "TEXT"),
     ("sessions", "version", "INTEGER NOT NULL DEFAULT 1"),
+    ("sessions", "turn_lease_owner", "TEXT NOT NULL DEFAULT ''"),
+    ("sessions", "turn_lease_expires_at", "TEXT"),
 )
 
 
@@ -151,7 +157,9 @@ class StateDatabase:
     # --- Baglanti -----------------------------------------------------------
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
-            str(self.path), timeout=BUSY_TIMEOUT_MS / 1000, isolation_level=None,
+            str(self.path),
+            timeout=BUSY_TIMEOUT_MS / 1000,
+            isolation_level=None,
             check_same_thread=False,
         )
         conn.row_factory = sqlite3.Row

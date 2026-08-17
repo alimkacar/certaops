@@ -81,15 +81,37 @@ _BASE_HANDOFF_FIELDS = frozenset(
     {"objective", "correlation_id", "evidence_ids", "warnings", "needs_review", "summary"}
 )
 
+# Is domaini agent'lari. Aralarinda **is nesnesi kimligi** (malzeme, PO, WBS -
+# hepsi D1) tasinabilir; tutar, fiyat ve kisisel veri tasinamaz.
+_BUSINESS_AGENTS = ("master_data", "supply_chain", "procurement", "finance")
+
+# `platform` teshis/mutabakat agent'idir. Is verisi hakkinda tahmin yapmaz ama
+# `sap_reconcile_execution` ve audit sorgusu icin BELGE KIMLIGINE ihtiyaci
+# vardir; bu yuzden is nesnesi kimlikleri iki yonde de tasinir.
+_DIAGNOSTIC_AGENT = "platform"
+
+_WITH_OBJECTS = _BASE_HANDOFF_FIELDS | {"business_objects"}
+
+# Tablo `core.agent_catalogue()` icindeki `handoff_targets` bildirimlerinin
+# tamamini kapsamak ZORUNDADIR. Kapsamayan bir cift fail-closed yedege duser ve
+# is nesnesi kimligini sessizce dusurur; bu, cok-ajanli akisi bozar ama hicbir
+# hata uretmez. `tests/policy/test_handoff_allowlist.py` bu butunlugu korur.
+#
+# Not: cift boyutu su an ayrim yapmiyor (tum ciftler ayni alan kumesini
+# aliyor). Koruma **alan boyutundadir**: zarfa yeni bir alan eklendiginde,
+# burada acikca izin verilmedikce hicbir devirde tasinmaz. Cift boyutu ileride
+# bir akisi daraltmak gerektiginde hazir duruyor.
 HANDOFF_FIELD_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
-    # Tedarik zinciri -> satinalma: is nesnesi kimlikleri gecer, tutar gecmez.
-    ("supply_chain", "procurement"): _BASE_HANDOFF_FIELDS | {"business_objects"},
-    ("master_data", "procurement"): _BASE_HANDOFF_FIELDS | {"business_objects"},
-    ("master_data", "supply_chain"): _BASE_HANDOFF_FIELDS | {"business_objects"},
-    ("procurement", "finance"): _BASE_HANDOFF_FIELDS | {"business_objects"},
-    ("supply_chain", "finance"): _BASE_HANDOFF_FIELDS | {"business_objects"},
-    ("finance", "procurement"): _BASE_HANDOFF_FIELDS | {"business_objects"},
-    ("procurement", "supply_chain"): _BASE_HANDOFF_FIELDS | {"business_objects"},
+    # Is domaini <-> is domaini
+    **{
+        (source, target): _WITH_OBJECTS
+        for source in _BUSINESS_AGENTS
+        for target in _BUSINESS_AGENTS
+        if source != target
+    },
+    # Teshis agent'i <-> is domaini (her iki yon)
+    **{(_DIAGNOSTIC_AGENT, target): _WITH_OBJECTS for target in _BUSINESS_AGENTS},
+    **{(source, _DIAGNOSTIC_AGENT): _WITH_OBJECTS for source in _BUSINESS_AGENTS},
 }
 
 

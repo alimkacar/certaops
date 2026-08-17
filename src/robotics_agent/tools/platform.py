@@ -11,10 +11,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..adapters.sap import (
-    CAPABILITY_MANIFEST,
     SAPError,
     explain_authorization_failure,
-    manifest_summary,
     parse_sap_error,
 )
 from ..contracts import (
@@ -22,13 +20,13 @@ from ..contracts import (
     SCOPE_AUDIT_READ,
     SCOPE_PLATFORM_READ,
     SCOPE_SAP_READ,
-    SCOPE_SAP_SIMULATE,
     EvidenceAccessDenied,
     RiskTier,
     page_limit,
     resolve_detail,
 )
-from ..core import agent_catalogue, plan_agents
+from ..core import plan_agents
+from ..core.agents import PACK_TO_AGENT, subsumed_packs
 from .registry import ToolContext, tool
 
 
@@ -68,12 +66,15 @@ def sap_discover_capabilities(
     aliases: list[str] | None = None,
     probe: bool = False,
 ) -> dict[str, Any]:
-    selected = [a for a in (aliases or []) if a in CAPABILITY_MANIFEST]
+    # Manifest backend'e aittir: S/4'te released API'ler, ECC'de Z-Gateway
+    # servisleri. Alias dogrulamasi da bu yuzden backend uzerinden yapilir.
+    known_aliases = ctx.sap.manifest_aliases()
+    selected = [a for a in (aliases or []) if a in known_aliases]
     backend_caps = ctx.sap.capabilities()
 
     # Alias verilmediginde manifest kompakt dondurulur: butun entity set ve doc
     # listesini her cagrida tasimak sema butcesini bosa harcar.
-    entries = manifest_summary(selected or None)
+    entries = ctx.sap.service_manifest(selected or None)
     if not selected:
         entries = [
             {
@@ -91,7 +92,7 @@ def sap_discover_capabilities(
         "backend_capabilities": backend_caps["supported"],
         "service_manifest": entries,
         "detail_hint": "Bir servisin entity set/alan detayi icin aliases=[...] verin.",
-        "preferred_order": "released OData V4 -> released OData V2/SOAP -> released custom (Tier 2)",
+        "preferred_order": ctx.sap.preferred_service_order(),
     }
     if "connection" in backend_caps:
         payload["connection"] = backend_caps["connection"]
@@ -227,73 +228,6 @@ def sap_explain_authorization_failure(
 
 
 # ---------------------------------------------------------------------------
-@tool(
-    name="sap_validate_change",
-    group="platform",
-    domain="diagnostics",
-    risk_tier=RiskTier.R1,
-    required_scopes=(SCOPE_SAP_SIMULATE,),
-    # Taslagi gercek SAP varsayilanlariyla kurar.
-    org_scoped=True,
-    result_token_budget=800,
-    description=(
-        "Mutating bir payload'i YAZMADAN once dogrular: zorunlu alanlar, tarih tutarliligi, "
-        "miktar/birim, tutar ve organizasyon kapsami. Yazma tool'unu cagirmadan hangi "
-        "bulgularin engelleyici oldugunu gosterir. Sonuc 'onay' degildir; yalnizca on kontroldur."
-    ),
-    input_schema={
-        "type": "object",
-        "properties": {
-            "operation": {
-                "type": "string",
-                "enum": ["purchase_requisition"],
-                "description": "Dogrulanacak islem tipi.",
-            },
-            "payload": {
-                "type": "object",
-                "description": "Islem govdesi. purchase_requisition icin {items:[...], header_text:...}",
-            },
-        },
-        "required": ["operation", "payload"],
-    },
-)
-def sap_validate_change(
-    ctx: ToolContext,
-    operation: str,
-    payload: dict[str, Any],
-) -> dict[str, Any]:
-    if operation != "purchase_requisition":
-        return {"error": f"Desteklenmeyen islem tipi: {operation}", "supported": ["purchase_requisition"]}
-
-    from .procurement import build_pr_items  # dairesel import olmasin diye burada
-
-    items = payload.get("items") or []
-    if not items:
-        return {"error": "payload.items bos.", "blocking": True}
-
-    try:
-        pr_items = build_pr_items(ctx, items)
-        draft = ctx.sap.prepare_purchase_requisition(
-            pr_items,
-            header_text=str(payload.get("header_text", "")),
-            purchase_group=payload.get("purchase_group"),
-        )
-    except SAPError as exc:
-        return {"valid": False, "blocking": True, **exc.as_dict()}
-
-    return {
-        "operation": operation,
-        "valid": draft.is_submittable,
-        "total_value": draft.total_value,
-        "currency": draft.currency,
-        "requires_human_approval": draft.requires_human_approval,
-        "findings": [f.model_dump() for f in draft.findings],
-        "blocking_findings": [f.message for f in draft.blocking_findings],
-        "source_api": draft.source_api,
-        "note": "Bu bir simulasyondur; SAP'a hicbir sey yazilmadi.",
-    }
-
-
 # ---------------------------------------------------------------------------
 # Audit kaydinin ozetinde korunacak alanlar. Genel butce kirpicisina birakilamaz:
 # kirpici listenin BASINI korur, oysa denetimde en yeni kayitlar kritiktir.
@@ -546,36 +480,64 @@ def get_evidence(ctx: ToolContext, evidence_id: str, path: str = "") -> dict[str
 
 # ---------------------------------------------------------------------------
 @tool(
-    name="sap_list_agents",
+    name="sap_list_domains",
     group="platform",
     domain="platform",
     risk_tier=RiskTier.R0,
     required_scopes=(SCOPE_PLATFORM_READ,),
     result_token_budget=700,
     description=(
-        "SAP multi-agent sistemindeki domain agent'larini ve sabit sorumluluk sinirlarini "
-        "listeler. Istege bagli bir kullanici mesaji verilirse deterministik orkestratorun "
-        "hangi agent zincirini sececegini onizler. Bu tool yetki veya tool kapsami genisletmez."
+        "SAP domain yetenek gorunumu: hangi domain hangi tool pack'lerini ve iterasyon "
+        "butcesini tasiyor. Istege bagli bir mesaj verilirse deterministik router'in hangi "
+        "domainleri acacagini onizler. Bu tool yetki veya tool kapsami genisletmez."
     ),
     input_schema={
         "type": "object",
         "properties": {
             "message": {
                 "type": "string",
-                "description": "Istege bagli olarak agent planlamasi onizlenecek kullanici mesaji.",
+                "description": "Istege bagli olarak domain secimi onizlenecek kullanici mesaji.",
             },
         },
         "required": [],
     },
 )
-def sap_list_agents(ctx: ToolContext, message: str = "") -> dict[str, Any]:
+def sap_list_domains(ctx: ToolContext, message: str = "") -> dict[str, Any]:
+    """Domain yetenek gorunumu.
+
+    Eski adi ``sap_list_agents``ti ve "ayri calisan agent'lar" anlatiyordu.
+    Ayri agent'lar kaldirildi; domain'ler artik prompt parcasi + tool pack +
+    butce metadata'sidir. Yaniltici bilgi vermemek icin tool yeniden
+    adlandirildi (eski ad geriye donuk uyumluluk icin ayrica kayitlidir).
+    """
+    from certaops.runtime import profile_catalogue
+
     assert ctx.actor
     payload: dict[str, Any] = {
-        "architecture": "orchestrator + isolated SAP domain agents",
-        "handoff_schema": "sap-agent-handoff/v1",
-        "agents": agent_catalogue(),
-        "note": "Agent sinirlari sabittir; bir domain agent kendi tool kapsamlarini genisletemez.",
+        "architecture": "certaops-single-runtime",
+        "domains": profile_catalogue(),
+        "note": (
+            "Tek runtime, dinamik tool pack. Domain sinirlari sabittir; model "
+            "kendi tool kapsamini genisletemez."
+        ),
     }
     if message.strip():
-        payload["plan_preview"] = plan_agents(message, ctx.actor).to_dict()
+        plan = plan_agents(message, ctx.actor)
+        preview = plan.to_dict()
+        # Onizleme, yonlendirmenin OZETIDIR: baska bir secili pack tarafindan
+        # zaten icerilen pack ayri bir domain gibi gosterilmez. `plan_agents`
+        # legacy sozlesmesi ise acilan tum profilleri listelemeye devam eder.
+        hidden = subsumed_packs(plan.routing.packs)
+        domains = [
+            PACK_TO_AGENT[pack]
+            for pack in plan.routing.packs
+            if pack not in hidden and pack in PACK_TO_AGENT
+        ]
+        payload["routing_preview"] = {
+            "packs": preview["routing"]["packs"],
+            "domains": list(dict.fromkeys(domains)) or preview["agents"],
+            "reason": preview["reason"],
+        }
     return payload
+
+

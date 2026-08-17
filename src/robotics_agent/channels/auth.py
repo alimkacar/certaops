@@ -124,7 +124,7 @@ class StaticTokenAuthenticator:
         self._missing_is_wildcard = missing_is_wildcard
         self._lock = threading.Lock()
         self._by_hash: dict[str, Principal] = {}
-        self._mtime = 0.0
+        self._signature: tuple[int, int, int] = (0, 0, 0)
         self._load()
 
     def _load(self) -> None:
@@ -144,17 +144,36 @@ class StaticTokenAuthenticator:
                 entry, missing_is_wildcard=self._missing_is_wildcard
             )
         self._by_hash = mapping
-        self._mtime = self.path.stat().st_mtime
+        self._signature = self._stat_signature()
         log.info("%d principal yuklendi (%s)", len(mapping), self.path)
+
+    def _stat_signature(self) -> tuple[int, int, int]:
+        """Dosya degisiklik imzasi: (mtime_ns, boyut, inode).
+
+        Yalniz `st_mtime` (saniye hassasiyetli float) kullanmak yetmez: ayni
+        saniye icinde yapilan bir guncelleme gorulmez ve iptal edilmis bir
+        token gecerli kalmaya devam eder. Bu bir yetkilendirme sorunudur, sadece
+        kararsiz bir test degil.
+
+        Uc bilesen birlikte kullanilir:
+          - `st_mtime_ns`  nanosaniye hassasiyeti (saniye ici guncelleme),
+          - `st_size`      icerik boyutu degistiyse mtime ayni olsa da yakalanir,
+          - `st_ino`       atomik guncelleme (gecici dosya + rename) inode degistirir;
+                           sirlar uretimde tam olarak boyle guncellenir.
+        """
+        stat = self.path.stat()
+        return (stat.st_mtime_ns, stat.st_size, stat.st_ino)
 
     def _reload_if_changed(self) -> None:
         try:
-            mtime = self.path.stat().st_mtime
+            signature = self._stat_signature()
         except OSError:
             return
-        if mtime != self._mtime:
+        if signature != self._signature:
             with self._lock:
-                self._load()
+                # Kilit alinana kadar baska bir istek yuklemis olabilir.
+                if self._stat_signature() != self._signature:
+                    self._load()
 
     def authenticate(self, token: str) -> ActorContext:
         if not token:

@@ -302,22 +302,64 @@ def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
+@dataclass(frozen=True)
+class NavigationInfo:
+    """Bir navigation property'nin sozlesmesi."""
+
+    name: str
+    target_type: str
+    is_collection: bool = False
+
+
 @dataclass
 class MetadataContract:
-    """$metadata belgesinden cikarilan sozlesme."""
+    """$metadata belgesinden cikarilan sozlesme.
+
+    Yalniz "alan var mi" sorusunu degil, **yazma govdesinin sekli ne olmali**
+    sorusunu da cevaplar: navigation property'ler, anahtar alanlar ve zorunlu
+    (`Nullable="false"`) alanlar da cikarilir.
+
+    Bunun onemi: bir POST govdesi, gercek bir yazma denemesi YAPILMADAN
+    sozlesmeye karsi denetlenebilir. Okuma yetkisi olan bir sistemde bile
+    "bu govde yapisal olarak kabul edilir mi" sorusu cevaplanabilir.
+    """
 
     entity_sets: dict[str, str] = field(default_factory=dict)  # set adi -> tip adi
     entity_types: dict[str, tuple[str, ...]] = field(default_factory=dict)  # tip -> alanlar
+    navigations: dict[str, dict[str, NavigationInfo]] = field(default_factory=dict)
+    keys: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    required: dict[str, tuple[str, ...]] = field(default_factory=dict)
     actions: tuple[str, ...] = ()
     functions: tuple[str, ...] = ()
     version: str = ""
 
-    def properties_of_set(self, entity_set: str) -> tuple[str, ...]:
+    # --- Tip cozumleme ------------------------------------------------------
+    def type_of_set(self, entity_set: str) -> str:
         type_name = self.entity_sets.get(entity_set, "")
-        if not type_name:
+        return type_name.rsplit(".", 1)[-1] if type_name else ""
+
+    def properties_of_set(self, entity_set: str) -> tuple[str, ...]:
+        short = self.type_of_set(entity_set)
+        if not short:
             return ()
-        short = type_name.rsplit(".", 1)[-1]
-        return self.entity_types.get(short, self.entity_types.get(type_name, ()))
+        return self.entity_types.get(short, self.entity_types.get(
+            self.entity_sets[entity_set], ()))
+
+    def properties_of_type(self, type_name: str) -> tuple[str, ...]:
+        return self.entity_types.get(type_name.rsplit(".", 1)[-1], ())
+
+    def key_properties(self, entity_set: str) -> tuple[str, ...]:
+        return self.keys.get(self.type_of_set(entity_set), ())
+
+    def required_properties(self, entity_set: str) -> tuple[str, ...]:
+        """Anahtar olmayan zorunlu alanlar.
+
+        Anahtarlar cikarilir: create sirasinda belge numarasi SAP tarafindan
+        uretilir, gonderilmesi beklenmez.
+        """
+        short = self.type_of_set(entity_set)
+        keys = set(self.keys.get(short, ()))
+        return tuple(p for p in self.required.get(short, ()) if p not in keys)
 
     def has_set(self, entity_set: str) -> bool:
         return entity_set in self.entity_sets
@@ -327,6 +369,22 @@ class MetadataContract:
         if not available:
             return tuple(expected)
         return tuple(sorted(p for p in expected if p not in available))
+
+    # --- Navigation ---------------------------------------------------------
+    def navigations_of_type(self, type_name: str) -> dict[str, NavigationInfo]:
+        return self.navigations.get(type_name.rsplit(".", 1)[-1], {})
+
+    def navigations_of_set(self, entity_set: str) -> dict[str, NavigationInfo]:
+        short = self.type_of_set(entity_set)
+        return self.navigations.get(short, {}) if short else {}
+
+    def is_empty(self) -> bool:
+        """Sozlesme okunabildi mi?
+
+        Bos olmasi "alan yok" DEGIL, "kanit yok" demektir. Bu ayrimi kaybetmek,
+        okunamayan bir $metadata yuzunden calisan bir kurulumu bozmaya yol acar.
+        """
+        return not self.entity_sets and not self.entity_types
 
 
 def parse_metadata(edmx_xml: str) -> MetadataContract:
@@ -348,13 +406,43 @@ def parse_metadata(edmx_xml: str) -> MetadataContract:
         tag = _local(element.tag)
         if tag == "EntityType":
             name = element.attrib.get("Name", "")
-            props = tuple(
-                child.attrib.get("Name", "")
-                for child in element
-                if _local(child.tag) == "Property" and child.attrib.get("Name")
-            )
-            if name:
-                contract.entity_types[name] = props
+            if not name:
+                continue
+            props: list[str] = []
+            required: list[str] = []
+            navigations: dict[str, NavigationInfo] = {}
+            keys: list[str] = []
+            for child in element:
+                child_tag = _local(child.tag)
+                child_name = child.attrib.get("Name", "")
+                if child_tag == "Property" and child_name:
+                    props.append(child_name)
+                    # V4 varsayilani Nullable="true"; yalniz ACIKCA false
+                    # bildirilen alan zorunlu sayilir.
+                    if child.attrib.get("Nullable", "true").lower() == "false":
+                        required.append(child_name)
+                elif child_tag == "NavigationProperty" and child_name:
+                    raw_type = child.attrib.get("Type", "")
+                    is_collection = raw_type.startswith("Collection(")
+                    target = raw_type[len("Collection("):-1] if is_collection else raw_type
+                    navigations[child_name] = NavigationInfo(
+                        name=child_name,
+                        target_type=target.rsplit(".", 1)[-1],
+                        is_collection=is_collection,
+                    )
+                elif child_tag == "Key":
+                    keys.extend(
+                        ref.attrib["Name"]
+                        for ref in child
+                        if _local(ref.tag) == "PropertyRef" and ref.attrib.get("Name")
+                    )
+            contract.entity_types[name] = tuple(props)
+            if navigations:
+                contract.navigations[name] = navigations
+            if keys:
+                contract.keys[name] = tuple(keys)
+            if required:
+                contract.required[name] = tuple(required)
         elif tag == "EntitySet":
             name = element.attrib.get("Name", "")
             type_name = element.attrib.get("EntityType", "")
@@ -431,6 +519,203 @@ def verify_contract(
         missing_entity_sets=missing_sets,
         missing_properties=missing_props,
     )
+
+
+# --- Yazma govdesinin sozlesmeye karsi denetimi ------------------------------
+@dataclass
+class WriteShapeIssue:
+    """Bir yazma govdesindeki tek yapisal sorun."""
+
+    #: unknown_field | missing_required | unknown_navigation | wrong_cardinality
+    kind: str
+    path: str
+    message: str
+    severity: str = "error"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "path": self.path,
+            "message": self.message,
+            "severity": self.severity,
+        }
+
+
+@dataclass
+class WriteShapeReport:
+    """Bir POST govdesinin `$metadata`ya karsi denetim sonucu.
+
+    **Ne kanitlar:** govdenin YAPISI hedef sistemin sozlesmesine uyuyor mu -
+    alan adlari dogru mu, ic ice yapi (deep insert) dogru navigation
+    uzerinden mi kuruluyor, zorunlu alan atlanmis mi.
+
+    **Ne kanitlamaz:** SAP'in calisma zamani is dogrulamalari. Bir govde
+    yapisal olarak kusursuz olup yine de "Malzeme X icin tesis Y'de gecerli
+    hesap atamasi girin" ile reddedilebilir. Bunu yalniz gercek bir yazma
+    gosterir.
+
+    Yani bu rapor **gerekli ama yeterli olmayan** kosulu dogrular. Degeri
+    sudur: en sik ve en sessiz hata sinifi (yanlis alan adi / yanlis ic ice
+    yapi) yazma yetkisi olmadan yakalanir.
+    """
+
+    entity_set: str
+    issues: list[WriteShapeIssue] = field(default_factory=list)
+    checked_fields: int = 0
+    contract_available: bool = True
+
+    @property
+    def ok(self) -> bool:
+        return not [i for i in self.issues if i.severity == "error"]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "entity_set": self.entity_set,
+            "structurally_valid": self.ok,
+            "contract_available": self.contract_available,
+            "checked_fields": self.checked_fields,
+            "issues": [i.to_dict() for i in self.issues],
+        }
+
+
+def verify_write_shape(
+    contract: MetadataContract,
+    entity_set: str,
+    payload: Mapping[str, Any],
+    *,
+    path: str = "",
+) -> WriteShapeReport:
+    """Bir yazma govdesini `$metadata` sozlesmesine karsi ozyinelemeli denetler.
+
+    Deep insert govdeleri de kapsanir: `_PurchaseRequisitionItem` gibi bir
+    anahtar navigation property olarak taninirsa, icindeki her kayit hedef
+    tipin alanlarina karsi ayrica denetlenir.
+    """
+    report = WriteShapeReport(entity_set=entity_set)
+    if contract.is_empty() or not contract.has_set(entity_set):
+        report.contract_available = False
+        return report
+
+    root = path or entity_set
+    _verify_level(
+        contract,
+        type_name=contract.type_of_set(entity_set),
+        payload=payload,
+        path=root,
+        report=report,
+        required=contract.required_properties(entity_set),
+    )
+    return report
+
+
+def _verify_level(
+    contract: MetadataContract,
+    *,
+    type_name: str,
+    payload: Mapping[str, Any],
+    path: str,
+    report: WriteShapeReport,
+    required: Iterable[str] = (),
+) -> None:
+    properties = set(contract.properties_of_type(type_name))
+    navigations = contract.navigations_of_type(type_name)
+    if not properties and not navigations:
+        # Tip cozumlenemedi: sessizce "hepsi dogru" demek yaniltici olur.
+        report.issues.append(
+            WriteShapeIssue(
+                kind="unknown_type",
+                path=path,
+                message=f"'{type_name}' tipi $metadata icinde bulunamadi.",
+                severity="warning",
+            )
+        )
+        return
+
+    for key, value in payload.items():
+        report.checked_fields += 1
+        child_path = f"{path}.{key}"
+        if key in properties:
+            continue
+        navigation = navigations.get(key)
+        if navigation is None:
+            report.issues.append(
+                WriteShapeIssue(
+                    kind="unknown_field",
+                    path=child_path,
+                    message=(
+                        f"'{key}' bu tipte ne alan ne navigation property. "
+                        "SAP bu govdeyi reddeder ya da alani sessizce yok sayar."
+                    ),
+                )
+            )
+            continue
+        # Navigation: kardinalite ve ic yapi denetlenir.
+        children = value if isinstance(value, list) else [value]
+        if navigation.is_collection and not isinstance(value, list):
+            report.issues.append(
+                WriteShapeIssue(
+                    kind="wrong_cardinality",
+                    path=child_path,
+                    message=f"'{key}' bir koleksiyon; liste gonderilmeli.",
+                )
+            )
+        if not navigation.is_collection and isinstance(value, list):
+            report.issues.append(
+                WriteShapeIssue(
+                    kind="wrong_cardinality",
+                    path=child_path,
+                    message=f"'{key}' tekil; liste degil nesne gonderilmeli.",
+                )
+            )
+        for index, child in enumerate(children):
+            if not isinstance(child, Mapping):
+                continue
+            _verify_level(
+                contract,
+                type_name=navigation.target_type,
+                payload=child,
+                path=f"{child_path}[{index}]" if navigation.is_collection else child_path,
+                report=report,
+            )
+
+    for name in required:
+        if name not in payload:
+            report.issues.append(
+                WriteShapeIssue(
+                    kind="missing_required",
+                    path=f"{path}.{name}",
+                    message=f"'{name}' $metadata'da zorunlu (Nullable=false) ama govdede yok.",
+                )
+            )
+
+
+def account_assignment_shape(
+    contract: MetadataContract, item_entity_set: str
+) -> str:
+    """Hesap atamasi bu serviste NEREYE yazilir?
+
+    Uc olasilik vardir ve hangisi oldugu tahminle degil sozlesmeyle belirlenir:
+
+      ``child``  Ayri bir alt entity (`_PurchaseReqnAcctAssgmt` /
+                 `to_PurchaseReqnAcctAssgmt`). Released S/4HANA PR API'sinde
+                 beklenen sekil budur.
+      ``inline`` WBS/masraf merkezi dogrudan kalemin uzerinde.
+      ``unknown`` Sozlesme okunamadi; guvenli varsayilan uygulanir.
+
+    Bu ayrimin bedeli yuksektir: yanlis secim ya 400 doner ya da - daha
+    kotusu - hesap atamasi OLMAYAN bir belge acar. Ikincisi sessizdir ve
+    proje maliyeti yanlis yere duser.
+    """
+    if contract.is_empty() or not contract.has_set(item_entity_set):
+        return "unknown"
+    navigations = contract.navigations_of_set(item_entity_set)
+    for name in navigations:
+        if "acctassgmt" in name.lower() or "accountassignment" in name.lower():
+            return "child"
+    properties = set(contract.properties_of_set(item_entity_set))
+    if {"WBSElement", "CostCenter"} & properties:
+        return "inline"
+    return "unknown"
 
 
 def manifest_summary(aliases: Iterable[str] | None = None) -> list[dict[str, Any]]:

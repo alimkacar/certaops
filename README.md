@@ -7,8 +7,8 @@
     <img alt="CI status" src="https://github.com/alimkacar/certaops-agent-toolkit/actions/workflows/ci.yml/badge.svg">
     <img alt="Python 3.10–3.13" src="https://img.shields.io/badge/Python-3.10%E2%80%933.13-3776AB?logo=python&logoColor=white">
     <img alt="Release 0.1.0" src="https://img.shields.io/badge/release-0.1.0-6D5DFB">
-    <img alt="25 SAP tools" src="https://img.shields.io/badge/SAP_tools-25-0FAAFF">
-    <img alt="410 tests passing" src="https://img.shields.io/badge/tests-410_passing-2EA44F">
+    <img alt="24 SAP tools" src="https://img.shields.io/badge/SAP_tools-24-0FAAFF">
+    <img alt="705 tests passing" src="https://img.shields.io/badge/tests-705_passing-2EA44F">
     <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-0B2239">
   </p>
 </div>
@@ -20,7 +20,7 @@
 ## What is CertaOps?
 
 CertaOps is a Python toolkit for building AI-assisted operations exclusively around SAP
-S/4HANA. It combines five domain-isolated agents with 25 purpose-built SAP tools and a
+S/4HANA. It combines five domain-isolated agents with 24 purpose-built SAP tools and a
 deterministic security runtime.
 
 The language model can propose a tool call; it cannot grant itself access, approve a write,
@@ -51,17 +51,11 @@ recoverable is the hard part.
 ```mermaid
 flowchart TD
     C["CLI · FastAPI · Python API"] --> G["Authenticated actor context"]
-    G --> O["Deterministic orchestrator"]
-    O --> A1["Platform & Diagnostics"]
-    O --> A2["Master Data"]
-    O --> A3["Planning & Supply Chain"]
-    O --> A4["Procurement"]
-    O --> A5["Project Finance & Reporting"]
-    A1 --> T["Bounded SAP tool registry"]
-    A2 --> T
-    A3 --> T
-    A4 --> T
-    A5 --> T
+    G --> R["Deterministic PackRouter (no LLM)"]
+    R --> RT["Single SAPAgentRuntime"]
+    RT --> MP["ModelProvider (Gemini / Anthropic)"]
+    MP -.->|"suggests calls only"| RT
+    RT --> T["Bounded SAP tool registry"]
     T --> P["Policy → Risk → Approval"]
     P --> I["Idempotency → SAP adapter → Validation"]
     I --> D["Field policy → DLP → Audit"]
@@ -69,8 +63,15 @@ flowchart TD
     I --> S["OData V4 / V2"]
 ```
 
-Agents never exchange full conversation history. Cross-domain work uses a compact,
-allowlisted `sap-agent-handoff/v1` envelope with correlation and evidence identifiers.
+**One user turn = one model loop.** Domains are no longer separate agent objects; they are
+metadata — a system prompt fragment, a tool pack, an iteration budget, and an access scope
+(`certaops.runtime.profiles`). A multi-domain request computes the union of authorized packs
+and runs a single loop instead of N sequential LLM calls.
+
+The model **never executes a tool**. It only proposes function calls; every call goes through
+`execute_tool` and therefore through RBAC/ABAC, dynamic risk scoring, human approval,
+idempotency, DLP, audit, timeouts, and result budgets. Tool names the model invents, or tools
+outside the actor's authorized set, are rejected fail-closed.
 
 ## Agent and tool catalog
 
@@ -120,16 +121,67 @@ python demo.py --tool sap_material_360 --args '{"material_id":"SFT-SCN-270"}'
 
 ## Run the AI agent
 
-The conversational runtime currently uses the Anthropic SDK. Copy the example environment and
-set your own API key locally:
+The runtime is provider-agnostic: core code depends on no vendor SDK type. The default
+provider is Google Gemini.
+
+### Gemini Developer API (development / quality)
 
 ```bash
 cp .env.example .env
-# Set ANTHROPIC_API_KEY in .env
+```
 
+```bash
+MODEL_PROVIDER=gemini
+MODEL_NAME=gemini-3.7-flash
+GEMINI_API_KEY=<your key>
+GEMINI_BACKEND=developer
+GEMINI_THINKING_LEVEL=low
+GEMINI_STORE_INTERACTIONS=false
+```
+
+### Vertex AI (recommended for production SAP data)
+
+```bash
+MODEL_PROVIDER=gemini
+MODEL_NAME=gemini-3.7-flash
+GEMINI_BACKEND=vertex
+GOOGLE_CLOUD_PROJECT=<project>
+GOOGLE_CLOUD_LOCATION=europe-west4
+```
+
+Vertex is the recommended production backend for SAP data because it runs under a Google Cloud
+enterprise data-processing agreement. The production profile emits a blocker for
+`GEMINI_BACKEND=developer`.
+
+### Anthropic (optional)
+
+```bash
+pip install ".[anthropic]"
+```
+
+```bash
+MODEL_PROVIDER=anthropic
+MODEL_NAME=claude-sonnet-5
+ANTHROPIC_API_KEY=<your key>
+```
+
+`ANTHROPIC_API_KEY` is no longer required to start the service.
+
+```bash
 python run_cli.py
 python run_cli.py -p "Show ATP and MRP status for HD-GEAR-CSF25-100"
 ```
+
+### Gemini 3 notes
+
+- `temperature`, `top_p`, `top_k` and `candidate_count` were removed in Gemini 3. The adapter
+  does not send them. Reasoning budget is set with `thinking_level`
+  (`low` → simple single-tool reads, `medium` → multi-step or multi-domain, `high` → only with
+  `GEMINI_ALLOW_HIGH_THINKING=true`).
+- The SDK's **automatic function calling is always disabled**. Only pure JSON schemas are sent;
+  no callable is ever handed to the SDK. This keeps every SAP call behind the security gate.
+- Gemini 3 thought signatures are carried opaquely and are never logged, audited, shared across
+  tenants, or turned into conversation text.
 
 After installation, the CLI is also available as:
 
@@ -226,8 +278,9 @@ outbound SAP host.
 
 | Layer | Current evidence |
 |---|---|
-| Local security and policy runtime | 410 passing tests |
-| Acceptance behavior | 27/27 executable checks with evidence output |
+| Full suite | 705 passing, 15 skipped (720 collected) |
+| Local security and policy runtime | `tests/policy` + `security` + `privacy` + `concurrency`: all passing |
+| Acceptance behavior | 28/28 executable checks with evidence output |
 | SAP tool behavior | End-to-end against the bundled S/4HANA simulator |
 | OData V2/V4 adapter | Contract-tested against recorded `$metadata` fixtures |
 | Live tenant semantics | 15 integration tests included, skipped without an authorized tenant |
@@ -253,7 +306,9 @@ python scripts/perf_benchmark.py
 
 `.env.example` documents the complete configuration surface, including:
 
-- model and iteration budgets;
+- model provider (`MODEL_PROVIDER`, `MODEL_NAME`), Gemini Developer/Vertex backends,
+  `thinking_level`, and provider-side storage controls;
+- iteration and token budgets;
 - mock or OData SAP backends;
 - OAuth 2.0, BTP Destination, and development-only Basic auth;
 - static-token or OIDC API authentication;
@@ -262,6 +317,33 @@ python scripts/perf_benchmark.py
 
 Never commit `.env`, credentials, private keys, live principal catalogs, generated reports, or
 runtime state. The repository ignore rules cover the default locations.
+
+## Health and observability
+
+`GET /health` reports the provider, model, and backend — never the API key:
+
+```json
+{
+  "model": {
+    "provider": "gemini",
+    "model": "gemini-3.7-flash",
+    "backend": "vertex",
+    "configured": true,
+    "thinking_level": "low",
+    "store_interactions": false
+  },
+  "direct_answers": { "enabled": true, "tools": ["sap_stock_overview", "..."] }
+}
+```
+
+Provider and model are also written to every audit record, so a behaviour change can be traced
+back to the model version that produced it.
+
+## Migration from the multi-agent architecture
+
+Version 0.2.0 replaced five sequential domain agents with one runtime. See
+[`docs/MIGRATION.md`](docs/MIGRATION.md). `SAPMultiAgent` and `SAPDomainAgent` still work as
+deprecated facades over `certaops.runtime.SAPAgentRuntime`.
 
 ## Project status
 

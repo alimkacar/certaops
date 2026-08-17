@@ -181,6 +181,40 @@ def sap_generate_report(
     sections = sections or []
     tables = tables or []
     sources = source_references or []
+
+    # Rapor dosyasi sistemden CIKAR: bu bir `export` hedefidir, `model` degil.
+    # Ekranda gorulebilen bir deger, indirilebilir bir dosyada ayni kurala tabi
+    # olmayabilir - toplu disa aktarma ek kapsam ister. Bu kapi eskiden hic
+    # calismiyordu; `sink="export"` politikasi tanimliydi ama cagrilmiyordu.
+    if ctx.dlp is not None and ctx.actor is not None:
+        decision = ctx.dlp.apply(
+            {
+                "executive_summary": executive_summary,
+                "sections": sections,
+                "tables": tables,
+            },
+            actor=ctx.actor,
+            sink="export",
+            detail=str(ctx.purpose and "full" or "standard"),
+            purpose=ctx.purpose,
+        )
+        if decision.denied:
+            return {
+                "error": decision.denied_reason
+                or "Rapor icerigi disa aktarma politikasi tarafindan reddedildi.",
+                "denial_code": "EXPORT_POLICY_DENIED",
+                "remediation": (
+                    "Bu rapor disa aktarim yetkisi gerektiren veri iceriyor. Daha dar "
+                    "bir icerikle deneyin veya gerekli disa aktarim kapsamina sahip bir "
+                    "kullaniciyla calisin."
+                ),
+            }
+        cleaned = decision.payload
+        if isinstance(cleaned, dict):
+            executive_summary = cleaned.get("executive_summary", executive_summary)
+            sections = cleaned.get("sections", sections)
+            tables = cleaned.get("tables", tables)
+
     out_dir: Path = ctx.settings.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = _safe_filename(filename or f"sap_{title}_{date.today().isoformat()}")

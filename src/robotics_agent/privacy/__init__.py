@@ -5,6 +5,7 @@ Dort sorumluluk, dort modul:
     classification   D0-D3 seviyeleri, SAP alan envanteri, tool `DataPolicy`si
     field_policy     "kim, hangi alani, nereye, hangi amacla gorebilir"
     dlp              tek merkezi motor: allow/mask/tokenize/drop/deny
+    output           hata govdesi ve model cevabi icin cikti kapisi
     pseudonymization tenant'a ozgu, geri cozulemez HMAC takma kimlik
     retention        saklama tablosu ve periyodik purge job
 
@@ -20,7 +21,7 @@ from .classification import (
     max_class,
     walk_fields,
 )
-from .dlp import DLPEngine, DLPFinding, DLPResult, build_dlp_engine
+from .dlp import DLPEngine, DLPFinding, DLPResult, build_dlp_engine, is_secret_field
 from .field_policy import (
     HANDOFF_FIELD_ALLOWLIST,
     PURPOSE_CODES,
@@ -29,6 +30,13 @@ from .field_policy import (
     Sink,
     handoff_allowlist,
 )
+from .output import (
+    REDACTED,
+    sanitize_error_body,
+    sanitize_for_client,
+    sanitize_for_log,
+    sanitize_text,
+)
 from .pseudonymization import Pseudonymizer, get_pseudonymizer, reset_pseudonymizer_cache
 from .retention import RETENTION_POLICY, PurgeReport, RetentionRule, RetentionSweeper
 
@@ -36,6 +44,7 @@ __all__ = [
     "FIELD_CLASS_INVENTORY",
     "HANDOFF_FIELD_ALLOWLIST",
     "PURPOSE_CODES",
+    "REDACTED",
     "RETENTION_POLICY",
     "DLPEngine",
     "DLPFinding",
@@ -47,6 +56,11 @@ __all__ = [
     "Pseudonymizer",
     "PurgeReport",
     "RetentionRule",
+    "is_secret_field",
+    "sanitize_error_body",
+    "sanitize_for_client",
+    "sanitize_for_log",
+    "sanitize_text",
     "RetentionSweeper",
     "Sink",
     "build_dlp_engine",

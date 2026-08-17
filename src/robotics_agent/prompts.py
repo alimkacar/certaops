@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from datetime import date
+from typing import Any
 
 from .config import Settings
 from .contracts import ActorContext
@@ -124,3 +126,25 @@ def prompt_version() -> str:
 
 
 SYSTEM_TEMPLATE = STABLE_PREFIX
+
+
+def build_runtime_prompt(
+    settings: Settings, *, profiles: Sequence[Any], actor: ActorContext | None = None
+) -> str:
+    """Tek runtime icin birlesik system prompt.
+
+    Cok domainli bir istekte ayri agent calistirmak yerine, acik domainlerin
+    gorev tanimlari **tek prompt'ta** birlestirilir. Domain ayrimi korunur
+    (model hangi domainlerde calistigini bilir) ama model bir kez cagrilir.
+    """
+    titles = ", ".join(p.title for p in profiles)
+    missions = "\n".join(f"- **{p.title}**: {p.mission}" for p in profiles)
+    role = (
+        f"# Bu turda acik SAP domainleri\n{missions}\n\n"
+        f"Yalniz yukaridaki domainlerin isini yaparsin ve yalniz sana verilen "
+        f"tool'lari kullanirsin. Baska bir domainin isini uydurmaz, gereken "
+        f"tool yoksa capability gap olarak bildirirsin.\n"
+    )
+    return "\n\n".join(
+        [STABLE_PREFIX, role, _context(settings, actor), f"# Aktif kapsam\n{titles}"]
+    )

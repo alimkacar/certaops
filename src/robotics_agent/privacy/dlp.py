@@ -143,7 +143,7 @@ _SECRET_HINTS = frozenset(
 )
 
 
-def _is_secret_field(field_name: str) -> bool:
+def is_secret_field(field_name: str) -> bool:
     """Alan adi bir sir tasiyicisi mi?
 
     Ad ya tek parca olarak ipucuna esittir (`Authorization`), ya da
@@ -384,7 +384,7 @@ class DLPEngine:
             return value
 
         # 1. Secret ipucu tasiyan anahtarlar deger bakilmadan gizlenir.
-        if _is_secret_field(field_name):
+        if is_secret_field(field_name):
             result.findings.append(
                 DLPFinding(path, field_name, DataClass.D3, PrivacyAction.MASK, "secret_key")
             )

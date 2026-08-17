@@ -201,7 +201,7 @@ class PolicyDecision:
 
 def _remediation_hint(code: str) -> str:
     return {
-        "UNKNOWN_TOOL": "Tool adini kontrol edin; sap_list_agents ve /tools ile mevcut SAP yeteneklerini listeleyin.",
+        "UNKNOWN_TOOL": "Tool adini kontrol edin; sap_list_domains ve /tools ile mevcut SAP yeteneklerini listeleyin.",
         "AUTH_REQUIRED": "Istek dogrulanmis bir kimlik tasimiyor. Oturum acin.",
         "MISSING_SCOPE": "Bu islem icin gereken is rolu atanmali. Yetki talebi SAP/BTP yoneticisine gider.",
         "ORG_SCOPE": "Argumandaki tesis/sirket kodu/satinalma organizasyonu yetki alaninizin disinda.",

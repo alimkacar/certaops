@@ -96,7 +96,15 @@ def verify_inventory() -> None:
         "sap_document_flow", "sap_purchase_order_360", "sap_workflow_status",
         "sap_supplier_invoice_status", "sap_invoice_block_explain",
     ]
-    check("25 tool kayitli", len(REGISTRY) == 25, f"kayitli: {len(REGISTRY)}")
+    # 26 -> 24: `sap_list_agents` (deprecated takma ad) ve `sap_validate_change`
+    # (dogrulamasi `sap_pr_prepare` ile ortusuyordu) kaldirildi. Modele ayni isi
+    # yapan iki tool gostermek yanlis secim uretir.
+    check("24 tool kayitli", len(REGISTRY) == 24, f"kayitli: {len(REGISTRY)}")
+    check(
+        "kaldirilan tool'lar geri gelmedi",
+        not {"sap_list_agents", "sap_validate_change"} & set(REGISTRY),
+        "sap_list_domains ve sap_pr_prepare yerlerini aliyor",
+    )
     check("5 P2P tool'u kayit defterinde", all(n in REGISTRY for n in p2p), ", ".join(p2p))
 
     read_only = all(not REGISTRY[n].risk_tier.is_mutating for n in p2p)

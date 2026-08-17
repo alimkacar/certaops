@@ -1,9 +1,9 @@
-"""SAP domain agent katalogu, planlama ve yapilandirilmis handoff sozlesmesi.
+"""Tek runtime icin SAP domain profili ve geriye uyumluluk metadata'si.
 
-Orkestrator LLM'e guvenerek yetki genisletmez. Kullanici istegi once kural
-tabanli router ile SAP domainlerine ayrilir; her domain agent yalniz kendi pack
-ve tool'larini gorur. Agent'lar arasinda tam konusma gecmisi degil, bu moduldaki
-sinirli ve denetlenebilir ``HandoffEnvelope`` tasinir.
+Gercek yurutme :mod:`robotics_agent.agent` icindeki tek runtime'da ve router'in
+sectigi exact tool-pack birlesimiyle yapilir. ``AgentSpec``, ``plan_agents`` ve
+``HandoffEnvelope`` eski istemcilerin veri sozlesmesini kirmamak icin korunur;
+ayri model istemcisi, history veya runtime handoff'u olusturmazlar.
 """
 
 from __future__ import annotations
@@ -13,12 +13,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..contracts import ActorContext
-from .router import BOOTSTRAP_PACK, RoutingDecision, route
+from .router import BOOTSTRAP_PACK, PACKS, RoutingDecision, route
 
 
 @dataclass(frozen=True)
 class AgentSpec:
-    """Bir SAP domain agent'inin sabit yetki ve tool siniri."""
+    """Legacy adiyla tutulan mantiksal SAP domain profili."""
 
     key: str
     title: str
@@ -30,7 +30,7 @@ class AgentSpec:
 AGENT_SPECS: dict[str, AgentSpec] = {
     "platform": AgentSpec(
         key="platform",
-        title="SAP Platform ve Teshis Agent'i",
+        title="SAP Platform ve Teshis Profili",
         packs=(BOOTSTRAP_PACK, "diagnostics"),
         mission=(
             "SAP baglanti/yetenek kesfi, yetki hatasi teshisi, audit, evidence ve "
@@ -40,7 +40,7 @@ AGENT_SPECS: dict[str, AgentSpec] = {
     ),
     "master_data": AgentSpec(
         key="master_data",
-        title="SAP Ana Veri Agent'i",
+        title="SAP Ana Veri Profili",
         packs=(BOOTSTRAP_PACK, "master_data"),
         mission=(
             "Malzeme arama, urun/tesis gorunumu, siniflandirma, degerleme ve ana veri "
@@ -50,7 +50,7 @@ AGENT_SPECS: dict[str, AgentSpec] = {
     ),
     "supply_chain": AgentSpec(
         key="supply_chain",
-        title="SAP Planlama ve Tedarik Zinciri Agent'i",
+        title="SAP Planlama ve Tedarik Zinciri Profili",
         packs=(BOOTSTRAP_PACK, "procurement_read", "p2p_visibility"),
         mission=(
             "Stok, ATP, MRP arz/talep, tedarikci performansi, TCO, acik siparis takibi ve "
@@ -60,7 +60,7 @@ AGENT_SPECS: dict[str, AgentSpec] = {
     ),
     "procurement": AgentSpec(
         key="procurement",
-        title="SAP Satinalma Agent'i",
+        title="SAP Satinalma Profili",
         packs=(BOOTSTRAP_PACK, "procurement_write", "procurement_read", "p2p_approval"),
         mission=(
             "Satinalma talebini hazirlar, deterministik diff ve dogrulama uretir, onay "
@@ -71,7 +71,7 @@ AGENT_SPECS: dict[str, AgentSpec] = {
     ),
     "finance": AgentSpec(
         key="finance",
-        title="SAP Proje Finans ve Raporlama Agent'i",
+        title="SAP Proje Finans ve Raporlama Profili",
         packs=(BOOTSTRAP_PACK, "project_finance", "p2p_finance", "reporting"),
         mission=(
             "SAP WBS plan/fiili/taahhut verisini, EAC/ETC durumunu, tedarikci faturasi "
@@ -96,9 +96,26 @@ PACK_TO_AGENT: dict[str, str] = {
 }
 
 
+def subsumed_packs(packs: tuple[str, ...] | list[str]) -> set[str]:
+    """Baska bir SECILI pack tarafindan zaten icerilen pack'ler.
+
+    `procurement_write` ornegin `procurement_read`i icerir. Yonlendirmenin
+    OZETINI sunan yuzeyler bunlari ayri bir domain gibi gostermemelidir;
+    kullanici iki profil almadi, yazma profilini ve onun bagimliligini aldi.
+    `plan_agents` ise legacy sozlesmedir ve acilan tum profilleri listeler.
+    """
+    out: set[str] = set()
+    for pack in packs:
+        definition = PACKS.get(pack)
+        if definition is None:
+            continue
+        out.update(i for i in getattr(definition, "includes", ()) if i != pack)
+    return out
+
+
 @dataclass(frozen=True)
 class OrchestrationPlan:
-    """Bir kullanici turunda calisacak sirali domain agent listesi."""
+    """Legacy istemciler icin secilen domain profili gorunumu."""
 
     agents: tuple[str, ...]
     routing: RoutingDecision
@@ -113,7 +130,7 @@ class OrchestrationPlan:
 
 
 def plan_agents(message: str, actor: ActorContext, *, max_agents: int = 3) -> OrchestrationPlan:
-    """Istek icin en dar yetkili SAP agent zincirini sec."""
+    """Istek icin mantiksal profil metadata'si uret; yurutme yapmaz."""
 
     routing = route(message, actor, max_packs=max_agents)
     if routing.fallback:
@@ -129,8 +146,6 @@ def plan_agents(message: str, actor: ActorContext, *, max_agents: int = 3) -> Or
         if key and key not in selected:
             selected.append(key)
 
-    if "procurement" in selected and "supply_chain" in selected:
-        selected.remove("supply_chain")
     if not selected:
         selected = ["platform"]
 
@@ -139,6 +154,21 @@ def plan_agents(message: str, actor: ActorContext, *, max_agents: int = 3) -> Or
         routing=routing,
         reason="Kural tabanli SAP domain eslesmesi ve actor yetkileri.",
     )
+
+
+def profiles_for_packs(pack_keys: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """Pack listesini calisan process degil, mantiksal domain profillerine cevir.
+
+    Eski ``plan_agents`` bir yazma profili secildiginde supply-chain agent'ini
+    zincirden cikariyordu. Tek runtime'da buna gerek yoktur: router'in actigi
+    hicbir pack metadata donusumunde kaybolmamalidir.
+    """
+    selected: list[str] = []
+    for pack in pack_keys:
+        key = PACK_TO_AGENT.get(pack)
+        if key and key not in selected:
+            selected.append(key)
+    return tuple(selected or ("platform",))
 
 
 def agent_catalogue() -> list[dict[str, Any]]:
@@ -156,7 +186,10 @@ def agent_catalogue() -> list[dict[str, Any]]:
 
 @dataclass(frozen=True)
 class HandoffEnvelope:
-    """Agent'lar arasinda tasinabilen sinirli, yapilandirilmis kanit ozeti."""
+    """Yalniz eski entegrasyonlar icin sinirli kanit zarfi.
+
+    Tek-runtime sohbet yolunda kullanilmaz veya provider state'i tasimaz.
+    """
 
     from_agent: str
     to_agent: str
@@ -168,11 +201,34 @@ class HandoffEnvelope:
     needs_review: bool = False
     summary: str = ""
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "schema": "sap-agent-handoff/v1",
-            "from_agent": self.from_agent,
-            "to_agent": self.to_agent,
+    #: Zarf ust verisi: allowlist'ten bagimsiz olarak her zaman tasinir.
+    #: Bunlar is verisi degil, yonlendirme bilgisidir.
+    _ENVELOPE_KEYS = ("schema", "from_agent", "to_agent")
+
+    #: Serbest metin alanlari. Allowlist'ten gecseler bile DLP'den de gecerler:
+    #: allowlist "hangi alan", DLP "o alanin icinde ne var" sorusunu cevaplar.
+    _TEXT_KEYS = ("objective", "summary")
+
+    def to_dict(self, *, dlp: Any = None, actor: Any = None) -> dict[str, Any]:
+        """Zarfi sozluge cevirir; **alan allowlist'i ve DLP burada uygulanir**.
+
+        Iki ayri kapi vardir ve ikisi de gereklidir:
+
+          1. `handoff_allowlist(from_agent, to_agent)` - bu agent cifti icin
+             hangi ALANLARIN tasinabilecegi. Tanimsiz cift icin daraltilmis
+             taban set doner (fail-closed): is nesnesi kimlikleri bile gecmez.
+          2. DLP `sink="handoff"` - gecen alanlarin ICINDE ne oldugu. Serbest
+             metin (model ozeti) her turlu hassas degeri tasiyabilir; D2
+             maskelenir, D3 dusurulur.
+
+        `dlp`/`actor` verilmezse yalniz allowlist uygulanir. Motor olmadan
+        cagirmak gecerlidir (test, serilestirme) ama uretim yolunda ikisi de
+        verilmelidir.
+        """
+        from ..privacy import handoff_allowlist
+
+        allowed = handoff_allowlist(self.from_agent, self.to_agent)
+        candidate = {
             "objective": self.objective[:500],
             "correlation_id": self.correlation_id,
             "evidence_ids": list(self.evidence_ids),
@@ -181,9 +237,39 @@ class HandoffEnvelope:
             "needs_review": self.needs_review,
             "summary": self.summary[:1200],
         }
+        payload: dict[str, Any] = {
+            "schema": "sap-agent-handoff/v1",
+            "from_agent": self.from_agent,
+            "to_agent": self.to_agent,
+        }
+        payload.update({k: v for k, v in candidate.items() if k in allowed})
 
-    def to_json(self) -> str:
-        return json.dumps(self.to_dict(), ensure_ascii=False, separators=(",", ":"))
+        dropped = sorted(k for k in candidate if k not in allowed)
+        if dropped:
+            # Sessizce dusurmek, alan gitti mi yoksa hic uretilmedi mi
+            # sorusunu cevapsiz birakirdi.
+            payload["dropped_fields"] = dropped
+
+        if dlp is None or actor is None:
+            return payload
+
+        from ..privacy import sanitize_text
+
+        for key in self._TEXT_KEYS:
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                payload[key] = sanitize_text(value, actor=actor, sink="handoff", dlp=dlp)
+        if isinstance(payload.get("warnings"), list):
+            payload["warnings"] = [
+                sanitize_text(str(w), actor=actor, sink="handoff", dlp=dlp)
+                for w in payload["warnings"]
+            ]
+        return payload
+
+    def to_json(self, *, dlp: Any = None, actor: Any = None) -> str:
+        return json.dumps(
+            self.to_dict(dlp=dlp, actor=actor), ensure_ascii=False, separators=(",", ":")
+        )
 
 
 def handoff_from_turn(

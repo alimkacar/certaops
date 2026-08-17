@@ -7,6 +7,7 @@ tanimlar; zorlama `core.policy` icindedir.
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
@@ -165,6 +166,24 @@ class ActorContext:
     @property
     def scopes(self) -> frozenset[str]:
         return scopes_for_roles(self.roles) | self.explicit_scopes
+
+    def security_fingerprint(self) -> str:
+        """Yetki ve organizasyon kapsaminin kararli ozeti.
+
+        Ayni kullanicinin rolleri ya da org kapsami degistiginde bu deger
+        degisir. Onbelleklenmis calisma zamanlari buna gore yeniden kurulur;
+        aksi halde yetkisi DUSURULMUS bir kullanici eski, genis yetkili
+        ornegi kullanmaya devam ederdi.
+        """
+        parts = [
+            ",".join(sorted(self.roles)),
+            ",".join(sorted(self.scopes)),
+            ",".join(sorted(self.company_codes)),
+            ",".join(sorted(self.plants)),
+            ",".join(sorted(self.purchasing_orgs)),
+            self.auth_method,
+        ]
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
     def has_scope(self, scope: str) -> bool:
         return scope in self.scopes

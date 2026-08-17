@@ -29,7 +29,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from ..contracts import ActorContext, ExecutionContext
 from .store import StateDatabase, get_state_db
@@ -113,18 +113,63 @@ class AuditEntry:
         }
 
 
+class CheckpointExporter(Protocol):
+    """Zincir ozetini defterin DISINA yazan hedef.
+
+    Ayri bir surece/depolamaya (S3 Object Lock, harici append-only log servisi)
+    yazilmasi asil amactir; ayni diske yazmak butunluk garantisi eklemez.
+    """
+
+    def export(self, checkpoint: dict[str, Any]) -> None: ...
+
+
+@dataclass
+class FileCheckpointExporter:
+    """Append-only bir dosyaya JSONL checkpoint yazar.
+
+    Bu **minimum** uygulamadir. Gercek WORM garantisi icin hedefin uygulama
+    kullanicisi tarafindan degistirilemeyen bir depolama olmasi gerekir
+    (ornegin object-lock'lu bir bucket ya da baska bir hesabin log servisi).
+    Ayni makinede tutulan bir dosya yalnizca kaza sonucu bozulmayi yakalar,
+    kotu niyetli bir yoneticiyi degil; bu sinir bilincli olarak belgelenmistir.
+    """
+
+    path: Path
+
+    def __post_init__(self) -> None:
+        self.path = Path(self.path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def export(self, checkpoint: dict[str, Any]) -> None:
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(checkpoint, ensure_ascii=False, default=str) + "\n")
+
+
 class AuditLedger:
     """SQLite destekli, process-safe hash zinciri.
 
     `mirror_path` verilirse kayitlar ayrica JSONL olarak da yazilir (dis log
     toplayicilar icin). Zincirin dogruluk kaynagi veritabanidir.
+
+    `checkpoint_exporter` verilirse zincir basinin ozeti duzenli araliklarla
+    harici bir append-only hedefe yazilir (bkz. `FileCheckpointExporter`).
     """
 
-    def __init__(self, db: StateDatabase, *, mirror_path: Path | str | None = None) -> None:
+    def __init__(
+        self,
+        db: StateDatabase,
+        *,
+        mirror_path: Path | str | None = None,
+        checkpoint_exporter: CheckpointExporter | None = None,
+        checkpoint_every: int = 0,
+    ) -> None:
         self._db = db
         self.mirror_path = Path(mirror_path) if mirror_path else None
         if self.mirror_path is not None:
             self.mirror_path.parent.mkdir(parents=True, exist_ok=True)
+        self._checkpoint_exporter = checkpoint_exporter
+        self._checkpoint_every = max(0, int(checkpoint_every))
+        self._last_checkpoint_seq = 0
 
     # --- Yazma --------------------------------------------------------------
     def append(
@@ -148,6 +193,9 @@ class AuditLedger:
         duration_ms: float | None = None,
         model: str = "",
         prompt_version: str = "",
+        tokens: dict[str, Any] | None = None,
+        estimated_cost: dict[str, Any] | None = None,
+        reasoning_level: str = "",
     ) -> AuditEntry:
         resolved_actor = actor or (execution.actor if execution else None)
         body: dict[str, Any] = {
@@ -172,6 +220,14 @@ class AuditLedger:
             # karar verdigini geriye donuk bulmayi saglar.
             "model": model or None,
             "prompt_version": prompt_version or None,
+            # Uygulanan akil yurutme seviyesi: kademelendirmenin gercekten
+            # calistigini denetim kaydindan da dogrulanabilir yapar.
+            "reasoning_level": reasoning_level or None,
+            # Token ve TAHMINI maliyet (rehber Madde 10). Maliyet saglayici
+            # faturasi degil, kendi sayaclarimizdan hesaplanan tahmindir;
+            # fiyat girilmemisse alan hic yazilmaz.
+            "tokens": tokens or None,
+            "estimated_cost": estimated_cost or None,
         }
         body = {k: v for k, v in body.items() if v is not None}
 
@@ -213,6 +269,8 @@ class AuditLedger:
 
         if self.mirror_path is not None:
             self._mirror({**skeleton, "entry_hash": entry_hash})
+
+        self._maybe_export_checkpoint(seq)
 
         return AuditEntry(
             seq=seq,
@@ -312,6 +370,51 @@ class AuditLedger:
             "scope": f"son {len(rows)} kayit" if partial else "tam zincir",
         }
 
+    def _maybe_export_checkpoint(self, seq: int) -> None:
+        """Esik dolduysa zincir ozetini harici hedefe yazar.
+
+        Export hatasi audit yazmasini GERI ALMAZ: kayit zaten deftere islendi.
+        Sessizce yutmak da dogru degil, bu yuzden uyari loglanir ve
+        `checkpoint_status()` ile disaridan gorunur kalir.
+        """
+        if self._checkpoint_exporter is None or self._checkpoint_every <= 0:
+            return
+        if seq - self._last_checkpoint_seq < self._checkpoint_every:
+            return
+        try:
+            self._checkpoint_exporter.export(self.checkpoint())
+            self._last_checkpoint_seq = seq
+        except Exception as exc:  # noqa: BLE001 - export hatasi audit'i bozmamali
+            log.warning("Audit checkpoint disa aktarilamadi: %s", exc)
+
+    def export_checkpoint(self) -> dict[str, Any] | None:
+        """Zincir ozetini simdi disa aktarir (kapanis, cron, manuel denetim)."""
+        if self._checkpoint_exporter is None:
+            return None
+        payload = self.checkpoint()
+        self._checkpoint_exporter.export(payload)
+        self._last_checkpoint_seq = int(payload.get("seq") or 0)
+        return payload
+
+    def checkpoint_status(self) -> dict[str, Any]:
+        """`/health` icin: harici checkpoint yapilandirilmis mi, ne kadar geride?"""
+        head = self._db.query_one("SELECT seq FROM audit_entries ORDER BY seq DESC LIMIT 1")
+        current = int(head["seq"]) if head else 0
+        configured = self._checkpoint_exporter is not None
+        return {
+            "configured": configured,
+            "every": self._checkpoint_every,
+            "last_exported_seq": self._last_checkpoint_seq,
+            "entries_since_export": max(0, current - self._last_checkpoint_seq),
+            # Yerel defterin butunluk sinirini gizlemeden bildirir.
+            "note": (
+                "Zincir tamper-evident'tir; immutability harici WORM hedefine baglidir."
+                if configured
+                else "Harici checkpoint hedefi yok: defterin tamaminin yeniden "
+                "yazilmasi tespit edilemez. AGENT_AUDIT_CHECKPOINT_PATH tanimlayin."
+            ),
+        }
+
     def checkpoint(self) -> dict[str, Any]:
         """Dis sisteme yazilacak zincir ozeti.
 
@@ -377,13 +480,25 @@ _LEDGER_CACHE: dict[str, AuditLedger] = {}
 _LEDGER_LOCK = threading.Lock()
 
 
-def get_audit_ledger(db_path: Path | str, *, mirror_path: Path | str | None = None) -> AuditLedger:
+def get_audit_ledger(
+    db_path: Path | str,
+    *,
+    mirror_path: Path | str | None = None,
+    checkpoint_path: Path | str | None = None,
+    checkpoint_every: int = 0,
+) -> AuditLedger:
     """Ayni durum veritabani icin tek defter ornegi."""
     key = str(db_path)
     with _LEDGER_LOCK:
         ledger = _LEDGER_CACHE.get(key)
         if ledger is None:
-            ledger = AuditLedger(get_state_db(db_path), mirror_path=mirror_path)
+            exporter = FileCheckpointExporter(Path(checkpoint_path)) if checkpoint_path else None
+            ledger = AuditLedger(
+                get_state_db(db_path),
+                mirror_path=mirror_path,
+                checkpoint_exporter=exporter,
+                checkpoint_every=checkpoint_every,
+            )
             _LEDGER_CACHE[key] = ledger
         return ledger
 

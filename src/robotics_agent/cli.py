@@ -11,7 +11,8 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 
-from .agent import SAPMultiAgent
+from certaops.runtime import SAPAgentRuntime
+
 from .config import get_settings, setup_logging
 
 console = Console()
@@ -39,7 +40,7 @@ EXAMPLES = [
 _RISK_STYLE = {"R0": "green", "R1": "cyan", "R2": "yellow", "R3": "red", "R4": "bold red"}
 
 
-def _print_tools(agent: SAPMultiAgent) -> None:
+def _print_tools(agent: SAPAgentRuntime) -> None:
     visible = set(agent._visible_names())  # noqa: SLF001 - CLI ayni surecte
     table = Table(title="Kayitli Toollar", header_style="bold cyan", show_lines=False)
     table.add_column("Tool", style="green", no_wrap=True)
@@ -65,7 +66,7 @@ def _print_tools(agent: SAPMultiAgent) -> None:
     )
 
 
-def _print_budget(agent: SAPMultiAgent) -> None:
+def _print_budget(agent: SAPAgentRuntime) -> None:
     console.print(
         Panel(
             json.dumps(agent.budget_report(), indent=2, ensure_ascii=False),
@@ -75,7 +76,7 @@ def _print_budget(agent: SAPMultiAgent) -> None:
     )
 
 
-def _print_audit(agent: SAPMultiAgent, limit: int = 10) -> None:
+def _print_audit(agent: SAPAgentRuntime, limit: int = 10) -> None:
     ledger = agent.ctx.audit
     if ledger is None:
         console.print("[yellow]Audit defteri yapilandirilmamis.[/yellow]")
@@ -99,7 +100,7 @@ def _print_audit(agent: SAPMultiAgent, limit: int = 10) -> None:
     console.print(f"[dim]Hash zinciri: {ledger.verify()}[/dim]")
 
 
-def _print_health(agent: SAPMultiAgent) -> None:
+def _print_health(agent: SAPAgentRuntime) -> None:
     health = agent.health()
     console.print(
         Panel(
@@ -110,7 +111,7 @@ def _print_health(agent: SAPMultiAgent) -> None:
     )
 
 
-def _run_turn(agent: SAPMultiAgent, message: str, *, show_tools: bool) -> None:
+def _run_turn(agent: SAPAgentRuntime, message: str, *, show_tools: bool) -> None:
     def on_tool_start(name: str, args: dict) -> None:
         if show_tools:
             preview = json.dumps(args, ensure_ascii=False)
@@ -157,10 +158,10 @@ def main(argv: list[str] | None = None) -> int:
     settings = get_settings()
 
     try:
-        agent = SAPMultiAgent(settings)
+        agent = SAPAgentRuntime(settings)
     except RuntimeError as exc:
         console.print(f"[red]Baslatma hatasi:[/red] {exc}")
-        console.print("[dim].env dosyasini olusturup ANTHROPIC_API_KEY degerini girin.[/dim]")
+        console.print("[dim].env dosyasini olusturup GEMINI_API_KEY degerini girin (MODEL_PROVIDER=gemini).[/dim]")
         return 1
 
     show_tools = not args.no_tool_log
@@ -173,7 +174,8 @@ def main(argv: list[str] | None = None) -> int:
     console.print(Panel(BANNER, border_style="cyan"))
     health = agent.health()
     console.print(
-        f"[dim]Model: {health['model']} | SAP: {health['sap'].get('backend')} "
+        f"[dim]Model: {health['model']['provider']}/{health['model']['model']} "
+        f"| SAP: {health['sap'].get('backend')} "
         f"({health['sap'].get('status')}) | {health['visible_tool_count']}/"
         f"{health['registered_tool_count']} tool gorunur | dry-run: {health['dry_run']} | "
         f"roller: {', '.join(health['actor']['roles']) or 'yok'}[/dim]\n"

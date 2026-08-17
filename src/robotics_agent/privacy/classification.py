@@ -26,6 +26,7 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import lru_cache
 from typing import Any
 
 __all__ = [
@@ -193,15 +194,45 @@ _PERSONAL_MARKERS = (
 
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 
+# Alan adlari kucuk ve tekrar eden bir kumedir: 200 satirlik bir sonucta ayni
+# 15 ad 200 kez normalize edilir. Bu fonksiyon DLP gezinmesinin en sicak
+# noktasiydi (240 tool cagrisinda 470.760 cagri). Onbellek sinirli tutulur ki
+# beklenmedik bir alan patlamasi bellegi buyutmesin.
+_NORMALIZE_CACHE_SIZE = 8192
+
+
+@lru_cache(maxsize=_NORMALIZE_CACHE_SIZE)
+def _normalize_cached(name: str) -> str:
+    return _NON_ALNUM.sub("", name.lower())
+
 
 def _normalize(name: str) -> str:
-    return _NON_ALNUM.sub("", str(name).lower())
+    # str olmayan anahtar (int indeks vb.) hashlenebilir ama onbellegi kirletir;
+    # once metne cevrilir.
+    return _normalize_cached(name if isinstance(name, str) else str(name))
 
 
+@lru_cache(maxsize=_NORMALIZE_CACHE_SIZE)
 def is_personal_field(name: str) -> bool:
     """Alan kisisel veri tasiyor mu (KVKK/GDPR anlaminda)?"""
     normalized = _normalize(name)
     return any(marker in normalized for marker in _PERSONAL_MARKERS)
+
+
+@lru_cache(maxsize=_NORMALIZE_CACHE_SIZE)
+def _classify_normalized(normalized: str) -> DataClass | None:
+    """Merkezi envanter + alt-dize kurallari. Politika override'i HARIC.
+
+    Override'lar tool'a ozgudur ve burada degerlendirilemez; bu fonksiyon
+    yalniz global kurallari onbellekler.
+    """
+    known = FIELD_CLASS_INVENTORY.get(normalized)
+    if known is not None:
+        return known
+    for needles, data_class in _SUBSTRING_RULES:
+        if any(needle in normalized for needle in needles):
+            return data_class
+    return None
 
 
 def classify_field(
@@ -223,13 +254,8 @@ def classify_field(
         for key, value in overrides.items():
             if _normalize(key) == normalized:
                 return value
-    known = FIELD_CLASS_INVENTORY.get(normalized)
-    if known is not None:
-        return known
-    for needles, data_class in _SUBSTRING_RULES:
-        if any(needle in normalized for needle in needles):
-            return data_class
-    return default
+    resolved = _classify_normalized(normalized)
+    return resolved if resolved is not None else default
 
 
 def walk_fields(payload: Any, *, prefix: str = "", max_depth: int = 12) -> list[tuple[str, str, Any]]:
@@ -286,6 +312,28 @@ class DataPolicy:
     data_owner: str = "sap_process_owner"
     retention_minutes: int = 120
 
+    # Normalize edilmis arama tablolari. Eskiden `classify()` her alan icin
+    # TUM politika anahtarlarini yeniden normalize ediyordu; 200 kayitlik bir
+    # sonucta bu on binlerce gereksiz regex cagrisi demekti. Anahtarlar sabit
+    # oldugu icin bir kez hesaplanir. `compare=False`: frozen dataclass'in
+    # esitlik/hash sozlesmesine karismaz.
+    _field_index: dict[str, DataClass] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _model_allowed_index: frozenset[str] = field(
+        default_factory=frozenset, init=False, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "_field_index", {_normalize(k): v for k, v in self.fields.items()}
+        )
+        object.__setattr__(
+            self,
+            "_model_allowed_index",
+            frozenset(_normalize(name) for name in self.model_allowed),
+        )
+
     def classify(self, field_name: str, *, strict: bool = False) -> DataClass:
         """Alan sinifini dondurur.
 
@@ -293,15 +341,12 @@ class DataPolicy:
         siniflandirilmamis veri modele/loga/cache'e sizmaz.
         """
         normalized = _normalize(field_name)
-        for key, value in self.fields.items():
-            if _normalize(key) == normalized:
-                return value
-        known = FIELD_CLASS_INVENTORY.get(normalized)
-        if known is not None:
-            return known
-        for needles, data_class in _SUBSTRING_RULES:
-            if any(needle in normalized for needle in needles):
-                return data_class
+        override = self._field_index.get(normalized)
+        if override is not None:
+            return override
+        resolved = _classify_normalized(normalized)
+        if resolved is not None:
+            return resolved
         return DataClass.D3 if strict else self.default_class
 
     def is_model_allowed(self, field_name: str, data_class: DataClass) -> bool:
@@ -314,8 +359,7 @@ class DataPolicy:
             return False
         if not self.model_allowed or data_class.level <= DataClass.D1.level:
             return True
-        normalized = _normalize(field_name)
-        return any(_normalize(allowed) == normalized for allowed in self.model_allowed)
+        return _normalize(field_name) in self._model_allowed_index
 
     @property
     def max_declared_class(self) -> DataClass:

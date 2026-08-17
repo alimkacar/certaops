@@ -118,9 +118,10 @@ PACKS: dict[str, DomainPack] = {
         title="Satinalma (yazma)",
         domains=("procurement_write",),
         # Yazma akisi ATP/tedarikci okumasina ihtiyac duyar; malzeme arama ise
-        # bu asamada gerekmez (numaralar zaten belirlenmis olur). master_data
-        # Ana veri ayri agent'a handoff edilir; bu, yazma agent'inin sema
-        # butcesini (3.000 token) icinde tutar.
+        # bu asamada gerekmez (numaralar zaten belirlenmis olur). Ana veri ayri
+        # profile birakilir; bu, yazma profilinin sema butcesini
+        # (`BUDGET_SCHEMA_TOKENS`, varsayilan 4.000) icinde tutar. Olculen deger
+        # `python demo.py --tokens` ciktisinda gorulur.
         includes=("procurement_read",),
         triggers=(
             "talep ac",
@@ -136,9 +137,10 @@ PACKS: dict[str, DomainPack] = {
     ),
     # --- Procure-to-pay gorunurlugu ----------------------------------------
     # Ayri pack olmasinin nedeni sema butcesi: bu tool'lari mevcut
-    # `procurement_read` pack'ine koymak, Satinalma agent'ini 3.000 token
-    # sinirinin uzerine cikarirdi. Ayirmak hem butceyi korur hem de her
-    # agent'in yalniz kendi isine yarayan semayi gormesini saglar.
+    # `procurement_read` pack'ine koymak, Satinalma profilini
+    # `BUDGET_SCHEMA_TOKENS` sinirinin uzerine cikarirdi. Ayirmak hem butceyi
+    # korur hem de her profilin yalniz kendi isine yarayan semayi gormesini
+    # saglar. Butce tek kaynaktir; yorumda sabit bir sayi tekrarlanmaz.
     "p2p_visibility": DomainPack(
         key="p2p_visibility",
         title="Belge akisi ve siparis durumu",
@@ -237,20 +239,30 @@ class RoutingDecision:
     packs: tuple[str, ...]
     matched_triggers: dict[str, tuple[str, ...]] = field(default_factory=dict)
     fallback: bool = False
+    omitted_packs: tuple[str, ...] = ()
+
+    @property
+    def truncated(self) -> bool:
+        """Yetkili bir eslesme ``max_packs`` siniri nedeniyle atlandi mi?"""
+
+        return bool(self.omitted_packs)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "packs": list(self.packs),
             "matched_triggers": {k: list(v) for k, v in self.matched_triggers.items()},
             "fallback": self.fallback,
+            "omitted_packs": list(self.omitted_packs),
+            "truncated": self.truncated,
         }
 
 
 def route(message: str, actor: ActorContext, *, max_packs: int = 2) -> RoutingDecision:
     """Kullanici metnine gore domain pack secer.
 
-    Bootstrap her zaman aciktir. Eslesme yoksa genis ama okuma agirlikli bir
-    varsayilan sete duser; mutating pack asla varsayilan olarak acilmaz.
+    Bootstrap her zaman aciktir. Eslesme yoksa yalniz teshis pack'i acilir;
+    genis bir veri pack'ini tahmin ederek modele gostermek yerine kullanicidan
+    hedefini netlestirmesi beklenir. Mutating pack asla varsayilan acilmaz.
     """
     normalized = _normalize(message or "")
     scores: list[tuple[int, str, tuple[str, ...]]] = []
@@ -265,20 +277,25 @@ def route(message: str, actor: ActorContext, *, max_packs: int = 2) -> RoutingDe
             scores.append((len(hits), key, hits))
 
     scores.sort(key=lambda item: (-item[0], item[1]))
-    chosen = [key for _, key, _ in scores[:max_packs]]
-    matched = {key: hits for _, key, hits in scores[:max_packs]}
-
+    selected_scores = scores[:max_packs]
+    omitted_scores = scores[max_packs:]
+    chosen = [key for _, key, _ in selected_scores]
+    matched = {key: hits for _, key, hits in selected_scores}
     fallback = False
     if not chosen:
         fallback = True
-        chosen = [
-            key
-            for key in ("master_data", "procurement_read")
-            if _actor_may_open(key, actor)
-        ]
+        chosen = ["diagnostics"] if _actor_may_open("diagnostics", actor) else []
 
     ordered = _expand(chosen)
-    return RoutingDecision(packs=ordered, matched_triggers=matched, fallback=fallback)
+    # Bir alt-skorlu pack, secilen bir pack'in dependency'si olarak zaten
+    # acilmissa gercekte omit edilmis sayilmaz.
+    omitted = tuple(key for _, key, _ in omitted_scores if key not in ordered)
+    return RoutingDecision(
+        packs=ordered,
+        matched_triggers=matched,
+        fallback=fallback,
+        omitted_packs=omitted,
+    )
 
 
 def _actor_may_open(pack_key: str, actor: ActorContext) -> bool:
@@ -323,9 +340,7 @@ def pack_catalogue(actor: ActorContext | None = None) -> list[dict[str, Any]]:
     return out
 
 
-def schema_token_report(
-    definitions: Sequence[dict[str, Any]], *, budget: int
-) -> dict[str, Any]:
+def schema_token_report(definitions: Sequence[dict[str, Any]], *, budget: int) -> dict[str, Any]:
     """Aktif tool semalarinin token maliyeti ve butce durumu."""
     total = sum(estimate_tokens(d) for d in definitions)
     return {

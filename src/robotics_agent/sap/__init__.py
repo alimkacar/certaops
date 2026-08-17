@@ -23,6 +23,15 @@ def build_backend(settings: Settings | None = None) -> SAPBackend:
         log.info("SAP backend: OData (%s, client %s)", settings.sap.base_url, settings.sap.client)
         return ODataSAPBackend(settings)
 
+    if kind == "ecc":
+        # ECC 6.0 EHP8: embedded SAP_GWFND 7.50 uzerinde Z-Gateway OData V2.
+        # Portlar `odata` ile birebir aynidir; degisen yalniz servis manifesti
+        # ve sorgu desenleridir. Tool/policy/audit/privacy katmanlari etkilenmez.
+        from .ecc import ECCSAPBackend
+
+        log.info("SAP backend: ECC (%s, client %s)", settings.sap.base_url, settings.sap.client)
+        return ECCSAPBackend(settings)
+
     from .mock import MockSAPBackend
 
     log.info("SAP backend: mock (yerel veri seti)")

@@ -34,7 +34,7 @@ COMMON_PROJECTION_SCHEMA: dict[str, Any] = {
 
 # Tool semalarina gomulen ortak, **kompakt** detay alani. Enum degerleri kendini
 # aciklar; her tool'un ayni cumleyi tekrar etmesi turda ~15 token bosa harcar
-# ve agent basina 3.000 token butcesini erken doldurur. Seviyelerin ne anlama
+# ve `BUDGET_SCHEMA_TOKENS` butcesini erken doldurur. Seviyelerin ne anlama
 # geldigi tool aciklamasinda ve burada tek yerde yazilidir:
 #   summary  = karar + toplamlar
 #   standard = varsayilan calisma seviyesi
@@ -192,36 +192,67 @@ def enforce_result_budget(
 ) -> BudgetOutcome:
     """Sonucu token butcesine sigdirir.
 
-    Strateji: en buyuk listeyi kademeli kisaltir, korunan alanlari hic dokunmaz.
+    Strateji: en buyuk liste veya metni kademeli kisaltir; gerekirse buyuk,
+    korumasiz alanlari kaldirir. Normal kosullarda korunan alanlara dokunulmaz.
+    Yalniz korunan verinin kendisi butceyi asiyorsa hard limit fail-closed
+    uygulanir ve tam kayit evidence handle arkasinda kalir.
     Kirpma yapildiginda `_meta.truncated` ve varsa `_meta.evidence_id` eklenir ki
     model tam kaydin nerede oldugunu bilsin.
     """
+    max_tokens = max(1, int(max_tokens))
     original = estimate_tokens(payload)
     if original <= max_tokens:
-        return BudgetOutcome(payload=payload, original_tokens=original, final_tokens=original, trimmed=False)
+        return BudgetOutcome(
+            payload=payload, original_tokens=original, final_tokens=original, trimmed=False
+        )
 
     trimmed_payload = json.loads(json.dumps(payload, ensure_ascii=False, default=str))
-    dropped = 0
-
-    for _ in range(12):
-        if estimate_tokens(trimmed_payload) <= max_tokens:
-            break
-        target_key, target_list = _largest_list(trimmed_payload)
-        if target_key is None or target_list is None or len(target_list) <= 1:
-            break
-        keep = max(1, len(target_list) // 2)
-        dropped += len(target_list) - keep
-        _replace_list(trimmed_payload, target_key, target_list[:keep])
-
-    meta = trimmed_payload.setdefault("_meta", {})
+    existing_meta = trimmed_payload.get("_meta")
+    if not isinstance(existing_meta, dict):
+        existing_meta = {}
+        trimmed_payload["_meta"] = existing_meta
+    meta = existing_meta
     meta["truncated"] = True
-    meta["dropped_items"] = dropped
+    meta["dropped_items"] = 0
     meta["budget_tokens"] = max_tokens
     if evidence_id:
         meta["evidence_id"] = evidence_id
     meta["hint"] = "Tam kayit icin get_evidence tool'unu evidence_id ile cagir."
 
+    dropped = _compact_to_budget(trimmed_payload, max_tokens=max_tokens, include_protected=False)
+    if estimate_tokens(trimmed_payload) > max_tokens:
+        # Hard limit, korunan tek bir scalar/string'in de siniri asmasina izin
+        # vermez. Tam deger evidence store'da kalir.
+        dropped += _compact_to_budget(
+            trimmed_payload, max_tokens=max_tokens, include_protected=True
+        )
+    meta["dropped_items"] = dropped
+
+    if estimate_tokens(trimmed_payload) > max_tokens:
+        # Handler tarafindan gelen sisirilmis `_meta` de hard limiti delemez.
+        compact_meta: dict[str, Any] = {
+            "truncated": True,
+            "dropped_items": dropped,
+            "budget_tokens": max_tokens,
+        }
+        if evidence_id:
+            compact_meta["evidence_id"] = evidence_id
+        trimmed_payload["_meta"] = compact_meta
+        _compact_to_budget(trimmed_payload, max_tokens=max_tokens, include_protected=True)
+
+    if estimate_tokens(trimmed_payload) > max_tokens:
+        # Cok dusuk yapilandirma limitlerinde metadata bile sigmayabilir. En
+        # kucuk dogru zarf secilir; `{}` her pozitif limitte bir token sayilir.
+        candidates: list[dict[str, Any]] = []
+        if evidence_id:
+            candidates.append({"_meta": {"truncated": True, "evidence_id": evidence_id}})
+        candidates.extend(({"_meta": {"truncated": True}}, {}))
+        trimmed_payload = next(
+            candidate for candidate in candidates if estimate_tokens(candidate) <= max_tokens
+        )
+
     final = estimate_tokens(trimmed_payload)
+    assert final <= max_tokens
     return BudgetOutcome(
         payload=trimmed_payload,
         original_tokens=original,
@@ -231,20 +262,103 @@ def enforce_result_budget(
     )
 
 
-def _largest_list(payload: dict[str, Any]) -> tuple[str | None, list[Any] | None]:
-    """Kirpilacak en buyuk listeyi bulur (yalniz ust seviye ve bir kademe alt)."""
-    best_key: str | None = None
-    best_list: list[Any] | None = None
-    best_size = 0
-    for key, value in payload.items():
-        if key in {"_meta", "evidence"} or key in PROTECTED_KEYS:
+_Path = tuple[str | int, ...]
+_Compaction = tuple[int, _Path, Any, int]
+
+
+def _compact_to_budget(payload: dict[str, Any], *, max_tokens: int, include_protected: bool) -> int:
+    """Nested list/string'leri hard token limitine kadar deterministik kisalt."""
+
+    dropped = 0
+    for _ in range(512):
+        if estimate_tokens(payload) <= max_tokens:
+            break
+        candidate = _largest_compactable(payload, include_protected=include_protected)
+        if candidate is not None:
+            _, path, replacement, removed = candidate
+            _set_path(payload, path, replacement)
+            dropped += removed
             continue
+        removable = _largest_removable_key(payload, include_protected=include_protected)
+        if removable is None:
+            break
+        parent, key = _parent_and_key(payload, removable)
+        del parent[key]
+    return dropped
+
+
+def _largest_compactable(payload: dict[str, Any], *, include_protected: bool) -> _Compaction | None:
+    best: _Compaction | None = None
+
+    def consider(path: _Path, value: Any, *, protected: bool) -> None:
+        nonlocal best
+        if protected and not include_protected:
+            return
+        replacement: Any
+        removed = 0
         if isinstance(value, list) and value:
-            size = estimate_tokens(value)
-            if size > best_size:
-                best_key, best_list, best_size = key, value, size
-    return best_key, best_list
+            keep = len(value) // 2
+            replacement = value[:keep]
+            removed = len(value) - keep
+        elif isinstance(value, str) and value:
+            keep = len(value) // 2
+            replacement = value[:keep] + ("…" if keep else "")
+        else:
+            return
+        saving = _json_size(value) - _json_size(replacement)
+        if saving > 0 and (best is None or saving > best[0]):
+            best = (saving, path, replacement, removed)
+
+    def visit(value: Any, path: _Path, *, protected: bool) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key == "_meta":
+                    continue
+                child_protected = protected or key in PROTECTED_KEYS
+                consider(path + (key,), child, protected=child_protected)
+                visit(child, path + (key,), protected=child_protected)
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                consider(path + (index,), child, protected=protected)
+                visit(child, path + (index,), protected=protected)
+
+    visit(payload, (), protected=False)
+    return best
 
 
-def _replace_list(payload: dict[str, Any], key: str, new_value: list[Any]) -> None:
-    payload[key] = new_value
+def _largest_removable_key(payload: dict[str, Any], *, include_protected: bool) -> _Path | None:
+    best: tuple[int, _Path] | None = None
+
+    def visit(value: Any, path: _Path, *, protected: bool) -> None:
+        nonlocal best
+        if not isinstance(value, dict):
+            return
+        for key, child in value.items():
+            if key == "_meta":
+                continue
+            child_protected = protected or key in PROTECTED_KEYS
+            child_path = path + (key,)
+            if include_protected or not child_protected:
+                size = _json_size({key: child})
+                if best is None or size > best[0]:
+                    best = (size, child_path)
+            visit(child, child_path, protected=child_protected)
+
+    visit(payload, (), protected=False)
+    return best[1] if best is not None else None
+
+
+def _parent_and_key(payload: dict[str, Any], path: _Path) -> tuple[Any, str | int]:
+    parent: Any = payload
+    for part in path[:-1]:
+        parent = parent[part]
+    return parent, path[-1]
+
+
+def _set_path(payload: dict[str, Any], path: _Path, value: Any) -> None:
+    parent, key = _parent_and_key(payload, path)
+    parent[key] = value
+
+
+def _json_size(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str))

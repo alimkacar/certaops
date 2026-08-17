@@ -9,6 +9,20 @@ Desteklenen modlar:
                  (Cloud Connector arkasindaki on-premise sistem dahil)
 
 Secret'lar yalnizca bu modulde tutulur; modele ve loglara asla verilmez.
+
+Iki tasarim notu:
+
+1. **Destination token'i sabit bir header degildir.** Destination servisi
+   `authTokens[].value` ile birlikte `expiresIn` doner. Token'i client
+   header'ina bir kez gomup birakmak, uzun omurlu bir serviste sure dolunca
+   her SAP cagrisinin 401 donmesi demektir; teshisi zordur cunku ilk saatler
+   sorunsuz gecer. Bu yuzden destination modu da `token_provider` uretir ve
+   saglayici sure dolmadan destination'i yeniden cozer.
+
+2. **`ProxyType: OnPremise` bir bilgi etiketi degil, yonlendirme karari.**
+   Cloud Connector arkasindaki sistem yalniz BTP connectivity proxy uzerinden
+   erisilir; dogrudan istek ic aga hic ulasmaz. Proxy yapilandirilmamissa
+   baglanti sessizce timeout'a dusmek yerine acik hata verir.
 """
 
 from __future__ import annotations
@@ -16,6 +30,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -39,6 +54,16 @@ class ResolvedConnection:
     proxy_type: str = "Internet"
     origin: str = "config"
     warnings: tuple[str, ...] = ()
+    #: Cloud Connector arkasindaki sistem icin BTP connectivity proxy URL'i.
+    proxy_url: str = ""
+    #: Proxy'ye gonderilecek `Proxy-Authorization` degerini ureten saglayici.
+    proxy_auth_provider: Callable[[], str] | None = None
+    #: Coklu Cloud Connector kurulumunda hedef location.
+    location_id: str = ""
+
+    @property
+    def is_on_premise(self) -> bool:
+        return self.proxy_type.lower() == "onpremise"
 
     def describe(self) -> dict[str, Any]:
         """Secret icermeyen ozet (health/capability tool'lari icin)."""
@@ -48,6 +73,8 @@ class ResolvedConnection:
             "proxy_type": self.proxy_type,
             "origin": self.origin,
             "verify_ssl": self.verify_ssl,
+            "via_connectivity_proxy": bool(self.proxy_url),
+            "location_id": self.location_id,
             "warnings": list(self.warnings),
         }
 
@@ -98,7 +125,19 @@ class OAuth2TokenProvider:
                     "OAuth2 yanitinda access_token yok.", code="OAUTH_TOKEN_MISSING",
                     detail=self._token_url,
                 )
-            self._expires_at = time.time() + float(payload.get("expires_in", 3600) or 3600)
+            # `or 3600` kullanmak `expires_in: 0` degerini de 3600'e cevirirdi:
+            # zaten olmus bir token bir saat boyunca onbellekte kalir ve her SAP
+            # cagrisi 401 doner. Teshisi zor bir arizadir. Eksik/None ile 0
+            # ayrilir.
+            raw_expiry = payload.get("expires_in")
+            if raw_expiry in (None, ""):
+                lifetime = 3600.0
+            else:
+                try:
+                    lifetime = float(raw_expiry)
+                except (TypeError, ValueError):
+                    lifetime = 3600.0
+            self._expires_at = time.time() + max(0.0, lifetime)
             return self._token
 
     def expires_in(self) -> float:
@@ -106,6 +145,19 @@ class OAuth2TokenProvider:
 
     def close(self) -> None:
         self._client.close()
+
+
+@dataclass
+class _DestinationSnapshot:
+    """Destination servisinden gelen tek cozumleme sonucu."""
+
+    base_url: str
+    token: str
+    token_type: str
+    proxy_type: str
+    auth_type: str
+    expires_at: float
+    warnings: tuple[str, ...]
 
 
 class DestinationResolver:
@@ -122,7 +174,8 @@ class DestinationResolver:
         self._token_provider = token_provider
         self._client = client or httpx.Client(timeout=30.0)
 
-    def resolve(self, name: str) -> ResolvedConnection:
+    def fetch(self, name: str) -> _DestinationSnapshot:
+        """Destination'i cozer. Her cagrida taze token doner."""
         response = self._client.get(
             f"{self._service_url}/destination-configuration/v1/destinations/{name}",
             headers={"Authorization": f"Bearer {self._token_provider()}"},
@@ -143,14 +196,27 @@ class DestinationResolver:
                 f"Destination '{name}' URL icermiyor.", code="DESTINATION_NO_URL", detail=name
             )
 
-        headers: dict[str, str] = {}
-        token_provider = None
+        token = ""
+        token_type = "Bearer"
+        # `expiresIn` yoksa muhafazakar davran: 10 dakika sonra yeniden coz.
+        # Uzun bir varsayilan, sure dolmus bir token'i saatlerce kullanmak demek.
+        lifetime = 600.0
         if auth_tokens:
-            token = auth_tokens[0]
-            value = str(token.get("value", ""))
-            token_type = str(token.get("type", "Bearer"))
-            if value:
-                headers["Authorization"] = f"{token_type} {value}"
+            entry = auth_tokens[0]
+            if entry.get("error"):
+                raise SAPError(
+                    f"Destination '{name}' kimlik dogrulama hatasi dondurdu.",
+                    code="DESTINATION_AUTH_FAILED",
+                    detail=name,
+                )
+            token = str(entry.get("value", ""))
+            token_type = str(entry.get("type") or "Bearer")
+            raw_expiry = entry.get("expiresIn")
+            if raw_expiry not in (None, ""):
+                try:
+                    lifetime = float(raw_expiry)
+                except (TypeError, ValueError):
+                    lifetime = 600.0
 
         auth_type = str(config.get("Authentication", ""))
         warnings: list[str] = []
@@ -165,40 +231,153 @@ class DestinationResolver:
                 "Agent teknik kullanici yetkisiyle genisletme yapamaz."
             )
 
-        return ResolvedConnection(
+        return _DestinationSnapshot(
             base_url=base_url,
-            token_provider=token_provider,
-            headers=headers,
+            token=token,
+            token_type=token_type,
             proxy_type=str(config.get("ProxyType", "Internet")),
-            origin=f"destination:{name}",
+            auth_type=auth_type,
+            expires_at=time.time() + max(0.0, lifetime),
             warnings=tuple(warnings),
+        )
+
+    def resolve(self, name: str) -> ResolvedConnection:
+        """Tek seferlik cozumleme (teshis ve geriye donuk uyumluluk).
+
+        Uretim yolu `DestinationTokenProvider` uzerinden gider; bu metot
+        token'i yenilemez, yalniz anlik durumu dondurur.
+        """
+        snapshot = self.fetch(name)
+        headers: dict[str, str] = {}
+        if snapshot.token:
+            headers["Authorization"] = f"{snapshot.token_type} {snapshot.token}"
+        return ResolvedConnection(
+            base_url=snapshot.base_url,
+            headers=headers,
+            proxy_type=snapshot.proxy_type,
+            origin=f"destination:{name}",
+            warnings=snapshot.warnings,
         )
 
     def close(self) -> None:
         self._client.close()
 
 
+class DestinationTokenProvider:
+    """Destination token'ini suresi dolmadan yeniden cozer.
+
+    `OAuth2TokenProvider` ile ayni sozlesme (`() -> str`), ama token'i
+    destination servisinden alir. Bu sinif olmadan destination modu, ilk
+    cozumlemede alinan token'i omur boyu kullanirdi.
+    """
+
+    def __init__(
+        self, resolver: DestinationResolver, name: str, *, skew_seconds: int = 60
+    ) -> None:
+        self._resolver = resolver
+        self._name = name
+        self._skew = max(10, skew_seconds)
+        self._snapshot: _DestinationSnapshot | None = None
+        self._lock = threading.Lock()
+
+    def snapshot(self) -> _DestinationSnapshot:
+        with self._lock:
+            current = self._snapshot
+            if current is None or time.time() >= current.expires_at - self._skew:
+                current = self._resolver.fetch(self._name)
+                self._snapshot = current
+            return current
+
+    def __call__(self) -> str:
+        return self.snapshot().token
+
+    @property
+    def has_token(self) -> bool:
+        return bool(self.snapshot().token)
+
+
+def _connectivity_proxy(cfg: SAPSettings) -> tuple[str, Callable[[], str] | None]:
+    """Cloud Connector trafiginin gectigi BTP connectivity proxy'si.
+
+    Proxy kimlik dogrulamasi da sureli bir OAuth2 token'idir; sabit deger
+    olarak gomulmez, saglayici uzerinden her istekte tazelenebilir hale gelir.
+    """
+    if not cfg.connectivity_proxy_url:
+        return "", None
+    provider: Callable[[], str] | None = None
+    if cfg.connectivity_client_id and cfg.connectivity_token_url:
+        provider = OAuth2TokenProvider(
+            token_url=cfg.connectivity_token_url,
+            client_id=cfg.connectivity_client_id,
+            client_secret=cfg.connectivity_client_secret,
+        )
+    return cfg.connectivity_proxy_url.rstrip("/"), provider
+
+
 def resolve_connection(cfg: SAPSettings) -> ResolvedConnection:
     """Ayarlara gore baglanti bilgisini cozer."""
     if cfg.auth_mode == "destination":
-        token_provider = OAuth2TokenProvider(
+        oauth = OAuth2TokenProvider(
             token_url=cfg.oauth_token_url,
             client_id=cfg.oauth_client_id,
             client_secret=cfg.oauth_client_secret,
             scope=cfg.oauth_scope,
         )
         resolver = DestinationResolver(
-            service_url=cfg.destination_service_url, token_provider=token_provider
+            service_url=cfg.destination_service_url, token_provider=oauth
         )
-        resolved = resolver.resolve(cfg.destination_name)
+        provider = DestinationTokenProvider(resolver, cfg.destination_name)
+        snapshot = provider.snapshot()
+
+        warnings = list(snapshot.warnings)
+        proxy_url, proxy_auth = "", None
+        if snapshot.proxy_type.lower() == "onpremise":
+            proxy_url, proxy_auth = _connectivity_proxy(cfg)
+            if not proxy_url:
+                # Sessiz timeout yerine acik hata: on-premise sistem
+                # connectivity proxy olmadan BTP'den erisilebilir DEGILDIR.
+                raise SAPError(
+                    f"Destination '{cfg.destination_name}' ProxyType=OnPremise bildiriyor "
+                    "ancak SAP_CONNECTIVITY_PROXY_URL tanimli degil. Cloud Connector "
+                    "arkasindaki sisteme dogrudan baglanilamaz.",
+                    code="CONNECTIVITY_PROXY_MISSING",
+                    detail=cfg.destination_name,
+                )
+            if proxy_auth is None:
+                warnings.append(
+                    "Connectivity proxy kimlik dogrulamasi yapilandirilmamis "
+                    "(SAP_CONNECTIVITY_TOKEN_URL/CLIENT_ID). Proxy anonim erisime "
+                    "acik degilse istekler 407 doner."
+                )
+
         return ResolvedConnection(
-            base_url=resolved.base_url,
-            token_provider=resolved.token_provider,
-            headers=resolved.headers,
+            base_url=snapshot.base_url,
+            # Token'i header'a gommuyoruz: her istekte saglayicidan taze okunur.
+            token_provider=provider if snapshot.token else None,
             verify_ssl=cfg.verify_ssl,
-            proxy_type=resolved.proxy_type,
-            origin=resolved.origin,
-            warnings=resolved.warnings,
+            proxy_type=snapshot.proxy_type,
+            origin=f"destination:{cfg.destination_name}",
+            warnings=tuple(warnings),
+            proxy_url=proxy_url,
+            proxy_auth_provider=proxy_auth,
+            location_id=cfg.cloud_connector_location_id,
+        )
+
+    if cfg.auth_mode == "apikey":
+        # SAP API Business Hub sandbox: gercek SAP tarafindan barindirilan,
+        # gercek verili, SALT OKUNUR bir S/4HANA Cloud sistemi. Servis
+        # yollarini, entity/alan adlarini ve hata bicimini dogrulamak icin
+        # kullanilir; yazma denemesi sandbox tarafindan reddedilir.
+        return ResolvedConnection(
+            base_url=cfg.base_url,
+            headers={cfg.api_key_header: cfg.api_key},
+            verify_ssl=cfg.verify_ssl,
+            origin="config:apikey(sandbox)",
+            warnings=(
+                "SAP_AUTH_MODE=apikey: API Business Hub sandbox'i SALT OKUNURDUR. "
+                "Yazma cagrilari SAP tarafindan reddedilir; kontrat dogrulamasi "
+                "icin kullanin.",
+            ),
         )
 
     if cfg.auth_mode == "oauth2":
@@ -229,12 +408,29 @@ def resolve_connection(cfg: SAPSettings) -> ResolvedConnection:
 
 
 def build_http_client(connection: ResolvedConnection, cfg: SAPSettings) -> httpx.Client:
+    """Cozulmus baglanti icin httpx istemcisi kurar.
+
+    On-premise destination'da trafik connectivity proxy'ye yonlendirilir.
+    `Proxy-Authorization` ve `SAP-Connectivity-SCC-Location-ID` proxy'nin
+    kendisine aittir; hedef SAP sistemine gonderilmez.
+    """
     headers = {"Accept": "application/json", "Accept-Language": "TR"}
     headers.update(connection.headers)
-    return httpx.Client(
-        base_url=connection.base_url,
-        auth=connection.auth,
-        verify=connection.verify_ssl,
-        timeout=cfg.timeout,
-        headers=headers,
-    )
+
+    kwargs: dict[str, Any] = {
+        "base_url": connection.base_url,
+        "auth": connection.auth,
+        "verify": connection.verify_ssl,
+        "timeout": cfg.timeout,
+        "headers": headers,
+    }
+    if connection.proxy_url:
+        proxy_headers: dict[str, str] = {}
+        if connection.proxy_auth_provider is not None:
+            proxy_headers["Proxy-Authorization"] = (
+                f"Bearer {connection.proxy_auth_provider()}"
+            )
+        if connection.location_id:
+            proxy_headers["SAP-Connectivity-SCC-Location-ID"] = connection.location_id
+        kwargs["proxy"] = httpx.Proxy(url=connection.proxy_url, headers=proxy_headers)
+    return httpx.Client(**kwargs)
