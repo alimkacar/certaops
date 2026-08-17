@@ -14,6 +14,7 @@ Portlar:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from datetime import date
 from typing import Any
 
@@ -55,10 +56,52 @@ __all__ = [
 ]
 
 
+def effective_unit_price(
+    declared: float | None,
+    source_price: float,
+) -> tuple[float, str]:
+    """Onay esigi hesabinda kullanilacak birim fiyat.
+
+    **Guvenlik kurali:** modelin bildirdigi fiyat degeri yalnizca YUKARI
+    calisir. Risk skorlamasindaki `max(bildirilen, runtime)` ilkesiyle aynidir.
+
+    Neden gerekli: `approval_policy="threshold"` onay ihtiyacini hazirlanan
+    taslagin tutarindan turetir. Model bildirdigi `net_price` ile bu tutari
+    serbestce dusurebilseydi, 59.000 EUR'luk bir talep `net_price=1` ile 50
+    EUR'a inip 25.000 EUR onay esigini hic onaysiz gecerdi. Bildirilen fiyat
+    SAP'in bilgi kaydindan/degerlemesinden DUSUKSE yok sayilir ve uyari uretilir.
+
+    Mesru kullanim korunur: alicinin bildigi ve SAP'tekinden YUKSEK olan
+    pazarlik fiyati aynen gecerlidir; yalnizca esigi asagi cekme yolu kapalidir.
+
+    Donus: (kullanilacak_fiyat, uyari_metni). Uyari bos ise ozel bir durum yok.
+    """
+    source = float(source_price or 0.0)
+    if declared is None:
+        return source, ""
+    declared_value = float(declared)
+    if declared_value >= source:
+        return declared_value, ""
+    return source, (
+        f"Bildirilen birim fiyat {declared_value:,.2f} SAP kaynagindaki "
+        f"{source:,.2f} degerinin altinda. Onay esigi hesabinda SAP fiyati "
+        "kullanildi; bildirilen fiyat tutari asagi cekemez."
+    )
+
+
 class ProductPort(ABC):
     """Malzeme ana verisi ve siniflandirma."""
 
     name: str = "abstract"
+
+    @property
+    def sap_call_count(self) -> int:
+        """Bu backend uzerinden SAP'a giden gercek istek sayisi.
+
+        Varsayilan 0'dir: simulator gibi HTTP yapmayan backend'ler icin dogru
+        cevap budur. HTTP yapan backend bunu ezer.
+        """
+        return 0
 
     @abstractmethod
     def search_materials(
@@ -372,6 +415,26 @@ class SAPBackend(
             # geciyorsa yetenek gercekten yok demektir.
             supported[capability] = own is not None and own is not base_impl
         return {"backend": self.name, "supported": supported}
+
+    # --- Servis manifesti ---------------------------------------------------
+    # Manifest **backend'e aittir**: S/4HANA released API'leri ile ECC Z-Gateway
+    # servisleri ayni sozluk degildir. `sap_discover_capabilities` bu iki metot
+    # uzerinden konusur ve tek bir manifeste sabitlenmez.
+    def service_manifest(self, aliases: Iterable[str] | None = None) -> list[dict[str, Any]]:
+        """Bu backend'in kullandigi servislerin ozeti."""
+        from ..adapters.sap import manifest_summary
+
+        return manifest_summary(list(aliases) if aliases else None)
+
+    def manifest_aliases(self) -> frozenset[str]:
+        """Bu backend'in tanidigi servis alias'lari."""
+        from ..adapters.sap import CAPABILITY_MANIFEST
+
+        return frozenset(CAPABILITY_MANIFEST)
+
+    def preferred_service_order(self) -> str:
+        """Servis secim tercih sirasi - modele hangi yolun once denendigini soyler."""
+        return "released OData V4 -> released OData V2/SOAP -> released custom (Tier 2)"
 
     # --- Saglik kontrolu ----------------------------------------------------
     def ping(self) -> dict[str, str]:

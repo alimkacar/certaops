@@ -28,7 +28,7 @@ from ..cache import (
     entry_for,
     get_tool_cache,
 )
-from ..config import Settings, get_settings
+from ..config import TOOL_TIMEOUT_CEILING_SECONDS, Settings, get_settings
 from ..contracts import (
     SCOPE_SAP_READ,
     ActorContext,
@@ -43,6 +43,7 @@ from ..contracts import (
     estimate_tokens,
 )
 from ..core import (
+    DIRECT_ANSWER_TOOLS,
     ApprovalStore,
     AuditLedger,
     IdempotencyStore,
@@ -55,7 +56,14 @@ from ..core import (
     sha256_of,
 )
 from ..observability import ToolInvocationMetric, TurnMetrics
-from ..privacy import DataClass, DataPolicy, DLPEngine, build_dlp_engine
+from ..privacy import (
+    DataClass,
+    DataPolicy,
+    DLPEngine,
+    build_dlp_engine,
+    sanitize_error_body,
+    sanitize_for_log,
+)
 from ..risk import ImpactProfile, MutationKind, Reversibility
 from ..sap import SAPBackend, SAPError, get_backend
 
@@ -312,7 +320,23 @@ class ToolSpec:
             for scope in self.required_scopes
         )
 
+    def to_function_declaration(self) -> Any:
+        """Saglayici-bagimsiz function declaration.
+
+        Core runtime yalnizca bunu kullanir; hicbir saglayicinin sema
+        bicimini bilmez. Saglayiciya ozgu donusum adapter'da yapilir.
+        """
+        from certaops.providers import FunctionDeclaration
+
+        return FunctionDeclaration(
+            name=self.name,
+            description=self.description,
+            parameters=dict(self.input_schema),
+        )
+
     def to_anthropic(self) -> dict[str, Any]:
+        """Deprecated: geriye donuk uyumluluk. Yeni kod
+        `to_function_declaration()` kullanmalidir."""
         return {
             "name": self.name,
             "description": self.description,
@@ -408,6 +432,13 @@ def tool(
                 raise ValueError(
                     f"{name}: mutating tool idempotent=True ve idempotency_key destegi ister."
                 )
+        if timeout_s > TOOL_TIMEOUT_CEILING_SECONDS:
+            # Oturum lease'i bu tavana gore hesaplanir; asilirsa calisan bir tur
+            # ikinci bir worker tarafindan devralinabilir.
+            raise ValueError(
+                f"{name}: timeout_s={timeout_s} tavani asiyor "
+                f"({TOOL_TIMEOUT_CEILING_SECONDS}s). Tavani config.py'de yukseltin."
+            )
         if risk_tier is RiskTier.R4 and approval_policy != "dual":
             raise ValueError(f"{name}: R4 tool cift onay (approval_policy='dual') gerektirir.")
 
@@ -425,6 +456,13 @@ def tool(
             )
         if cache_policy.enabled and cache_policy.max_class is DataClass.D3:
             raise ValueError(f"{name}: D3 veri cache'lenemez.")
+        # Modeli atlayan dogrudan yanit yolu yalniz salt-okunur tool'lar
+        # icindir. Bir yazma tool'unun sonucunu modele hic gostermeden
+        # kullaniciya donmek, "ne yazildi" muhakemesini devre disi birakirdi.
+        if risk_tier.is_mutating and name in DIRECT_ANSWER_TOOLS:
+            raise ValueError(
+                f"{name}: mutating tool DIRECT_ANSWER_TOOLS allowlist'inde olamaz."
+            )
 
         REGISTRY[name] = ToolSpec(
             name=name,
@@ -458,6 +496,17 @@ def anthropic_tool_definitions(names: list[str] | None = None) -> list[dict[str,
     if names is None:
         return [spec.to_anthropic() for spec in REGISTRY.values()]
     return [REGISTRY[n].to_anthropic() for n in names if n in REGISTRY]
+
+
+def function_declarations(names: list[str] | None = None) -> list[Any]:
+    """Modele gonderilecek saglayici-bagimsiz declaration listesi.
+
+    `anthropic_tool_definitions` ile ayni sozlesme, ama saglayici-notr:
+    bicime ozgu donusum adapter'da yapilir. `names` verilmezse tum tool'lar.
+    """
+    if names is None:
+        return [spec.to_function_declaration() for spec in REGISTRY.values()]
+    return [REGISTRY[n].to_function_declaration() for n in names if n in REGISTRY]
 
 
 def visible_tool_names(domains: frozenset[str], actor: ActorContext) -> list[str]:
@@ -510,6 +559,44 @@ class ToolTimeout(RuntimeError):
     """Tool sozlesmesindeki `timeout_s` asildi."""
 
 
+class ToolExecutorSaturated(RuntimeError):
+    """Cok fazla tool cagrisi terk edilmis durumda; yenisi baslatilmiyor."""
+
+
+# --- Terk edilmis tool thread'lerinin muhasebesi ---------------------------
+# Timeout **cagiriciyi** serbest birakir; arka plandaki is devam eder. Bu
+# bilincli bir tercih (Python'da bir thread guvenle oldurulemez), ama sinirsiz
+# birakilirsa uzun omurlu bir serviste thread'ler birikir ve bellek tukenir.
+#
+# Neden ThreadPoolExecutor degil: Python 3.9+ havuz thread'leri daemon
+# DEGILDIR ve yorumlayici cikista onlari join eder. Asili kalan tek bir tool,
+# surecin kapanmasini sonsuza kadar engellerdi. Daemon thread + acik muhasebe
+# hem sizintiyi sinirlar hem kapanmayi bloke etmez.
+_ABANDONED_LOCK = threading.Lock()
+_ABANDONED: set[threading.Thread] = set()
+
+
+def _sweep_abandoned() -> int:
+    """Biten thread'leri listeden dusurur ve kalan sayiyi dondurur.
+
+    Kendi kendini toparlar: gec de olsa tamamlanan bir tool sayimdan cikar.
+    """
+    with _ABANDONED_LOCK:
+        finished = {t for t in _ABANDONED if not t.is_alive()}
+        _ABANDONED.difference_update(finished)
+        return len(_ABANDONED)
+
+
+def _mark_abandoned(worker: threading.Thread) -> None:
+    with _ABANDONED_LOCK:
+        _ABANDONED.add(worker)
+
+
+def abandoned_tool_threads() -> int:
+    """Gozlemlenebilirlik: su an terk edilmis tool thread sayisi."""
+    return _sweep_abandoned()
+
+
 def _run_with_timeout(
     spec: ToolSpec, arguments: dict[str, Any], ctx: ToolContext
 ) -> Any:
@@ -528,6 +615,17 @@ def _run_with_timeout(
     if timeout <= 0:
         return spec.handler(ctx=ctx, **arguments)
 
+    # Terk edilmis is birikmisse yeni cagri baslatmak durumu kotulestirir.
+    # Sessizce yavaslamak yerine acik hata verilir: operasyon ekibi asili
+    # kalan tool'u gorur, kullanici da neden bekledigini bilir.
+    limit = ctx.settings.budget.max_abandoned_tool_threads
+    if limit > 0 and _sweep_abandoned() >= limit:
+        raise ToolExecutorSaturated(
+            f"{_sweep_abandoned()} tool cagrisi zaman asimindan sonra hala calisiyor "
+            f"(sinir {limit}). Yeni cagri baslatilmadi. SAP_TIMEOUT ve hedef sistem "
+            "yanit suresini kontrol edin."
+        )
+
     box: dict[str, Any] = {}
 
     def _target() -> None:
@@ -542,6 +640,7 @@ def _run_with_timeout(
     worker.start()
     worker.join(timeout)
     if worker.is_alive():
+        _mark_abandoned(worker)
         raise ToolTimeout(
             f"'{spec.name}' {timeout:g} saniyelik sozlesme limitini asti."
         )
@@ -613,8 +712,31 @@ def execute_tool(
             return payload, False
 
     # --- 3. Handler (sozlesmedeki timeout siniri altinda) ------------------
+    # Handler oncesi/sonrasi fark = bu tool'un yaptigi gercek SAP cagrisi.
+    _sap_calls_before = getattr(ctx.sap, "sap_call_count", 0)
     try:
         result = _run_with_timeout(spec, arguments, ctx)
+    except ToolExecutorSaturated as exc:
+        # Is HIC baslamadi: yazma yapilmadigi kesindir, mutabakat gerekmez.
+        payload = json.dumps(
+            {
+                "error": str(exc),
+                "denial_code": "TOOL_EXECUTOR_SATURATED",
+                "retryable": True,
+            },
+            ensure_ascii=False,
+        )
+        ctx.audit.append(
+            "tool.saturated",
+            execution=ctx.execution,
+            tool=name,
+            risk_tier=spec.risk_tier.value,
+            outcome="error",
+            detail={"abandoned_threads": abandoned_tool_threads()},
+        )
+        _record_metric(ctx, spec, name, outcome="error", started=started, result=payload)
+        log.error("tool calistirici doygun | %s | %d terk edilmis", name, abandoned_tool_threads())
+        return payload, True
     except ToolTimeout as exc:
         mutating = spec.risk_tier.is_mutating
         body: dict[str, Any] = {
@@ -642,18 +764,23 @@ def execute_tool(
         log.warning("tool timeout | %s | %.1fs", name, spec.timeout_s)
         return payload, True
     except SAPError as exc:
-        payload = json.dumps(exc.as_dict(), ensure_ascii=False)
+        # SAP hata govdeleri basarisiz alanin degerini yankilar (IBAN, e-posta,
+        # vergi no). Bu dal eskiden DLP adimindan ONCE donuyordu; artik her
+        # hedef kendi sink'inden gecer.
+        safe_body = _safe_error(ctx, exc.as_dict(), sink="model")
+        payload = json.dumps(safe_body, ensure_ascii=False)
         ctx.audit.append(
             "tool.sap_error",
             execution=ctx.execution,
             tool=name,
             risk_tier=spec.risk_tier.value,
             outcome="error",
-            sap_messages=[str(exc)],
+            # Denetim defteri uzun saklamalidir: log sink'i (D2 mask, D3 drop).
+            sap_messages=[_safe_log(ctx, str(exc))],
             detail={"sap_code": exc.code},
         )
         _record_metric(ctx, spec, name, outcome="error", started=started, result=payload)
-        log.warning("tool SAP hatasi | %s | %s", name, exc)
+        log.warning("tool SAP hatasi | %s | %s", name, _safe_log(ctx, str(exc)))
         return payload, True
     except TypeError as exc:
         payload = json.dumps(
@@ -664,20 +791,31 @@ def execute_tool(
         log.warning("tool parametre hatasi | %s | %s", name, exc)
         return payload, True
     except Exception as exc:  # noqa: BLE001 - model hatayi gorup duzeltebilmeli
-        payload = json.dumps({"error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False)
+        # Istisna metni payload parcasi tasiyabilir; tipi korunur, govde temizlenir.
+        safe_body = _safe_error(
+            ctx, {"error": f"{type(exc).__name__}: {exc}"}, sink="model"
+        )
+        payload = json.dumps(safe_body, ensure_ascii=False)
         ctx.audit.append(
             "tool.failed",
             execution=ctx.execution,
             tool=name,
             risk_tier=spec.risk_tier.value,
             outcome="error",
-            detail={"error": f"{type(exc).__name__}: {exc}"},
+            detail={"error": _safe_log(ctx, f"{type(exc).__name__}: {exc}")},
         )
         _record_metric(ctx, spec, name, outcome="error", started=started, result=payload)
-        log.exception("tool hatasi | %s", name)
+        # exc_info hassas veriyi stack trace uzerinden loga tasiyabilir:
+        # tip ve tool adi teshis icin yeterli.
+        log.error("tool hatasi | %s | %s", name, type(exc).__name__)
         return payload, True
     finally:
         ctx.decision = None
+        # Her cikis yolunda guncellenir: basari, timeout ve hata dallarinda da
+        # yapilan SAP cagrilari butceye ve telemetriye yazilmalidir.
+        ctx.sap_call_count += (
+            getattr(ctx.sap, "sap_call_count", 0) - _sap_calls_before
+        )
 
     # --- 4. Alan politikasi ve DLP (modele verilmeden ONCE) -----------------
     serialized = strip_empty(_serialize(result))
@@ -805,6 +943,26 @@ def execute_tool(
         " (kirpildi)" if outcome.trimmed else "",
     )
     return payload, is_error
+
+
+def _safe_error(
+    ctx: ToolContext, body: dict[str, Any], *, sink: str = "model"
+) -> dict[str, Any]:
+    """Hata govdesini hedefe gore temizler (OWASP LLM02).
+
+    Yapisal alanlar (`sap_code`, `denial_code`, `timeout_s`) korunur: model
+    dogru davranisi bunlara bakarak secer. Yalniz serbest metin taranir.
+    """
+    if ctx.dlp is None or ctx.actor is None:
+        return body
+    return sanitize_error_body(body, actor=ctx.actor, sink=sink, dlp=ctx.dlp)  # type: ignore[arg-type]
+
+
+def _safe_log(ctx: ToolContext, text: str) -> str:
+    """Log/denetim satiri icin temizleme (D2 -> mask, D3 -> drop)."""
+    if ctx.dlp is None or ctx.actor is None:
+        return "[gizlendi]"
+    return sanitize_for_log(text, actor=ctx.actor, dlp=ctx.dlp)
 
 
 def _cache_key_for(spec: ToolSpec, arguments: dict[str, Any], ctx: ToolContext):

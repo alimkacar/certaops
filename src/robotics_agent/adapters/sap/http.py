@@ -4,6 +4,7 @@ Sagladigi adapter garantileri:
   - Host allowlist: SSRF ve yanlis sisteme yazma riski kesilir.
   - CSRF token akisi: fetch + 403'te tek kez yenileme.
   - Retry: yalniz guvenli durumlarda; `Retry-After` basligina uyar.
+  - Devre kesici: surekli altyapi hatasinda hizli hata (bkz. `breaker`).
   - Yapilandirilmis hata: her hatali yanit `SAPFault`a cevrilir.
   - Correlation ID: her istege eklenir, hataya ve audit'e tasinir.
 """
@@ -19,6 +20,7 @@ from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 import httpx
 
+from .breaker import CircuitBreaker, null_breaker
 from .errors import RETRYABLE_STATUS, SAPError, SAPFault, parse_sap_error
 
 log = logging.getLogger(__name__)
@@ -80,21 +82,66 @@ class ODataHttpCore:
     csrf_enabled: bool = True
     token_provider: Callable[[], str] | None = None
     sleep: Callable[[float], None] = time.sleep
+    #: Kimlik suresi dolunca yeni bir HTTP istemcisi uretir (destination token
+    #: yenileme, connectivity proxy `Proxy-Authorization` tazeleme).
+    reconnect: Callable[[], httpx.Client] | None = None
+    #: Ardisik altyapi hatasinda hizli hata veren devre kesici. Varsayilan
+    #: ornek devre disidir; `build_*_client` yapilandirmadan gercek kesiciyi verir.
+    breaker: CircuitBreaker = field(default_factory=null_breaker)
 
     _csrf_token: str = field(default="", init=False, repr=False)
+    # Gercekten SAP'a giden istek sayisi. Butce ve telemetri bunu okur.
+    call_count: int = field(default=0, init=False)
+    _reconnect_used: bool = field(default=False, init=False, repr=False)
 
     # --- Guvenlik -----------------------------------------------------------
     def _assert_host_allowed(self, url: str) -> None:
-        if not self.allowed_hosts:
-            return  # allowlist tanimlanmamis: base_url disi cagri zaten yapilmaz
-        host = urlsplit(str(url)).hostname or ""
-        for allowed in self.allowed_hosts:
-            candidate = allowed.strip().lower()
-            if not candidate:
-                continue
+        """Istegin gidecegi hostu allowlist'e karsi dogrular.
+
+        `SAP_ALLOWED_HOSTS` tanimliysa **tek yetkili odur**: yanlis
+        yapilandirilmis bir `base_url` bile allowlist disina cikamaz.
+
+        Allowlist bos birakildiginda ise base_url hostu ORTUK allowlist gorevi
+        gorur. Bu onemli, cunku sayfalama `@odata.nextLink` degerini SUNUCUDAN
+        alir: ele gecirilmis ya da yanlis yapilandirilmis bir sistem nextLink
+        olarak baska bir host verip sonraki sayfa istegini `Authorization`
+        basligiyla birlikte oraya yonlendirebilir. Eskiden allowlist bos
+        oldugunda kontrol TUMDEN atlaniyordu ve bu yol aciktu.
+        """
+        host = (urlsplit(str(url)).hostname or "").lower()
+        candidates = [c.strip().lower() for c in self.allowed_hosts if c.strip()]
+        if not candidates and self.client.base_url:
+            base_host = (self.client.base_url.host or "").lower()
+            if base_host:
+                candidates.append(base_host)
+        if not candidates:
+            return
+        for candidate in candidates:
             if host == candidate or (candidate.startswith("*.") and host.endswith(candidate[1:])):
                 return
-        raise HostNotAllowed(host, self.allowed_hosts)
+        raise HostNotAllowed(host, tuple(candidates))
+
+    def _try_reconnect(self) -> bool:
+        """Kimlik suresi dolmus olabilir: istemciyi bir kez yeniden kurar.
+
+        Tur basina yalniz bir kez denenir; kalici bir yetki hatasinda sonsuz
+        yeniden baglanma dongusune girmemek icin.
+        """
+        if self.reconnect is None or self._reconnect_used:
+            return False
+        self._reconnect_used = True
+        try:
+            fresh = self.reconnect()
+        except Exception:  # noqa: BLE001 - yeniden baglanma hatasi orijinali gizlememeli
+            log.warning("SAP baglantisi yenilenemedi; orijinal yetki hatasi dondurulecek")
+            return False
+        # Eski istemciyi burada KAPATMIYORUZ: ayni httpx.Client birden fazla
+        # cekirdek (V2/V4) tarafindan paylasilabilir. Yasam dongusu, paylasimi
+        # bilen `reconnect` saglayicisina aittir.
+        self.client = fresh
+        self._csrf_token = ""
+        log.info("SAP baglantisi yenilendi (kimlik suresi dolmus olabilir)")
+        return True
 
     # --- Istek --------------------------------------------------------------
     def request(
@@ -111,6 +158,7 @@ class ODataHttpCore:
         expect_json: bool = True,
     ) -> ODataResponse:
         method = method.upper()
+        self.call_count += 1
         merged_headers: dict[str, str] = {
             "Accept": "application/json",
             "Accept-Language": "TR",
@@ -134,17 +182,23 @@ class ODataHttpCore:
 
         while attempt < max(1, self.max_retries):
             attempt += 1
-            if method in MODIFYING_METHODS and self.csrf_enabled:
-                merged_headers["x-csrf-token"] = self._ensure_csrf(service_root or path)
-
-            url = self.client.base_url.join(path) if self.client.base_url else httpx.URL(path)
-            self._assert_host_allowed(str(url))
+            # Devre acikken istek GONDERILMEZ. Bu yazma yolu icin de guvenlidir:
+            # `CircuitOpen` istegin SAP'a ulasmadigini garanti eder, dolayisiyla
+            # cagiran taraf mutabakat aramak zorunda kalmaz.
+            self.breaker.allow()
 
             try:
+                if method in MODIFYING_METHODS and self.csrf_enabled:
+                    merged_headers["x-csrf-token"] = self._ensure_csrf(service_root or path)
+
+                url = self.client.base_url.join(path) if self.client.base_url else httpx.URL(path)
+                self._assert_host_allowed(str(url))
+
                 response = self.client.request(
                     method, path, params=query, json=json_body, headers=merged_headers
                 )
             except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError):
+                self.breaker.record_failure()
                 # Yazma cagrilarinda sonuc bilinmiyor: cekirdek burada retry yapmaz,
                 # karar core.execution'daki idempotency/mutabakat katmanina aittir.
                 if method in MODIFYING_METHODS:
@@ -153,8 +207,18 @@ class ODataHttpCore:
                     raise
                 self.sleep(min(8.0, 2.0**attempt))
                 continue
+            except Exception:
+                # Yapilandirma/CSRF hatasi SAP'in sagligini olcmez; deneme
+                # kilidini birak ama sayaci artirma.
+                self.breaker.record_ignored()
+                raise
 
             if response.is_success:
+                # Basarili cagri = kimlik gecerli. Yeniden baglanma hakki
+                # tazelenir; uzun omurlu bir surec token her doldugunda
+                # kendini toparlayabilsin.
+                self.breaker.record_success()
+                self._reconnect_used = False
                 return self._to_response(response, expect_json=expect_json)
 
             fault = parse_sap_error(
@@ -168,9 +232,28 @@ class ODataHttpCore:
             )
             last_fault = fault
 
+            # Yalniz altyapi hatalari (429/5xx) devreyi acar. 401/403/404/409
+            # gibi is ve yetki hatalari SAP'in saglikli oldugunu gosterir;
+            # bunlarin devreyi acmasi diger kullanicilari cezalandirmak olurdu.
+            if self.breaker.counts_as_failure(fault.http_status):
+                self.breaker.record_failure()
+            else:
+                self.breaker.record_ignored()
+
             # CSRF token suresi dolmus: bir kez yenile ve tekrar dene.
             if fault.is_csrf and attempt < self.max_retries:
                 self._csrf_token = ""
+                continue
+
+            # 401 (kimlik) / 407 (proxy kimligi): destination ve connectivity
+            # token'lari surelidir. Bu kodlar istegin SAP tarafinda HIC
+            # islenmedigini bildirir, dolayisiyla yazma cagrisini tekrarlamak
+            # da guvenlidir. Yeniden baglanip bir kez daha denenir.
+            if (
+                fault.http_status in {401, 407}
+                and attempt < self.max_retries
+                and self._try_reconnect()
+            ):
                 continue
 
             if fault.http_status in RETRYABLE_STATUS and attempt < self.max_retries:

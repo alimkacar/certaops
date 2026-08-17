@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -49,6 +50,17 @@ def _env_path(key: str, default: str) -> Path:
     return Path(_env(key, default)).expanduser().resolve()
 
 
+#: Bir tool handler'inin calisabilecegi en uzun sure. Kayitli hicbir tool
+#: `timeout_s` olarak bunu asamaz (registry kayit sirasinda reddeder), bu yuzden
+#: oturum lease'i bu degeri ust sinir olarak kabul edebilir.
+TOOL_TIMEOUT_CEILING_SECONDS: float = 120.0
+
+#: Gercek bir SAP sistemine baglanan backend'ler. `mock` disaridadir.
+#: Uretim profili ve baglanti dogrulamasi bu kumeye gore karar verir; tek
+#: kaynak olmasi yeni backend eklendiginde kapinin atlanmasini engeller.
+_LIVE_SAP_BACKENDS: frozenset[str] = frozenset({"odata", "ecc"})
+
+
 @dataclass(frozen=True)
 class SAPSettings:
     """SAP baglanti ve organizasyon ayarlari."""
@@ -68,13 +80,38 @@ class SAPSettings:
     # basic  -> kullanici/parola (yalniz gelistirme)
     # oauth2 -> client credentials token akisi
     # destination -> SAP BTP Destination servisi uzerinden cozumleme
+    # apikey -> SAP API Business Hub sandbox (sandbox.api.sap.com). SALT OKUNUR
+    #           bir SAP sistemine karsi kontrat dogrulamak icindir; uretimde
+    #           kullanilamaz.
     auth_mode: str = field(default_factory=lambda: _env("SAP_AUTH_MODE", "basic").lower())
+    api_key: str = field(default_factory=lambda: _env("SAP_API_KEY"))
+    api_key_header: str = field(default_factory=lambda: _env("SAP_API_KEY_HEADER", "APIKey"))
     oauth_token_url: str = field(default_factory=lambda: _env("SAP_OAUTH_TOKEN_URL"))
     oauth_client_id: str = field(default_factory=lambda: _env("SAP_OAUTH_CLIENT_ID"))
     oauth_client_secret: str = field(default_factory=lambda: _env("SAP_OAUTH_CLIENT_SECRET"))
     oauth_scope: str = field(default_factory=lambda: _env("SAP_OAUTH_SCOPE"))
     destination_name: str = field(default_factory=lambda: _env("SAP_DESTINATION_NAME"))
     destination_service_url: str = field(default_factory=lambda: _env("SAP_DESTINATION_SERVICE_URL"))
+
+    # --- Cloud Connector (ProxyType=OnPremise) ------------------------------
+    # On-premise bir destination'a BTP'den DOGRUDAN erisilemez; trafik
+    # connectivity proxy uzerinden gecer. Bos birakilirsa on-premise
+    # destination acik hata verir (sessiz timeout yerine).
+    connectivity_proxy_url: str = field(
+        default_factory=lambda: _env("SAP_CONNECTIVITY_PROXY_URL")
+    )
+    connectivity_token_url: str = field(
+        default_factory=lambda: _env("SAP_CONNECTIVITY_TOKEN_URL")
+    )
+    connectivity_client_id: str = field(
+        default_factory=lambda: _env("SAP_CONNECTIVITY_CLIENT_ID")
+    )
+    connectivity_client_secret: str = field(
+        default_factory=lambda: _env("SAP_CONNECTIVITY_CLIENT_SECRET")
+    )
+    cloud_connector_location_id: str = field(
+        default_factory=lambda: _env("SAP_CLOUD_CONNECTOR_LOCATION_ID")
+    )
 
     # OData surum tercihi: released V4 servisi varsa V4, yoksa V2'ye duser.
     odata_version: str = field(default_factory=lambda: _env("SAP_ODATA_VERSION", "auto").lower())
@@ -86,6 +123,12 @@ class SAPSettings:
     purch_org: str = field(default_factory=lambda: _env("SAP_PURCH_ORG", "1000"))
     purch_group: str = field(default_factory=lambda: _env("SAP_PURCH_GROUP", "R01"))
     currency: str = field(default_factory=lambda: _env("SAP_CURRENCY", "EUR"))
+    # Malzeme aciklamasinda tercih edilen dil. Kodda sabit "TR" idi; farkli
+    # dilde veri tasiyan bir sistemde (ornegin API Hub sandbox'i) aciklama
+    # sessizce bos ya da yanlis dilde gelirdi.
+    description_language: str = field(
+        default_factory=lambda: _env("SAP_DESCRIPTION_LANGUAGE", "TR").upper()
+    )
     storage_location: str = field(default_factory=lambda: _env("SAP_STORAGE_LOCATION", "0001"))
 
     dry_run: bool = field(default_factory=lambda: _env_bool("SAP_DRY_RUN", True))
@@ -95,15 +138,28 @@ class SAPSettings:
 
     def validate(self) -> list[str]:
         problems: list[str] = []
-        if self.backend not in {"mock", "odata"}:
-            problems.append(f"SAP_BACKEND '{self.backend}' gecersiz. 'mock' veya 'odata' olmali.")
-        if self.auth_mode not in {"basic", "oauth2", "destination"}:
+        if self.backend not in ({"mock"} | _LIVE_SAP_BACKENDS):
             problems.append(
-                f"SAP_AUTH_MODE '{self.auth_mode}' gecersiz. basic/oauth2/destination olmali."
+                f"SAP_BACKEND '{self.backend}' gecersiz. "
+                "'mock', 'odata' (S/4HANA) veya 'ecc' (ECC 6.0 EHP8) olmali."
+            )
+        if self.auth_mode not in {"basic", "oauth2", "destination", "apikey"}:
+            problems.append(
+                f"SAP_AUTH_MODE '{self.auth_mode}' gecersiz. "
+                "basic/oauth2/destination/apikey olmali."
             )
         if self.odata_version not in {"auto", "v2", "v4"}:
             problems.append(f"SAP_ODATA_VERSION '{self.odata_version}' gecersiz. auto/v2/v4 olmali.")
-        if self.backend == "odata":
+        # ECC 6.0 EHP8'de OData V4 yoktur: RAP ABAP 7.53+ ister, EHP8 7.50'dir.
+        # Yanlis konfigurasyon calisma zamaninda 404 olarak degil, burada patlar.
+        if self.backend == "ecc" and self.odata_version == "v4":
+            problems.append(
+                "SAP_ODATA_VERSION=v4 ECC backend'i ile kullanilamaz. "
+                "ECC 6.0 EHP8 (NetWeaver 7.50) yalniz OData V2 destekler; 'v2' veya "
+                "'auto' kullanin."
+            )
+        # Gercek SAP baglantisi isteyen backend'ler ayni baglanti sozlesmesini paylasir.
+        if self.backend in _LIVE_SAP_BACKENDS:
             if not self.base_url and self.auth_mode != "destination":
                 problems.append("SAP_BASE_URL bos (SAP_BACKEND=odata icin zorunlu).")
             if self.auth_mode == "basic" and (not self.username or not self.password):
@@ -120,6 +176,11 @@ class SAPSettings:
                 self.destination_name and self.destination_service_url
             ):
                 problems.append("SAP_DESTINATION_NAME / SAP_DESTINATION_SERVICE_URL eksik.")
+            if self.auth_mode == "apikey" and not self.api_key:
+                problems.append(
+                    "SAP_API_KEY bos (SAP_AUTH_MODE=apikey icin zorunlu). "
+                    "https://api.sap.com hesabinizdan alin."
+                )
         return problems
 
 
@@ -209,6 +270,20 @@ class StateSettings:
     max_sessions: int = field(default_factory=lambda: _env_int("AGENT_MAX_SESSIONS", 500))
     evidence_ttl_minutes: int = field(default_factory=lambda: _env_int("AGENT_EVIDENCE_TTL_MIN", 120))
     evidence_max_entries: int = field(default_factory=lambda: _env_int("AGENT_EVIDENCE_MAX", 500))
+    # Audit zinciri checkpoint'lerinin yazilacagi harici (ideal olarak WORM)
+    # hedef. Bos = disa aktarim kapali; zincir yine tutulur ama defterin
+    # kendisi yeniden yazilirsa bunu kanitlayacak bagimsiz bir kopya olmaz.
+    audit_checkpoint_path: str = field(
+        default_factory=lambda: _env("AGENT_AUDIT_CHECKPOINT_PATH", "")
+    )
+    audit_checkpoint_every: int = field(
+        default_factory=lambda: _env_int("AGENT_AUDIT_CHECKPOINT_EVERY", 100)
+    )
+
+    @property
+    def checkpoint_enabled(self) -> bool:
+        """Harici checkpoint hedefi tanimli mi?"""
+        return bool(str(self.audit_checkpoint_path).strip())
 
     @property
     def db_path(self) -> Path:
@@ -337,16 +412,126 @@ class TokenBudget:
     turn_result_tokens: int = field(default_factory=lambda: _env_int("BUDGET_TURN_RESULT_TOKENS", 6000))
     answer_tokens: int = field(default_factory=lambda: _env_int("BUDGET_ANSWER_TOKENS", 1200))
     keep_full_results: int = field(default_factory=lambda: _env_int("BUDGET_KEEP_FULL_RESULTS", 6))
+    # Zaman asimindan sonra arka planda calismaya devam eden tool thread'i
+    # ust siniri. Asilirsa yeni cagri baslatilmaz ve acik hata donulur.
+    # 0 = sinirsiz (onerilmez; uzun omurlu serviste thread birikir).
+    max_abandoned_tool_threads: int = field(
+        default_factory=lambda: _env_int("BUDGET_MAX_ABANDONED_THREADS", 16)
+    )
+
+
+#: Desteklenen model saglayicilari. `fake` yalniz testler icindir.
+_MODEL_PROVIDERS: frozenset[str] = frozenset({"gemini", "anthropic", "fake"})
+_THINKING_LEVELS: frozenset[str] = frozenset({"minimal", "low", "medium", "high"})
+
+
+@dataclass(frozen=True)
+class ModelSettings:
+    """Saglayici-bagimsiz model ayarlari.
+
+    Saglayici secimi konfigurasyondadir; core runtime hicbir SDK tipini
+    bilmez. Yeni bir saglayici eklemek buraya bir anahtar eklemek demektir.
+    """
+
+    provider: str = field(default_factory=lambda: _env("MODEL_PROVIDER", "gemini").lower())
+    name: str = field(default_factory=lambda: _env("MODEL_NAME", "gemini-3.7-flash"))
+    timeout_s: float = field(default_factory=lambda: _env_float("MODEL_TIMEOUT", 90.0))
+    max_retries: int = field(default_factory=lambda: _env_int("MODEL_MAX_RETRIES", 2))
+
+    # --- Gemini -------------------------------------------------------------
+    gemini_api_key: str = field(default_factory=lambda: _env("GEMINI_API_KEY"))
+    # developer -> Gemini Developer API | vertex -> Google Cloud Vertex AI
+    gemini_backend: str = field(
+        default_factory=lambda: _env("GEMINI_BACKEND", "developer").lower()
+    )
+    google_cloud_project: str = field(default_factory=lambda: _env("GOOGLE_CLOUD_PROJECT"))
+    google_cloud_location: str = field(default_factory=lambda: _env("GOOGLE_CLOUD_LOCATION"))
+    # Taban muhakeme seviyesi. Runtime istegin karmasikligina gore yukseltir.
+    thinking_level: str = field(
+        default_factory=lambda: _env("GEMINI_THINKING_LEVEL", "low").lower()
+    )
+    # `high` maliyetlidir ve gecikmeyi buyutur: yalniz acik konfigurasyonla.
+    allow_high_thinking: bool = field(
+        default_factory=lambda: _env_bool("GEMINI_ALLOW_HIGH_THINKING", False)
+    )
+    # Saglayicinin istek/yaniti saklamasi. SAP verisi icin varsayilan KAPALI.
+    store_interactions: bool = field(
+        default_factory=lambda: _env_bool("GEMINI_STORE_INTERACTIONS", False)
+    )
+
+    # --- Anthropic (opsiyonel) ---------------------------------------------
+    anthropic_api_key: str = field(default_factory=lambda: _env("ANTHROPIC_API_KEY"))
+
+    @property
+    def configured(self) -> bool:
+        """Saglayici gercekten cagrilabilir durumda mi?"""
+        if self.provider == "gemini":
+            if self.gemini_backend == "vertex":
+                return bool(self.google_cloud_project and self.google_cloud_location)
+            return bool(self.gemini_api_key)
+        if self.provider == "anthropic":
+            return bool(self.anthropic_api_key)
+        return True
+
+    def validate(self) -> list[str]:
+        problems: list[str] = []
+        if self.provider not in _MODEL_PROVIDERS:
+            problems.append(
+                f"MODEL_PROVIDER '{self.provider}' gecersiz "
+                f"({', '.join(sorted(_MODEL_PROVIDERS))})."
+            )
+        if not self.name:
+            problems.append("MODEL_NAME bos olamaz.")
+        if self.thinking_level not in _THINKING_LEVELS:
+            problems.append(
+                f"GEMINI_THINKING_LEVEL '{self.thinking_level}' gecersiz "
+                f"({', '.join(sorted(_THINKING_LEVELS))})."
+            )
+        if self.thinking_level == "high" and not self.allow_high_thinking:
+            problems.append(
+                "GEMINI_THINKING_LEVEL=high icin GEMINI_ALLOW_HIGH_THINKING=true "
+                "gerekir (maliyet ve gecikme bilincli bir karardir)."
+            )
+        if self.provider == "gemini":
+            if self.gemini_backend not in {"developer", "vertex"}:
+                problems.append(
+                    f"GEMINI_BACKEND '{self.gemini_backend}' gecersiz "
+                    "(developer/vertex)."
+                )
+            elif self.gemini_backend == "vertex" and not (
+                self.google_cloud_project and self.google_cloud_location
+            ):
+                problems.append(
+                    "GEMINI_BACKEND=vertex icin GOOGLE_CLOUD_PROJECT ve "
+                    "GOOGLE_CLOUD_LOCATION zorunludur."
+                )
+            elif self.gemini_backend == "developer" and not self.gemini_api_key:
+                problems.append("GEMINI_API_KEY tanimli degil.")
+        if self.provider == "anthropic" and not self.anthropic_api_key:
+            problems.append("ANTHROPIC_API_KEY tanimli degil (MODEL_PROVIDER=anthropic).")
+        return problems
+
+    def describe(self) -> dict[str, object]:
+        """Health ciktisi. **API anahtari asla yer almaz.**"""
+        payload: dict[str, object] = {
+            "provider": self.provider,
+            "model": self.name,
+            "configured": self.configured,
+            "thinking_level": self.thinking_level,
+            "store_interactions": self.store_interactions,
+        }
+        if self.provider == "gemini":
+            payload["backend"] = self.gemini_backend
+            if self.gemini_backend == "vertex":
+                payload["location"] = self.google_cloud_location
+        return payload
 
 
 @dataclass(frozen=True)
 class AgentSettings:
-    """Claude API ve agent dongusu ayarlari."""
+    """Agent dongusu ayarlari (saglayicidan bagimsiz)."""
 
-    api_key: str = field(default_factory=lambda: _env("ANTHROPIC_API_KEY"))
-    model: str = field(default_factory=lambda: _env("AGENT_MODEL", "claude-sonnet-5"))
     max_tokens: int = field(default_factory=lambda: _env_int("AGENT_MAX_TOKENS", 8000))
-    temperature: float = field(default_factory=lambda: _env_float("AGENT_TEMPERATURE", 0.2))
     # Use-case bazli tool adimi siniri. Global 25 yerine akis bazinda sinir uygulanir.
     max_tool_iterations: int = field(
         default_factory=lambda: _env_int("AGENT_MAX_TOOL_ITERATIONS", 12)
@@ -364,12 +549,70 @@ class AgentSettings:
     local_roles: tuple[str, ...] = field(
         default_factory=lambda: _env_tuple("AGENT_LOCAL_ROLES", "VIEWER,PURCHASER")
     )
+    # Modelin katki saglamayacagi sorularda yaniti LLM'e hic gondermeden
+    # yerel olarak uretir (bkz. core.direct). Gizlilik + gecikme kazanci.
+    # Kapatildiginda her yanit klasik LLM akisindan gecer.
+    direct_answers_enabled: bool = field(
+        default_factory=lambda: _env_bool("AGENT_DIRECT_ANSWERS", True)
+    )
+    # Muhakeme kademelendirmesinin tabani. Saglayiciya `thinking_level` olarak
+    # gider; saglayici desteklemiyorsa yok sayilir.
+    gemini_thinking_level: str = field(
+        default_factory=lambda: _env("GEMINI_THINKING_LEVEL", "low").lower()
+    )
+    # Pack bazli yukseltmeler. Yalniz YUKSELTIR (bkz. reasoning_level).
+    reasoning_levels: tuple[tuple[str, str], ...] = field(
+        default_factory=lambda: _parse_reasoning_levels(
+            _env(
+                "AGENT_REASONING_LEVELS",
+                "procurement_write:medium,p2p_finance:medium,project_finance:medium",
+            )
+        )
+    )
 
     def iteration_limit(self, domain: str = "") -> int:
         for key, limit in self.iteration_limits:
             if key == domain:
                 return limit
         return self.max_tool_iterations
+
+    def reasoning_level(self, packs: Iterable[str] = ()) -> str:
+        """Bu turda acilan pack'lere gore muhakeme seviyesi.
+
+        Kural **tek yonludur**: override yalnizca seviyeyi YUKSELTEBILIR.
+        Yapilandirilmis taban asagi cekilemez, cunku yanlis yazilmis bir
+        override bir yazma yolunu az dusunulmus birakabilirdi. Birden fazla
+        pack acildiysa en yuksegi kazanir; taninmayan pack ve gecersiz
+        seviye degeri sessizce yok sayilir.
+        """
+        base = self.gemini_thinking_level
+        if base not in _REASONING_ORDER:
+            base = "low"
+        best = _REASONING_ORDER.index(base)
+        overrides = dict(self.reasoning_levels)
+        for pack in packs:
+            level = overrides.get(pack)
+            if level not in _REASONING_ORDER:
+                continue
+            best = max(best, _REASONING_ORDER.index(level))
+        return _REASONING_ORDER[best]
+
+
+#: Muhakeme seviyeleri, dusukten yukseye. Sira karsilastirmayi tanimlar.
+_REASONING_ORDER: tuple[str, ...] = ("minimal", "low", "medium", "high")
+
+
+def _parse_reasoning_levels(raw: str) -> tuple[tuple[str, str], ...]:
+    """`pack:seviye,pack:seviye` metnini ayristirir. Gecersiz girdi atlanir."""
+    out: list[tuple[str, str]] = []
+    for part in raw.split(","):
+        if ":" not in part:
+            continue
+        key, _, level = part.partition(":")
+        key, level = key.strip(), level.strip().lower()
+        if key and level:
+            out.append((key, level))
+    return tuple(out)
 
 
 def _parse_iteration_limits(raw: str) -> tuple[tuple[str, int], ...]:
@@ -404,6 +647,7 @@ class UnsafeProductionConfig(RuntimeError):
 @dataclass(frozen=True)
 class Settings:
     sap: SAPSettings = field(default_factory=SAPSettings)
+    model: ModelSettings = field(default_factory=ModelSettings)
     agent: AgentSettings = field(default_factory=AgentSettings)
     security: SecuritySettings = field(default_factory=SecuritySettings)
     state: StateSettings = field(default_factory=StateSettings)
@@ -437,8 +681,7 @@ class Settings:
             problems.append(
                 f"APP_ENV '{self.app_env}' gecersiz. development/staging/production olmali."
             )
-        if not self.agent.api_key:
-            problems.append("ANTHROPIC_API_KEY tanimli degil.")
+        problems.extend(self.model.validate())
         return problems
 
     # --- Uretim kapisi ------------------------------------------------------
@@ -473,7 +716,10 @@ class Settings:
                 "SAP_BACKEND=mock uretimde kullanilamaz: simulasyon backend'i gercek "
                 "olmayan SAP verisi uretir. SAP_BACKEND=odata kullanin."
             )
-        if self.sap.backend == "odata":
+        # Gercek SAP baglantisi kuran her backend ayni kapidan gecer. Yeni bir
+        # backend eklendiginde bu kume genisletilmezse (ornegin `ecc`), guvensiz
+        # yapilandirma uretimde sessizce kabul edilir.
+        if self.sap.backend in _LIVE_SAP_BACKENDS:
             if not self.security.allowed_sap_hosts:
                 blockers.append(
                     "SAP_BACKEND=odata iken SAP_ALLOWED_HOSTS bos olamaz (egress allowlist)."
@@ -483,12 +729,39 @@ class Settings:
                     "SAP_AUTH_MODE=basic uretimde kullanilamaz. "
                     "oauth2 veya destination kullanin."
                 )
+            if self.sap.auth_mode == "apikey":
+                # Sandbox salt okunurdur ve paylasimlidir: uretim verisi yok,
+                # kullanici bazli yetki yok, denetlenebilir kimlik yok.
+                blockers.append(
+                    "SAP_AUTH_MODE=apikey yalniz SAP API Business Hub sandbox'i "
+                    "icindir; uretimde kullanilamaz. oauth2 veya destination kullanin."
+                )
             if not self.sap.verify_ssl:
                 blockers.append("SAP_VERIFY_SSL=false uretimde kabul edilemez.")
         if not self.sap.dry_run and self.security.approval_gateway == "local":
             blockers.append(
                 "SAP_DRY_RUN=false iken AGENT_APPROVAL_GATEWAY=local olamaz: gercek yazma "
                 "dogrulanmis bir onay gecidi (bpa) gerektirir."
+            )
+        # --- Model saglayici kapilari ---------------------------------------
+        if self.model.provider == "fake":
+            blockers.append(
+                "MODEL_PROVIDER=fake yalnizca testler icindir; uretimde kullanilamaz."
+            )
+        if not self.model.configured:
+            blockers.append(
+                f"MODEL_PROVIDER={self.model.provider} yapilandirilmamis "
+                "(API anahtari veya Vertex proje/lokasyon eksik)."
+            )
+        if self.model.store_interactions:
+            blockers.append(
+                "GEMINI_STORE_INTERACTIONS=true: SAP verisi saglayici tarafinda "
+                "kalici olarak saklanamaz."
+            )
+        if self.model.provider == "gemini" and self.model.gemini_backend == "developer":
+            blockers.append(
+                "GEMINI_BACKEND=developer uretimde SAP verisi icin onerilmez; "
+                "kurumsal veri isleme sozlesmesi icin GEMINI_BACKEND=vertex kullanin."
             )
         if self.state.session_backend == "memory":
             blockers.append(
@@ -540,6 +813,8 @@ class Settings:
         blockers = self.production_blockers()
         return {
             "app_env": self.app_env,
+            "model_provider": self.model.provider,
+            "model_name": self.model.name,
             "auth_mode": self.security.auth_mode,
             "sap_backend": self.sap.backend,
             "sap_auth_mode": self.sap.auth_mode,
