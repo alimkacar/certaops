@@ -304,7 +304,12 @@ def test_logs_never_receive_commercial_or_personal_data(engine):
 
 def test_handoff_allowlist_is_fail_closed_for_unknown_pairs():
     known = handoff_allowlist("supply_chain", "procurement")
-    unknown = handoff_allowlist("finance", "master_data")
+    # Ornek DEGISTI: eskiden ("finance", "master_data") kullaniliyordu, ama o
+    # cift `agent_catalogue()` icinde `handoff_targets` olarak bildirilmis
+    # gecerli bir akistir. Test farkinda olmadan allowlist'in EKSIK olmasina
+    # dayaniyordu; allowlist tamamlaninca yanlis alarm uretti. Gercekten
+    # tanimsiz bir cift kullanilir.
+    unknown = handoff_allowlist("bilinmeyen_kaynak", "bilinmeyen_hedef")
     assert "business_objects" in known
     assert "business_objects" not in unknown
     assert {"summary", "evidence_ids", "correlation_id"} <= unknown

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import importlib
 import json
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -124,6 +127,9 @@ def test_health_is_public_and_reports_posture(client):
     assert body["auth_mode"] == "static_token"
     assert body["audit_head"]["valid"] is True
     assert body["status"] == "ok"
+    assert body["runtime_scope"] == "per_authenticated_session_security_context"
+    assert body["runtime_count"] == 1
+    assert body["runtime_cache"]["cached"] >= 0
 
 
 def test_health_declares_simulation_mode(client):
@@ -222,9 +228,7 @@ def test_empty_message_is_rejected_before_model_call(client):
 
 
 def test_oversized_message_is_rejected_by_schema(client):
-    response = client.post(
-        "/chat", headers=auth("purchaser"), json={"message": "x" * 25_000}
-    )
+    response = client.post("/chat", headers=auth("purchaser"), json={"message": "x" * 25_000})
     assert response.status_code == 422
 
 
@@ -370,6 +374,144 @@ def test_other_users_session_cannot_be_deleted(client):
     assert response.status_code == 404
     # Sahibi icin hala var.
     assert api_module._session_store.load(record.session_id, actor=owner) is not None  # noqa: SLF001
+
+
+def test_actor_security_change_rebuilds_and_closes_cached_runtime(client, monkeypatch):
+    import robotics_agent.channels.api as api_module
+    from robotics_agent.contracts import ActorContext
+
+    instances = []
+
+    class FakeRuntime:
+        def __init__(self, *args, actor, **kwargs):
+            self.actor = actor
+            self.closed = False
+            instances.append(self)
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(api_module, "SAPAgentRuntime", FakeRuntime)
+    viewer = ActorContext(
+        subject="same@firma.test", tenant="100", roles=("VIEWER",), plants=frozenset({"1100"})
+    )
+    purchaser = ActorContext(
+        subject="same@firma.test",
+        tenant="100",
+        roles=("PURCHASER",),
+        plants=frozenset({"1100"}),
+    )
+
+    first = api_module._agent_for(viewer, "security-change")  # noqa: SLF001
+    assert api_module._agent_for(viewer, "security-change") is first  # noqa: SLF001
+    replacement = api_module._agent_for(purchaser, "security-change")  # noqa: SLF001
+
+    assert replacement is not first
+    assert first.closed is True
+    assert len(instances) == 2
+    api_module._evict_runtime(purchaser, "security-change")  # noqa: SLF001
+
+
+def test_parallel_api_turn_is_rejected_before_model_or_tool(client, monkeypatch):
+    import robotics_agent.channels.api as api_module
+
+    actor = api_module._auth().resolve(  # noqa: SLF001
+        f"Bearer {TOKENS['purchaser']}"
+    )
+    record = api_module._session_store.create(actor=actor)  # noqa: SLF001
+    entered = Event()
+    release = Event()
+
+    class BlockingRuntime:
+        call_count = 0
+
+        def __init__(self, *args, **kwargs):
+            self.messages = []
+            self.active_packs = ["bootstrap"]
+
+        def chat(self, message):
+            type(self).call_count += 1
+            entered.set()
+            assert release.wait(timeout=5)
+            self.messages.extend(
+                [
+                    {"role": "user", "content": message},
+                    {"role": "assistant", "content": "tamam"},
+                ]
+            )
+            return SimpleNamespace(
+                text="tamam",
+                tool_calls=[],
+                iterations=1,
+                input_tokens=1,
+                output_tokens=1,
+                direct_answer=False,
+                direct_answer_reason="",
+                model_calls=1,
+                active_packs=list(self.active_packs),
+                active_agents=[],
+                agent_trace=[],
+                policy_denials=0,
+                needs_review=False,
+                correlation_id="corr-blocking",
+                artifacts=[],
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(api_module, "SAPAgentRuntime", BlockingRuntime)
+    payload = {"message": "ilk", "session_id": record.session_id}
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(client.post, "/chat", headers=auth("purchaser"), json=payload)
+        assert entered.wait(timeout=5)
+        second = client.post(
+            "/chat",
+            headers=auth("purchaser"),
+            json={"message": "ikinci", "session_id": record.session_id},
+        )
+        assert second.status_code == 409
+        assert second.json()["detail"]["code"] == "SESSION_BUSY"
+        assert BlockingRuntime.call_count == 1
+        release.set()
+        first = future.result(timeout=5)
+
+    assert first.status_code == 200
+    assert BlockingRuntime.call_count == 1
+
+
+def test_shutdown_closes_providers_then_resets_shared_backend_once(client, monkeypatch):
+    import robotics_agent.channels.api as api_module
+    from robotics_agent.contracts import ActorContext
+
+    closed = []
+    reset_calls = []
+
+    class FakeRuntime:
+        def __init__(self, *args, actor, **kwargs):
+            self.actor = actor
+
+        def close(self):
+            closed.append(self.actor.subject)
+
+    monkeypatch.setattr(api_module, "SAPAgentRuntime", FakeRuntime)
+    monkeypatch.setattr(api_module, "reset_backend", lambda: reset_calls.append("reset"))
+    one = ActorContext(subject="one", tenant="100", roles=("VIEWER",))
+    two = ActorContext(subject="two", tenant="100", roles=("VIEWER",))
+    original_max = api_module._settings.state.max_sessions  # noqa: SLF001
+    object.__setattr__(api_module._settings.state, "max_sessions", 1)  # noqa: SLF001
+    try:
+        api_module._agent_for(one, "s1")  # noqa: SLF001
+        api_module._agent_for(two, "s2")  # noqa: SLF001
+        # LRU kapasite eviction'i ilk provider'i hemen kapatir.
+        assert closed == ["one"]
+
+        api_module._shutdown_runtimes()  # noqa: SLF001
+    finally:
+        object.__setattr__(api_module._settings.state, "max_sessions", original_max)  # noqa: SLF001
+
+    assert sorted(closed) == ["one", "two"]
+    assert reset_calls == ["reset"]
 
 
 # --- Guvenlik durusu --------------------------------------------------------

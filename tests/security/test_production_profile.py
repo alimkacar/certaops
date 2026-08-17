@@ -132,6 +132,13 @@ _SAFE_PRODUCTION = {
     "privacy.retention_sweep_seconds": 900,
     "cache.d3_enabled": False,
     "risk.scoring_mode": "enforce",
+    # Model saglayicisinin uretim degerleri: Vertex backend'i (kurumsal veri
+    # isleme sozlesmesi) ve saglayici tarafinda saklama KAPALI.
+    "model.provider": "gemini",
+    "model.gemini_backend": "vertex",
+    "model.google_cloud_project": "certaops-prod",
+    "model.google_cloud_location": "europe-west4",
+    "model.store_interactions": False,
 }
 
 
@@ -389,3 +396,104 @@ def test_bpa_rejects_task_without_approver_identity(tmp_path):
     with pytest.raises(SAPError) as exc:
         gateway.complete(task_id="wf-1", request=request)
     assert exc.value.code == "BPA_APPROVER_UNKNOWN"
+
+
+# ---------------------------------------------------------------------------
+# ECC backend'i uretim kapisinda odata ile ayni muameleyi gormeli.
+#
+# Regresyon kaydi: ECC backend'i eklendiginde `SAPSettings.validate()`
+# guncellendi ama uretim profili `backend == "odata"` kontrolunde kaldi.
+# Sonuc: SAP_BACKEND=ecc ile basic auth, kapali SSL ve bos egress allowlist
+# uretimde sessizce gecebiliyordu. Gercek SAP baglantisi isteyen her backend
+# ayni kapidan gecmeli.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("backend", ["odata", "ecc"])
+def test_gercek_backend_uretimde_egress_allowlist_ister(
+    settings_factory, tmp_path, backend
+):
+    settings = _prod(
+        settings_factory, tmp_path,
+        **{"sap.backend": backend, "sap.base_url": "https://sap.local",
+           "sap.auth_mode": "oauth2", "sap.oauth_token_url": "https://t",
+           "sap.oauth_client_id": "c", "sap.oauth_client_secret": "s",
+           "security.allowed_sap_hosts": ()},
+    )
+    blockers = settings.production_blockers()
+    assert any("ALLOWED_HOSTS" in b for b in blockers), (
+        f"{backend}: egress allowlist zorunlulugu uygulanmadi"
+    )
+
+
+@pytest.mark.parametrize("backend", ["odata", "ecc"])
+def test_gercek_backend_uretimde_basic_auth_kabul_etmez(
+    settings_factory, tmp_path, backend
+):
+    settings = _prod(
+        settings_factory, tmp_path,
+        **{"sap.backend": backend, "sap.base_url": "https://sap.local",
+           "sap.auth_mode": "basic", "sap.username": "u", "sap.password": "p",
+           "security.allowed_sap_hosts": ("sap.local",)},
+    )
+    blockers = settings.production_blockers()
+    assert any("basic" in b.lower() for b in blockers), (
+        f"{backend}: uretimde basic auth engellenmedi"
+    )
+
+
+@pytest.mark.parametrize("backend", ["odata", "ecc"])
+def test_gercek_backend_uretimde_ssl_dogrulamasi_zorunlu(
+    settings_factory, tmp_path, backend
+):
+    settings = _prod(
+        settings_factory, tmp_path,
+        **{"sap.backend": backend, "sap.base_url": "https://sap.local",
+           "sap.auth_mode": "oauth2", "sap.oauth_token_url": "https://t",
+           "sap.oauth_client_id": "c", "sap.oauth_client_secret": "s",
+           "sap.verify_ssl": False, "security.allowed_sap_hosts": ("sap.local",)},
+    )
+    blockers = settings.production_blockers()
+    assert any("VERIFY_SSL" in b for b in blockers), (
+        f"{backend}: SSL dogrulamasi kapaliyken uretim acildi"
+    )
+
+
+# --- Model saglayici kapilari -----------------------------------------------
+def test_fake_provider_blocks_production(settings_factory, tmp_path):
+    """Test saglayicisi uretimde calisamaz."""
+    settings = _prod(settings_factory, tmp_path, **{**_SAFE_PRODUCTION, "model.provider": "fake"})
+    blockers = settings.production_blockers()
+    assert any("MODEL_PROVIDER=fake" in b for b in blockers)
+
+
+def test_developer_backend_blocks_production(settings_factory, tmp_path):
+    """Developer API uretimde SAP verisi icin onerilmez; Vertex istenir."""
+    settings = _prod(
+        settings_factory,
+        tmp_path,
+        **{
+            **_SAFE_PRODUCTION,
+            "model.gemini_backend": "developer",
+            "model.gemini_api_key": "key",
+        },
+    )
+    blockers = settings.production_blockers()
+    assert any("GEMINI_BACKEND=developer" in b for b in blockers)
+
+
+def test_provider_side_storage_blocks_production(settings_factory, tmp_path):
+    """SAP verisi saglayici tarafinda kalici olarak saklanamaz."""
+    settings = _prod(
+        settings_factory, tmp_path, **{**_SAFE_PRODUCTION, "model.store_interactions": True}
+    )
+    blockers = settings.production_blockers()
+    assert any("STORE_INTERACTIONS" in b for b in blockers)
+
+
+def test_unconfigured_provider_blocks_production(settings_factory, tmp_path):
+    settings = _prod(
+        settings_factory,
+        tmp_path,
+        **{**_SAFE_PRODUCTION, "model.google_cloud_project": "", "model.google_cloud_location": ""},
+    )
+    blockers = settings.production_blockers()
+    assert any("yapilandirilmamis" in b for b in blockers)

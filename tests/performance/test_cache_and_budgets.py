@@ -38,7 +38,9 @@ from robotics_agent.tools import (
 )
 from robotics_agent.tools.registry import REGISTRY
 
-SCHEMA_BUDGET = 3000
+# Tek-runtime multi-domain union'lari ve explicit `additionalProperties=false`
+# guvenlik semalari icin production/runtime kontrati 4.000 tokendir.
+SCHEMA_BUDGET = 4000
 TURN_RESULT_BUDGET = 6000
 
 
@@ -62,7 +64,9 @@ def _actor(*, tenant="100", subject="a@firma.test", roles=("PURCHASER",), plants
 _POLICY = CachePolicy(ttl_seconds=60, max_class=DataClass.D2)
 
 
-def _key(actor, *, tool="sap_purchase_order_360", arguments=None, policy=_POLICY, detail="standard"):
+def _key(
+    actor, *, tool="sap_purchase_order_360", arguments=None, policy=_POLICY, detail="standard"
+):
     return build_cache_key(
         tool=tool,
         tool_version="1.0.0",
@@ -83,7 +87,10 @@ def test_cross_tenant_read_is_structurally_impossible():
     """Capraz-tenant cache sizintisi yapisal olarak sifir olmalidir."""
     cache = SecureCache()
     tenant_a, tenant_b = _actor(tenant="100"), _actor(tenant="200")
-    cache.set(_key(tenant_a), entry_for({"secret": "A"}, tool="t", data_class=DataClass.D1, ttl_seconds=60))
+    cache.set(
+        _key(tenant_a),
+        entry_for({"secret": "A"}, tool="t", data_class=DataClass.D1, ttl_seconds=60),
+    )
     assert cache.get(_key(tenant_b)) is None
     assert cache.get(_key(tenant_a)) is not None
 
@@ -110,12 +117,22 @@ def test_cache_key_separates_detail_levels():
 def test_cache_key_separates_tool_versions():
     actor = _actor()
     a = build_cache_key(
-        tool="t", tool_version="1.0.0", actor=actor, system_alias="S4",
-        arguments={}, detail="standard", policy=_POLICY,
+        tool="t",
+        tool_version="1.0.0",
+        actor=actor,
+        system_alias="S4",
+        arguments={},
+        detail="standard",
+        policy=_POLICY,
     )
     b = build_cache_key(
-        tool="t", tool_version="1.1.0", actor=actor, system_alias="S4",
-        arguments={}, detail="standard", policy=_POLICY,
+        tool="t",
+        tool_version="1.1.0",
+        actor=actor,
+        system_alias="S4",
+        arguments={},
+        detail="standard",
+        policy=_POLICY,
     )
     assert a.digest != b.digest
 
@@ -188,8 +205,12 @@ def test_write_invalidates_tagged_entries_within_tenant_only():
     cache = SecureCache()
     a, b = _actor(tenant="100"), _actor(tenant="200")
     tags = frozenset({"po_id:4500019014"})
-    cache.set(_key(a), entry_for({"v": "a"}, tool="t", data_class=DataClass.D1, ttl_seconds=60, tags=tags))
-    cache.set(_key(b), entry_for({"v": "b"}, tool="t", data_class=DataClass.D1, ttl_seconds=60, tags=tags))
+    cache.set(
+        _key(a), entry_for({"v": "a"}, tool="t", data_class=DataClass.D1, ttl_seconds=60, tags=tags)
+    )
+    cache.set(
+        _key(b), entry_for({"v": "b"}, tool="t", data_class=DataClass.D1, ttl_seconds=60, tags=tags)
+    )
 
     removed = cache.invalidate_tags("100", tags)
     assert removed == 1
@@ -236,9 +257,13 @@ def test_another_tenant_does_not_see_cached_result(settings, purchaser):
 
     reset_tool_cache()
     other = ActorContext(
-        subject=purchaser.subject, tenant="900", roles=("PURCHASER",),
-        company_codes=frozenset({"1000"}), plants=frozenset({"1100"}),
-        purchasing_orgs=frozenset({"1000"}), auth_method="test",
+        subject=purchaser.subject,
+        tenant="900",
+        roles=("PURCHASER",),
+        company_codes=frozenset({"1000"}),
+        plants=frozenset({"1100"}),
+        purchasing_orgs=frozenset({"1000"}),
+        auth_method="test",
     )
     ctx_a = ToolContext(settings=settings, sap=build_backend(settings), actor=purchaser)
     ctx_b = ToolContext(settings=settings, sap=build_backend(settings), actor=other)
@@ -251,7 +276,7 @@ def test_another_tenant_does_not_see_cached_result(settings, purchaser):
 
 # --- CI butce kapilari -----------------------------------------------------
 def test_every_agent_stays_within_schema_token_budget():
-    """Sema butcesi 3.000 tokeni asarsa build basarisiz olur."""
+    """Legacy profil gorunumleri de tek-runtime sema butcesini asamaz."""
     over: list[str] = []
     for spec in AGENT_SPECS.values():
         actor = _actor(roles=("BUYER_LEAD", "AUDITOR"))
@@ -324,8 +349,11 @@ def test_document_flow_does_not_issue_n_plus_one_queries(settings, purchaser, mo
     sap = build_backend(settings)
     calls: list[str] = []
     for method in (
-        "get_document_flow", "get_purchase_order_items", "get_schedule_lines",
-        "get_goods_receipts", "get_supplier_invoices",
+        "get_document_flow",
+        "get_purchase_order_items",
+        "get_schedule_lines",
+        "get_goods_receipts",
+        "get_supplier_invoices",
     ):
         original = getattr(sap, method)
 

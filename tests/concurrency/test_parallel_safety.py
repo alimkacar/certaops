@@ -21,6 +21,7 @@ import sys
 import textwrap
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -31,6 +32,8 @@ from robotics_agent.core import (
     AuditLedger,
     BeginOutcome,
     IdempotencyStore,
+    MemorySessionStore,
+    SessionBusy,
     SessionConflict,
     SQLiteSessionStore,
     get_state_db,
@@ -141,15 +144,17 @@ def test_consumed_approval_cannot_be_reserved(tmp_path, approver):
     db = get_state_db(tmp_path / "s.sqlite3")
     approvals = ApprovalStore(db)
     idem = IdempotencyStore(db)
-    record = approvals.issue(
-        tool="t", payload={"a": 1}, tenant="100", approvers=[approver]
-    )
+    record = approvals.issue(tool="t", payload={"a": 1}, tenant="100", approvers=[approver])
     approvals.consume(record.approval_id, execution_id="exec-1")
 
     with pytest.raises(ApprovalReservationConflict):
         idem.begin(
-            "k:v1", tenant="100", tool="t", payload_sha256="h",
-            execution_id="exec-2", approval_id=record.approval_id,
+            "k:v1",
+            tenant="100",
+            tool="t",
+            payload_sha256="h",
+            execution_id="exec-2",
+            approval_id=record.approval_id,
         )
 
 
@@ -158,15 +163,25 @@ def test_released_approval_can_be_reserved_again(tmp_path, approver):
     db = get_state_db(tmp_path / "s.sqlite3")
     approvals = ApprovalStore(db)
     idem = IdempotencyStore(db)
-    record = approvals.issue(
-        tool="t", payload={"a": 1}, tenant="100", approvers=[approver]
+    record = approvals.issue(tool="t", payload={"a": 1}, tenant="100", approvers=[approver])
+    idem.begin(
+        "k1:v1",
+        tenant="100",
+        tool="t",
+        payload_sha256="h1",
+        execution_id="exec-1",
+        approval_id=record.approval_id,
     )
-    idem.begin("k1:v1", tenant="100", tool="t", payload_sha256="h1",
-               execution_id="exec-1", approval_id=record.approval_id)
     idem.release_approval(record.approval_id, execution_id="exec-1")
 
-    result = idem.begin("k2:v1", tenant="100", tool="t", payload_sha256="h2",
-                        execution_id="exec-2", approval_id=record.approval_id)
+    result = idem.begin(
+        "k2:v1",
+        tenant="100",
+        tool="t",
+        payload_sha256="h2",
+        execution_id="exec-2",
+        approval_id=record.approval_id,
+    )
     assert result.outcome is BeginOutcome.NEW
 
 
@@ -265,6 +280,52 @@ def test_parallel_session_saves_have_single_winner(tmp_path, purchaser):
         results = list(pool.map(save, range(8)))
 
     assert results.count("ok") == 1, results
+
+
+def test_memory_session_snapshots_detect_lost_update(purchaser):
+    """load(), depodaki mutable kaydi cagirana sizdirmamali."""
+    store = MemorySessionStore(ttl_hours=1)
+    created = store.create(actor=purchaser)
+    first = store.load(created.session_id, actor=purchaser)
+    second = store.load(created.session_id, actor=purchaser)
+    assert first is not None and second is not None and first is not second
+
+    first.messages = [{"role": "user", "content": "birinci"}]
+    store.save(first)
+    second.messages = [{"role": "user", "content": "ikinci"}]
+    with pytest.raises(SessionConflict):
+        store.save(second)
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+def test_session_turn_lease_blocks_before_parallel_work(backend, tmp_path, purchaser):
+    """Ikinci ayni-session turu ilk callback bitmeden store'da kesilir."""
+    store = (
+        MemorySessionStore(ttl_hours=1)
+        if backend == "memory"
+        else SQLiteSessionStore(get_state_db(tmp_path / "lease.sqlite3"), ttl_hours=1)
+    )
+    created = store.create(actor=purchaser)
+    entered = Event()
+    release = Event()
+
+    def first_turn() -> None:
+        with store.turn(created.session_id, actor=purchaser) as (record, _):
+            entered.set()
+            assert release.wait(timeout=5)
+            record.turn_count += 1
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(first_turn)
+        assert entered.wait(timeout=5)
+        with pytest.raises(SessionBusy):
+            with store.turn(created.session_id, actor=purchaser):
+                pytest.fail("busy session context'ine girilmemeliydi")
+        release.set()
+        future.result(timeout=5)
+
+    loaded = store.load(created.session_id, actor=purchaser)
+    assert loaded is not None and loaded.turn_count == 1
 
 
 def test_session_is_not_readable_by_other_user_in_same_tenant(tmp_path, purchaser):

@@ -27,11 +27,9 @@ def test_registry_contains_only_sap_operations():
         "sap_discover_capabilities",
         "sap_connection_health",
         "sap_explain_authorization_failure",
-        "sap_validate_change",
         "sap_get_execution_audit",
         "sap_reconcile_execution",
         "get_evidence",
-        "sap_list_agents",
         "sap_search_materials",
         "sap_material_360",
         "sap_stock_overview",
@@ -50,6 +48,7 @@ def test_registry_contains_only_sap_operations():
         "sap_workflow_status",
         "sap_supplier_invoice_status",
         "sap_invoice_block_explain",
+        "sap_list_domains",
     }
     assert set(REGISTRY) == expected
     removed = {

@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from robotics_agent.config import TOOL_TIMEOUT_CEILING_SECONDS
 from robotics_agent.contracts import (
     PROTECTED_KEYS,
     ActorContext,
@@ -36,6 +37,7 @@ from robotics_agent.core import (
     SQLiteSessionStore,
     agent_catalogue,
     build_idempotency_key,
+    build_session_store,
     domains_for_packs,
     get_state_db,
     normalize_pack_keys,
@@ -85,9 +87,7 @@ def test_expired_lease_is_taken_over_as_recovered(tmp_path):
     store.begin("k1", tenant="100", tool="t", payload_sha256="h", execution_id="e1")
     past = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
     with store._db.write() as conn:  # noqa: SLF001 - testte durum kurgusu
-        conn.execute(
-            "UPDATE idempotency SET lease_expires_at = ? WHERE key = 'k1'", (past,)
-        )
+        conn.execute("UPDATE idempotency SET lease_expires_at = ? WHERE key = 'k1'", (past,))
     result = store.begin("k1", tenant="100", tool="t", payload_sha256="h", execution_id="e2")
     assert result.outcome is BeginOutcome.RECOVERED
     assert result.may_execute is False or result.record.needs_reconciliation
@@ -220,8 +220,12 @@ def test_audit_redacts_secrets(ledger, purchaser):
 
 def test_audit_records_model_and_prompt_version(ledger, purchaser):
     ledger.append(
-        "tool.completed", actor=purchaser, tool="t", outcome="ok",
-        model="claude-sonnet-5", prompt_version="v1-abc123",
+        "tool.completed",
+        actor=purchaser,
+        tool="t",
+        outcome="ok",
+        model="claude-sonnet-5",
+        prompt_version="v1-abc123",
     )
     entry = ledger.recent(limit=1)[0]
     assert entry["model"] == "claude-sonnet-5"
@@ -317,6 +321,22 @@ def test_large_result_is_trimmed_and_marked():
     assert len(outcome.payload["rows"]) < 200
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"large_scalar": "x" * 20_000},
+        {"nested": {"level": {"large_scalar": "y" * 20_000}}},
+    ],
+)
+def test_scalar_and_nested_strings_obey_hard_result_budget(payload):
+    outcome = enforce_result_budget(payload, max_tokens=80, evidence_id="ev-hard")
+
+    assert outcome.trimmed is True
+    assert outcome.final_tokens <= 80
+    assert estimate_tokens(outcome.payload) <= 80
+    assert outcome.payload["_meta"]["truncated"] is True
+
+
 def test_protected_keys_survive_trimming():
     payload = {
         "requisition_id": "10000431",
@@ -399,6 +419,20 @@ def test_router_falls_back_without_keyword_match(purchaser):
     assert "procurement_write" not in decision.packs
 
 
+def test_router_reports_packs_omitted_by_max_pack_limit(purchaser):
+    decision = route(
+        "baglanti malzeme stok satinalma talebi fatura maliyet rapor",
+        purchaser,
+        max_packs=3,
+    )
+
+    assert decision.truncated is True
+    assert decision.omitted_packs
+    assert not set(decision.omitted_packs) & set(decision.packs)
+    assert decision.to_dict()["truncated"] is True
+    assert decision.to_dict()["omitted_packs"] == list(decision.omitted_packs)
+
+
 def test_normalize_pack_keys_drops_unknown():
     assert normalize_pack_keys(["master_data", "uydurma_pack"]) == ("master_data",)
 
@@ -406,15 +440,13 @@ def test_normalize_pack_keys_drops_unknown():
 def test_agent_catalogue_has_isolated_sap_domains():
     catalogue = agent_catalogue()
     assert {row["agent"] for row in catalogue} == set(AGENT_SPECS)
-    assert set(AGENT_SPECS) == {
-        "platform", "master_data", "supply_chain", "procurement", "finance"
-    }
+    assert set(AGENT_SPECS) == {"platform", "master_data", "supply_chain", "procurement", "finance"}
     assert all("engineering" not in spec.packs for spec in AGENT_SPECS.values())
 
 
 def test_procurement_plan_deduplicates_supply_chain_dependency(purchaser):
     plan = plan_agents("ATP kontrol et ve satinalma talebi olustur", purchaser)
-    assert plan.agents == ("procurement",)
+    assert plan.agents == ("supply_chain", "procurement")
 
 
 def test_unknown_intent_goes_to_platform_agent(purchaser):
@@ -518,6 +550,18 @@ def test_sqlite_session_survives_new_store_instance(tmp_path, purchaser):
     second = SQLiteSessionStore(get_state_db(db_path), ttl_hours=1)
     loaded = second.load(record.session_id, actor=purchaser)
     assert loaded is not None and loaded.messages[0]["content"] == "kalici"
+
+
+def test_session_lease_covers_configured_model_and_sap_worst_case(settings):
+    store = build_session_store(settings)
+    model_budget = settings.model.timeout_s * (settings.model.max_retries + 1)
+    iteration_budget = max(
+        settings.agent.max_tool_iterations,
+        *(limit for _, limit in settings.agent.iteration_limits),
+    )
+    tool_budget = max(settings.sap.timeout, TOOL_TIMEOUT_CEILING_SECONDS)
+    worst_case = (model_budget + tool_budget) * iteration_budget + model_budget + 60
+    assert store.turn_lease_seconds >= worst_case
 
 
 # --- Risk seviyeleri -------------------------------------------------------

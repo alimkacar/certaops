@@ -242,25 +242,6 @@ def test_connection_health_reports_guardrails(ctx, run_tool):
     assert any("allowlist" in w for w in result.get("warnings", []))
 
 
-def test_validate_change_simulates_without_writing(ctx, run_tool):
-    result = run_tool(
-        "sap_validate_change",
-        ctx,
-        operation="purchase_requisition",
-        payload={"items": [{"material_id": "SFT-SCN-270", "quantity": 1}]},
-    )
-    assert result["valid"] is True
-    assert "simulasyon" in result["note"]
-    assert result["findings"]
-
-
-def test_validate_change_rejects_unknown_operation(ctx, run_tool):
-    result = run_tool(
-        "sap_validate_change", ctx, operation="goods_receipt", payload={}, expect_error=True
-    )
-    assert "error" in result
-
-
 def test_reconcile_reports_not_found_for_unused_key(ctx, run_tool):
     result = run_tool("sap_reconcile_execution", ctx, idempotency_key="hic:kullanilmadi:v1")
     assert result["status"] == "not_found"
@@ -272,22 +253,25 @@ def test_reconcile_lists_pending(ctx, run_tool):
     assert "pending_count" in result
 
 
-def test_sap_list_agents_returns_isolated_catalogue(ctx, run_tool):
-    result = run_tool("sap_list_agents", ctx)
-    assert result["architecture"] == "orchestrator + isolated SAP domain agents"
-    assert {row["agent"] for row in result["agents"]} == {
+def test_sap_list_domains_returns_capability_view(ctx, run_tool):
+    result = run_tool("sap_list_domains", ctx)
+    assert result["architecture"] == "certaops-single-runtime"
+    assert {row["domain"] for row in result["domains"]} == {
         "platform", "master_data", "supply_chain", "procurement", "finance"
     }
-    assert result["handoff_schema"] == "sap-agent-handoff/v1"
+    # Ayri calisan agent'lar VARMIS gibi bilgi vermez.
+    assert "handoff_schema" not in result
+    assert all("agent" not in row for row in result["domains"])
 
 
-def test_sap_list_agents_previews_deterministic_plan(ctx, run_tool):
+def test_sap_list_domains_previews_deterministic_routing(ctx, run_tool):
     result = run_tool(
-        "sap_list_agents",
+        "sap_list_domains",
         ctx,
         message="HD-GEAR icin ATP kontrol et ve satinalma talebi olustur",
     )
-    assert result["plan_preview"]["agents"] == ["procurement"]
+    assert result["routing_preview"]["domains"] == ["procurement"]
+    assert "procurement_write" in result["routing_preview"]["packs"]
 
 
 def test_authorization_failure_explanation_grants_nothing(ctx, run_tool):
@@ -455,3 +439,18 @@ def test_confidential_results_are_masked_before_the_model(settings, purchaser):
         assert result["amount"] == 100  # is verisi korunur
     finally:
         REGISTRY.pop("_test_confidential", None)
+
+
+def test_removed_tools_are_not_registered():
+    """Silinen tool'lar geri gelmemeli.
+
+    `sap_list_agents` deprecated bir takma addi; `sap_validate_change` ise
+    `sap_pr_prepare` ile ayni dogrulamayi yapiyordu. Modele ayni isi yapan
+    iki tool gostermek yanlis secim uretir.
+    """
+    from robotics_agent.tools.registry import REGISTRY
+
+    assert "sap_list_agents" not in REGISTRY
+    assert "sap_validate_change" not in REGISTRY
+    assert "sap_list_domains" in REGISTRY, "yerine gecen tool durmali"
+    assert "sap_pr_prepare" in REGISTRY, "dogrulamayi devralan tool durmali"
