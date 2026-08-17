@@ -34,7 +34,6 @@ from __future__ import annotations
 import argparse
 import ast
 import json
-import sys
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[1] / "src"
