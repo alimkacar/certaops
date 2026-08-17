@@ -99,7 +99,7 @@ def test_default_is_allowed_for_matching_actor(pdp, purchaser):
 def test_non_org_tool_is_not_blocked_by_defaults(pdp, restricted):
     """SAP organizasyonuna dokunmayan tool varsayilan kontrolune takilmaz."""
     spec = _Spec(
-        name="sap_list_agents",
+        name="sap_simulate_only",
         risk_tier=RiskTier.R1,
         required_scopes=("sap.simulate",),
         applies_org_defaults=False,

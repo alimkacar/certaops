@@ -179,6 +179,16 @@ def _args_fingerprint(name: str, arguments: dict[str, Any]) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
 
 
+#: Saglayici cagrisinin saglikli bittigini gosteren durumlar.
+#: `requires_action` modelin tool cagirmak ISTEDIGINI soyler; bu normal
+#: akistir. Bunu "tamamlanmadi" saymak butun tool cagrilarini sessizce
+#: dusururdu.
+HEALTHY_PROVIDER_STATUSES = frozenset({"", "completed", "requires_action"})
+
+#: Acikca bozuk oldugu bilinen durumlar.
+BROKEN_PROVIDER_STATUSES = frozenset({"failed", "cancelled", "incomplete"})
+
+
 def _supports_streaming(provider: Any) -> bool:
     """Saglayici `generate(..., on_text=...)` kabul ediyor mu?
 
@@ -646,7 +656,17 @@ class SAPAgentRuntime:
             # Ikincisinde status "completed" gelir; yalniz status'e bakmak
             # yetmez. Her iki halde de hicbir cagri calistirilmaz.
             truncated = response.stop_reason == "max_tokens" and bool(response.function_calls)
-            if (response.status and response.status != "completed") or truncated:
+            unhealthy = response.status not in HEALTHY_PROVIDER_STATUSES
+            if unhealthy and response.status not in BROKEN_PROVIDER_STATUSES:
+                # Taninmayan durum: guvenli tarafta kaliriz ama sessiz kalmayiz.
+                # Sessiz bloklama, bir eval'in "hicbir sey calismadigi icin"
+                # gecmesine yol acar - yani yanlis sebepten yesil olur.
+                log.error(
+                    "saglayici taninmayan bir status dondurdu: %r - "
+                    "function call'lar guvenlik geregi calistirilmadi",
+                    response.status,
+                )
+            if unhealthy or truncated:
                 assert self.ctx.audit
                 self.ctx.audit.append(
                     "model.incomplete_response",

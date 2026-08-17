@@ -53,10 +53,10 @@ def run_demo() -> int:
     print("CertaOps - deterministik SAP tool runtime demosu")
     print(f"Sistem: {ctx.settings.sap.system_alias} | backend: {ctx.sap.name} | dry-run: {ctx.settings.sap.dry_run}")
 
-    agents = call(ctx, "sap_list_agents")
-    print("\nDomain agent'lari:")
-    for item in agents["agents"]:
-        print(f"  - {item['agent']}: {item['title']}")
+    profiles = call(ctx, "sap_list_domains")
+    print("\nDomain profilleri:")
+    for item in profiles["domains"]:
+        print(f"  - {item['domain']}: {item['title']}")
 
     material = "SFT-SCN-270"
     master = call(ctx, "sap_material_360", material_id=material, detail="summary")

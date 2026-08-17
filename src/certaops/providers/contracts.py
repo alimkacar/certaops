@@ -263,11 +263,16 @@ class ModelResponse:
     text: str = ""
     function_calls: tuple[FunctionCall, ...] = ()
     usage: TokenUsage = field(default_factory=TokenUsage)
-    #: Saglayici cagrisinin SONUCU ("completed" / "failed" / "cancelled" /
-    #: "incomplete"). `stop_reason`dan farklidir: o modelin turu neden
-    #: bitirdigini soyler, bu cagrinin saglikli tamamlanip tamamlanmadigini.
-    #: Tamamlanmamis bir yanittaki function call YARIM olabilir; runtime
-    #: bunlari calistirmaz.
+    #: Saglayici cagrisinin SONUCU. `stop_reason`dan farklidir: o modelin turu
+    #: neden bitirdigini soyler, bu cagrinin saglikli tamamlanip tamamlanmadigini.
+    #:
+    #:   SAGLIKLI : "completed" (tur bitti), "requires_action" (model tool
+    #:              cagirmak istiyor - NORMAL akis, hata degil)
+    #:   BOZUK    : "failed", "cancelled", "incomplete"
+    #:
+    #: Bozuk bir yanittaki function call YARIM olabilir; runtime bunlari
+    #: calistirmaz. Taninmayan bir deger de guvenli tarafta kalinarak bozuk
+    #: sayilir, ama sessizce degil: ERROR seviyesinde loglanir.
     status: str = "completed"
     stop_reason: StopReason = "end_turn"
     model: str = ""

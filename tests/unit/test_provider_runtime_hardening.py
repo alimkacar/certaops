@@ -116,3 +116,51 @@ def test_max_tokens_truncation_never_executes_partial_function_calls(
     assert turn.needs_review is True
     assert turn.stop_reason == "max_tokens"
     assert "tamamlanmis sayilmadi" in turn.text
+
+
+def test_requires_action_status_still_executes_function_calls(settings, purchaser) -> None:
+    """`requires_action` modelin tool cagirmak ISTEDIGINI soyler - hata degil.
+
+    Bunu "tamamlanmadi" saymak butun tool cagrilarini sessizce dusururdu ve
+    guvenlik testleri "hicbir sey calismadigi icin" gecerdi: yanlis sebepten
+    yesil. Bu test o regresyonu sabitler.
+    """
+    provider = FakeModelProvider(
+        [
+            ModelResponse(
+                text="Baglantiyi kontrol ediyorum.",
+                function_calls=(FunctionCall("ok-1", "sap_connection_health", {}),),
+                status="requires_action",
+            ),
+            ModelResponse(text="Baglanti saglikli.", status="completed"),
+        ]
+    )
+    runtime = SAPAgentRuntime(settings, actor=purchaser, provider=provider)
+    _disable_direct_answers(settings)
+
+    turn = runtime.chat("Baglanti sagligini kontrol et")
+
+    assert [c.name for c in turn.tool_calls] == ["sap_connection_health"]
+    assert turn.needs_review is False
+
+
+def test_unknown_provider_status_is_blocked_and_logged(settings, purchaser, caplog) -> None:
+    """Taninmayan durum guvenli tarafta bloklanir, ama SESSIZ degil."""
+    provider = FakeModelProvider(
+        [
+            ModelResponse(
+                text="Belirsiz durum.",
+                function_calls=(FunctionCall("x-1", "sap_connection_health", {}),),
+                status="voodoo",
+            )
+        ]
+    )
+    runtime = SAPAgentRuntime(settings, actor=purchaser, provider=provider)
+    _disable_direct_answers(settings)
+
+    with caplog.at_level("ERROR"):
+        turn = runtime.chat("Baglanti sagligini kontrol et")
+
+    assert turn.tool_calls == []
+    assert turn.needs_review is True
+    assert any("voodoo" in r.getMessage() for r in caplog.records)

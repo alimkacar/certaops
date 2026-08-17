@@ -180,7 +180,6 @@ def build_arguments(name: str, seeds: Seeds) -> dict[str, Any] | None:
         # --- cekirdek deger gerektirmeyenler ---
         "sap_connection_health": {},
         "sap_discover_capabilities": {"probe": True},
-        "sap_list_agents": {},
         "sap_list_domains": {},
         "sap_get_execution_audit": {"limit": 5, "verify_chain": True},
         "sap_reconcile_execution": {"list_pending": True},
