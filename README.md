@@ -8,7 +8,7 @@
     <img alt="Python 3.10–3.13" src="https://img.shields.io/badge/Python-3.10%E2%80%933.13-3776AB?logo=python&logoColor=white">
     <img alt="Release 0.1.0" src="https://img.shields.io/badge/release-0.1.0-6D5DFB">
     <img alt="24 SAP tools" src="https://img.shields.io/badge/SAP_tools-24-0FAAFF">
-    <img alt="705 tests passing" src="https://img.shields.io/badge/tests-705_passing-2EA44F">
+    <img alt="736 tests passing" src="https://img.shields.io/badge/tests-736_passing-2EA44F">
     <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-0B2239">
   </p>
 </div>
@@ -20,7 +20,7 @@
 ## What is CertaOps?
 
 CertaOps is a Python toolkit for building AI-assisted operations exclusively around SAP
-S/4HANA. It combines five domain-isolated agents with 24 purpose-built SAP tools and a
+S/4HANA. It combines five domain profiles with 24 purpose-built SAP tools and a
 deterministic security runtime.
 
 The language model can propose a tool call; it cannot grant itself access, approve a write,
@@ -265,10 +265,11 @@ tool acceptance gate:
 python scripts/api_hub_acceptance.py
 ```
 
-The gate starts the MCP server over stdio, verifies `initialize` and `tools/list`, calls
-all 18 Hub-safe tools, follows an `evidence_id` through `get_evidence`, and fails if a
-write or local-file side-effect tool is exposed. The expected result is `18/18`. It
-always forces `SAP_DRY_RUN=true` and never enables the integration write gate. The set
+The read-only SAP API Hub acceptance has been run successfully: all 18 Hub-safe tools
+were exercised against the sandbox and their read behavior was verified. The gate starts
+the MCP server over stdio, verifies `initialize` and `tools/list`, follows an `evidence_id`
+through `get_evidence`, and fails if a write or local-file side-effect tool is exposed.
+It always forces `SAP_DRY_RUN=true` and never enables the integration write gate. The set
 includes real PO item, material-document and supplier-invoice reads for four P2P tools.
 
 ### SAP CAL cost-controlled acceptance
@@ -316,12 +317,12 @@ outbound SAP host.
 
 | Layer | Current evidence |
 |---|---|
-| Full suite | 754 passing, 15 skipped (769 collected) |
+| Full suite | 736 passing, 16 skipped (752 collected) |
 | Local security and policy runtime | `tests/policy` + `security` + `privacy` + `concurrency`: all passing |
 | Acceptance behavior | 28/28 executable checks with evidence output |
-| SAP tool behavior | End-to-end against the bundled S/4HANA simulator |
+| SAP tool behavior | End-to-end against the bundled S/4HANA simulator and verified read-only SAP API Hub acceptance (18/18 tools) |
 | OData V2/V4 adapter | Contract-tested against recorded `$metadata` fixtures |
-| Live tenant semantics | 15 integration tests included, skipped without an authorized tenant |
+| Live tenant semantics | 16 integration tests included, skipped without an authorized tenant |
 
 Run the same quality gates used by CI:
 
