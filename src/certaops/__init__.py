@@ -29,7 +29,7 @@ _LAZY = {
     "get_settings": ("robotics_agent.config", "get_settings"),
     "setup_logging": ("robotics_agent.config", "setup_logging"),
     "SAPAgentRuntime": ("certaops.runtime", "SAPAgentRuntime"),
-    "SAPMultiAgent": ("robotics_agent.agent", "SAPMultiAgent"),
+    "SAPMultiAgent": ("robotics_agent.compat_agent", "SAPMultiAgent"),
     "build_provider": ("certaops.providers", "build_provider"),
 }
 

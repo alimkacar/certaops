@@ -28,8 +28,8 @@ from ..contracts import (
     resolve_detail,
 )
 from ..core import Verification, approval_payload_for, payload_hash
-from ..sap.models import PurchaseRequisitionItem
-from .registry import ToolContext, tool
+from ..sap.models import PurchaseRequisitionItem, ValidationFinding
+from .registry import PerformanceBudget, ToolContext, tool
 
 # Incoterm bazli tahmini ek lojistik/gumruk yuku (net fiyat uzerine oran)
 INCOTERM_LANDED_ADDER = {"EXW": 0.11, "FOB": 0.08, "FCA": 0.08, "CIF": 0.04, "CIP": 0.04,
@@ -38,6 +38,11 @@ INCOTERM_LANDED_ADDER = {"EXW": 0.11, "FOB": 0.08, "FCA": 0.08, "CIF": 0.04, "CI
 DEFECT_COST_MULTIPLIER = 3.0
 # Yillik sermaye maliyeti - odeme vadesi avantaji hesabinda kullanilir
 COST_OF_CAPITAL = 0.12
+
+
+def _material_key(value: str) -> str:
+    """SAP malzeme numaralarini karsilastirmak icin normalize eder."""
+    return str(value).strip().upper()
 
 
 def _parse_date(value: str | None) -> date | None:
@@ -140,6 +145,7 @@ def sap_search_materials(
     domain="planning",
     risk_tier=RiskTier.R0,
     required_scopes=(SCOPE_SAP_READ,),
+    performance_budget=PerformanceBudget(p95_ms=6000, max_sap_calls=6, max_records=200),
     description=(
         "Malzemelerin STOK FOTOGRAFINI dondurur (MARD serbest stok, rezervasyon, acik siparis, "
         "emniyet stogu) ve tedarik suresine gore kaba bir en erken tarih tahmini yapar. "
@@ -180,16 +186,23 @@ def sap_stock_overview(
     need_by = _parse_date(required_date)
     today = date.today()
 
-    levels = ctx.sap.get_stock(material_ids, plant=plant)
-    found_ids = {level.material_id for level in levels}
-    not_found = [m for m in material_ids if m.upper() not in found_ids]
+    requested = [m for m in dict.fromkeys(material_ids) if m]
+    levels = ctx.sap.get_stock(requested, plant=plant)
+    masters = ctx.sap.get_materials(requested, plant=plant)
+    records_by_material = ctx.sap.get_info_records_bulk(requested, plant=plant)
+
+    masters_by_key = {_material_key(k): v for k, v in masters.items()}
+    records_by_key = {_material_key(k): v for k, v in records_by_material.items()}
+    not_found = [m for m in requested if _material_key(m) not in masters_by_key]
+    levels = [lvl for lvl in levels if _material_key(lvl.material_id) in masters_by_key]
 
     rows: list[dict[str, Any]] = []
     shortages: list[dict[str, Any]] = []
 
     for level in levels:
-        material = ctx.sap.get_material(level.material_id, plant=plant)
-        records = ctx.sap.get_info_records(level.material_id, plant=plant)
+        key = _material_key(level.material_id)
+        material = masters_by_key.get(key)
+        records = records_by_key.get(key, [])
         best_lead = min(
             (r.planned_delivery_days for r in records),
             default=material.planned_delivery_days if material else 30,
@@ -272,6 +285,7 @@ def sap_stock_overview(
     domain="procurement_read",
     risk_tier=RiskTier.R1,
     required_scopes=(SCOPE_SAP_READ, SCOPE_SAP_SIMULATE),
+    performance_budget=PerformanceBudget(p95_ms=4000, max_sap_calls=5, max_records=200),
     description=(
         "Bir malzeme icin SAP satinalma bilgi kayitlarindaki (EINA/EINE) tum tedarikcileri "
         "toplam sahip olma maliyeti (TCO) uzerinden karsilastirir. Net fiyat + kademeli fiyat "
@@ -314,9 +328,10 @@ def sap_compare_vendors(
     need_by = _parse_date(required_date)
     today = date.today()
     candidates: list[dict[str, Any]] = []
+    vendors = ctx.sap.get_vendors([record.vendor_id for record in records])
 
     for record in records:
-        vendor = ctx.sap.get_vendor(record.vendor_id)
+        vendor = vendors.get(record.vendor_id)
         unit_price = record.price_for_qty(quantity)
         base = unit_price * quantity
 
@@ -549,6 +564,7 @@ def sap_track_purchase_orders(
     risk_tier=RiskTier.R0,
     required_scopes=(SCOPE_SAP_READ,),
     result_token_budget=1100,
+    performance_budget=PerformanceBudget(p95_ms=6000, max_sap_calls=10, max_records=200),
     description=(
         "Bir malzemenin tek gorunumde 360 ozeti: ana veri, tesis/MRP parametreleri, degerleme "
         "fiyati, stok dagilimi, siniflandirma karakteristikleri, tedarik kaynaklari ve acik "
@@ -717,6 +733,7 @@ def sap_material_360(
     risk_tier=RiskTier.R0,
     required_scopes=(SCOPE_SAP_READ,),
     result_token_budget=900,
+    performance_budget=PerformanceBudget(p95_ms=30000, max_sap_calls=6, max_records=200),
     description=(
         "Tedarikcinin fiyat, teslim, miktar, kalite ve servis skorlarini SAP operasyonel "
         "degerlendirmesinden (A_SUPPLIEROPLSCORESAV_CDS) toplar ve acik siparislerdeki gercek "
@@ -748,7 +765,7 @@ def sap_supplier_score_360(
     all_estimated: set[str] = set()
 
     for vendor_id in vendor_ids:
-        vendor = ctx.sap.get_vendor(vendor_id)
+        vendor = ctx.sap.get_vendor_master(vendor_id)
         if vendor is None:
             rows.append({"vendor_id": vendor_id, "error": "Tedarikci bulunamadi."})
             continue
@@ -917,6 +934,26 @@ def sap_pr_prepare(
     )
     digest = payload_hash(approval_payload)
 
+    # --- Tenant profili: SAP'in reddedecegi seyi ONCEDEN yakala -------------
+    # `$metadata` bir alanin var oldugunu soyler, sirketin onu ZORUNLU
+    # yaptigini soylemez. Field selection ve BAdI kurallari ancak bildirilerek
+    # ya da SAP reddedildikten sonra ogrenilerek bilinir. Profil bu bilgiyi
+    # tasir; burada uygulanmazsa kullanici ayni duvara her seferinde carpar.
+    profile = ctx.tenant_profile()
+    profile_findings = [
+        ValidationFinding(
+            severity="error",
+            field=name,
+            message=(
+                f"'{name}' bu sistemde zorunlu ama bos. Tenant profilinde zorunlu "
+                f"alan olarak tanimli; SAP yazmayi reddederdi."
+            ),
+        )
+        for name in profile.missing_required(draft.payload)
+    ]
+    all_findings = [*draft.findings, *profile_findings]
+    blocking = [f.message for f in all_findings if f.blocking]
+
     payload: dict[str, Any] = {
         "draft_id": draft.draft_id,
         "total_value": draft.total_value,
@@ -924,9 +961,10 @@ def sap_pr_prepare(
         "item_count": len(draft.items),
         "items": draft.items,
         "diff": draft.diff,
-        "findings": [f.model_dump() for f in draft.findings],
-        "blocking": [f.message for f in draft.blocking_findings],
-        "submittable": draft.is_submittable,
+        "findings": [f.model_dump() for f in all_findings],
+        "blocking": blocking,
+        "document_type": profile.document_type,
+        "submittable": draft.is_submittable and not profile_findings,
         "payload_sha256": digest,
         "source_api": draft.source_api,
         "written_to_sap": False,

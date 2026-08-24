@@ -78,6 +78,7 @@ def client(tmp_path, principals_file, monkeypatch):
     monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("OUTPUT_DIR", str(tmp_path / "out"))
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-not-used")
+    monkeypatch.setenv("SAP_BACKEND", "mock")
     monkeypatch.setenv("SAP_ALLOWED_HOSTS", "s4.firma.test")
     monkeypatch.setenv("AGENT_SESSION_BACKEND", "sqlite")
     # Gizlilik ve risk kapilari da guvenli uretim degerleriyle yapilandirilmis
@@ -230,6 +231,24 @@ def test_empty_message_is_rejected_before_model_call(client):
 def test_oversized_message_is_rejected_by_schema(client):
     response = client.post("/chat", headers=auth("purchaser"), json={"message": "x" * 25_000})
     assert response.status_code == 422
+
+
+def test_chunked_oversized_body_is_rejected_by_middleware(client, monkeypatch):
+    import robotics_agent.channels.api as api
+
+    original_limit = api._settings.security.max_request_bytes
+    object.__setattr__(api._settings.security, "max_request_bytes", 32)
+    try:
+        response = client.post(
+            "/chat",
+            headers={**auth("purchaser"), "Transfer-Encoding": "chunked"},
+            content=iter([b'{"message":"', b"x" * 64, b'"}']),
+        )
+    finally:
+        object.__setattr__(api._settings.security, "max_request_bytes", original_limit)
+
+    assert response.status_code == 413
+    assert response.json()["code"] == "REQUEST_TOO_LARGE"
 
 
 def test_correlation_id_is_echoed(client):

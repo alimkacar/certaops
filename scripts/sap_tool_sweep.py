@@ -135,30 +135,54 @@ class Seeds:
         self.evidence_id = ""
         self.discovery: list[str] = []
 
-    def discover(self, run) -> None:
-        if not self.material:
+    def discover(self, run, *, needed: set[str] | None = None) -> None:
+        """Yalniz secilen tool'larin gerektirdigi cekirdekleri kesfeder.
+
+        Onceki surum `--only sap_purchase_order_360` kosusunda bile WBS bulmak
+        icin custom proje maliyet servisine gidiyordu. Bu hem CAL aktif suresini
+        hem SAP cagrilarini bosa harciyordu.
+        """
+        selected = needed or set()
+        needs_material = not selected or bool(selected & {
+            "sap_search_materials", "sap_material_360", "sap_stock_overview",
+            "sap_atp_check", "sap_mrp_shortage_explain", "sap_compare_vendors",
+            "sap_track_purchase_orders", "sap_pr_prepare", "sap_pr_submit",
+        })
+        needs_vendor = not selected or bool(selected & {
+            "sap_supplier_score_360", "sap_compare_vendors",
+        })
+        needs_po = not selected or bool(selected & {
+            "sap_purchase_order_360", "sap_document_flow", "sap_workflow_status",
+            "sap_supplier_invoice_status", "sap_track_purchase_orders",
+        })
+        needs_invoice = not selected or bool(selected & {
+            "sap_invoice_block_explain", "sap_supplier_invoice_status",
+        })
+        needs_wbs = not selected or "sap_project_cost_status" in selected
+
+        if needs_material and not self.material:
             payload, err = run("sap_search_materials", {"limit": 5})
             if not err:
                 self.material = _first(payload, "material_id", "material", "Product")
                 self.discovery.append(f"material <- sap_search_materials: {self.material or 'YOK'}")
-        if not self.vendor and self.material:
+        if needs_vendor and not self.vendor and self.material:
             payload, err = run("sap_compare_vendors", {"material_id": self.material, "quantity": 1})
             if not err:
                 self.vendor = _first(payload, "vendor_id", "supplier", "Supplier")
                 self.discovery.append(f"vendor <- sap_compare_vendors: {self.vendor or 'YOK'}")
-        if not self.po:
+        if needs_po and not self.po:
             payload, err = run("sap_track_purchase_orders", {"only_open": False})
             if not err:
                 self.po = _first(payload, "po_id", "purchase_order", "PurchaseOrder")
                 self.discovery.append(f"po <- sap_track_purchase_orders: {self.po or 'YOK'}")
-        if not self.invoice:
+        if needs_invoice and not self.invoice:
             # Bu tool en az bir filtre ister; po varsa onu, yoksa only_blocked kullan.
             filters = {"po_id": self.po} if self.po else {"only_blocked": True}
             payload, err = run("sap_supplier_invoice_status", {**filters, "limit": 5})
             if not err:
                 self.invoice = _first(payload, "invoice_id", "supplier_invoice", "SupplierInvoice")
                 self.discovery.append(f"invoice <- sap_supplier_invoice_status: {self.invoice or 'YOK'}")
-        if not self.wbs:
+        if needs_wbs and not self.wbs:
             payload, err = run("sap_project_cost_status", {})
             if not err:
                 self.wbs = _first(payload, "wbs_element", "wbs", "WBSElement")
@@ -242,6 +266,8 @@ def classify(payload: Any, is_error: bool) -> str:
         return DENIED
     if any(k in blob for k in ("APPROVAL", "ONAY")):
         return APPROVAL
+    if any(k in blob for k in ("BULUNAMADI", "BILGI KAYDI", "VERI YOK")):
+        return EMPTY
     return SAP_ERR
 
 
@@ -311,7 +337,7 @@ def main(argv: list[str] | None = None) -> int:
     # --- Kesif ---
     seeds = Seeds(args)
     if not args.no_discover:
-        seeds.discover(run)
+        seeds.discover(run, needed=set(args.only or REGISTRY))
 
     # --- Tarama ---
     # get_evidence baska bir tool'un urettigi evidence_id'yi ister; en sona alinir.
@@ -420,8 +446,6 @@ def _print_human(report: dict[str, Any], seeds: Seeds) -> None:
     for row in report["results"]:
         colour = _COLOUR.get(row["status"], "")
         ms = f"{row.get('ms', 0):>5} ms" if "ms" in row else " " * 8
-        # NOT: ToolContext.sap_call_count su an hicbir yerde artmiyor (olu sayac).
-        # Yaniltmamak icin yalniz sifirdan buyukse basilir; sayac duzelince kendiliginden gorunur.
         calls = f"{row['sap_calls']} cagri" if row.get("sap_calls") else ""
         print(f"  [{colour}{row['status']:<8}{RESET}] {row['tool']:<34} "
               f"{row.get('risk', ''):<3} {ms} {DIM}{calls}{RESET}")

@@ -9,7 +9,7 @@ from typing import Any
 
 from .config import Settings
 from .contracts import ActorContext
-from .core.agents import AgentSpec
+from .core.domain_profiles import AgentSpec
 
 STABLE_PREFIX = """\
 Sen kurumsal SAP S/4HANA operasyonlari icin calisan, policy denetimli bir domain agent'isin.
@@ -115,7 +115,7 @@ def build_domain_prompt(
 
 def build_system_prompt(settings: Settings, *, actor: ActorContext | None = None) -> str:
     """Geriye donuk uyumluluk icin platform agent prompt'u."""
-    from .core.agents import AGENT_SPECS
+    from .core.domain_profiles import AGENT_SPECS
 
     return build_domain_prompt(settings, spec=AGENT_SPECS["platform"], actor=actor)
 

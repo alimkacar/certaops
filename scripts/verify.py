@@ -360,6 +360,15 @@ def main() -> int:
     parser.add_argument("--log", action="store_true", help="Uygulama loglarini da goster")
     args = parser.parse_args()
 
+    # Bu betik deterministik yerel kabul kapisidir. `.env` icinde canli bir
+    # Hub/tenant tanimli olsa bile dis sisteme cikamaz; gercek baglanti icin
+    # yalniz `check_real_sap.py` ve `sap_tool_sweep.py` kullanilir.
+    settings = get_settings()
+    object.__setattr__(settings.sap, "backend", "mock")
+    object.__setattr__(settings.sap, "dry_run", True)
+    object.__setattr__(settings.security, "allowed_sap_hosts", ())
+    object.__setattr__(settings.security, "disabled_tools", ())
+
     # Bilincli ret'ler (AUTH_REQUIRED, ORG_SCOPE) uygulama tarafinda WARNING
     # uretir. Bunlar bu script icin **beklenen** davranistir; ciktiyi
     # kirletmemesi icin susturulur. `--log` ile geri acilir.
@@ -368,7 +377,6 @@ def main() -> int:
         logging.getLogger("robotics_agent.tools.registry").setLevel(logging.ERROR)
 
     load_all_tools()
-    settings = get_settings()
     print(f"{BOLD}CertaOps 0.1.0 - kabul dogrulamasi{RESET}")
     print(f"{DIM}backend={settings.sap.backend} | dlp={settings.privacy.dlp_mode} | "
           f"risk={settings.risk.scoring_mode} | cache={settings.cache.backend}{RESET}")

@@ -89,6 +89,25 @@ def test_read_entity_returns_none_on_404():
     assert row is None and etag == ""
 
 
+def test_configured_description_language_is_sent():
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("Accept-Language", ""))
+        return httpx.Response(200, json={"value": []})
+
+    core = ODataHttpCore(
+        client=httpx.Client(
+            base_url="https://s4.firma.test", transport=httpx.MockTransport(handler)
+        ),
+        accept_language="EN",
+        sleep=lambda _: None,
+    )
+    ODataV4Client(core).read_collection("srv", "Items")
+
+    assert seen == ["EN"]
+
+
 def test_etag_is_read_from_body_or_header():
     def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"id": 1, "@odata.etag": 'W/"abc"'})

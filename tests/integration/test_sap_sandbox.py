@@ -10,6 +10,7 @@ tenant'i ve asagidaki ortam degiskenleri gerekir:
     SAP_INTEGRATION_MATERIAL=<test malzemesi>
     SAP_INTEGRATION_VENDOR=<test tedarikcisi>     (opsiyonel)
     SAP_INTEGRATION_ALLOW_WRITE=1                 (yazma testleri icin, AYRICA)
+    SAP_DRY_RUN=false                             (yazma testleri icin, AYRICA)
 
 Yazma testleri bilerek ayri bir bayrakla korunur ve calistiginda olusturdugu
 belgeyi raporlar: quality sisteminde bile kontrolsuz belge birakmak istenmez.
@@ -33,7 +34,10 @@ from robotics_agent.sap import build_backend
 from robotics_agent.sap.models import PurchaseRequisitionItem
 
 RUN_INTEGRATION = os.getenv("SAP_INTEGRATION_TESTS") == "1"
-ALLOW_WRITE = os.getenv("SAP_INTEGRATION_ALLOW_WRITE") == "1"
+ALLOW_WRITE = (
+    os.getenv("SAP_INTEGRATION_ALLOW_WRITE") == "1"
+    and os.getenv("SAP_DRY_RUN", "true").strip().lower() in {"0", "false", "no"}
+)
 
 pytestmark = pytest.mark.skipif(
     not RUN_INTEGRATION,
@@ -180,7 +184,8 @@ def test_authorization_failure_is_structured(sap):
 
 # --- Yazma (ayrica bayrakli) ------------------------------------------------
 @pytest.mark.skipif(
-    not ALLOW_WRITE, reason="Yazma testleri icin SAP_INTEGRATION_ALLOW_WRITE=1 gerekli."
+    not ALLOW_WRITE,
+    reason="Yazma icin SAP_INTEGRATION_ALLOW_WRITE=1 ve SAP_DRY_RUN=false gerekli.",
 )
 def test_prepare_does_not_write(sap, material):
     draft = sap.prepare_purchase_requisition(
@@ -194,7 +199,8 @@ def test_prepare_does_not_write(sap, material):
 
 
 @pytest.mark.skipif(
-    not ALLOW_WRITE, reason="Yazma testleri icin SAP_INTEGRATION_ALLOW_WRITE=1 gerekli."
+    not ALLOW_WRITE,
+    reason="Yazma icin SAP_INTEGRATION_ALLOW_WRITE=1 ve SAP_DRY_RUN=false gerekli.",
 )
 def test_write_then_read_back_and_idempotent_retry(sap, material, capsys):
     """Write -> read-back -> ayni referansla tekrar (duplicate olmamali)."""
@@ -227,7 +233,8 @@ def test_write_then_read_back_and_idempotent_retry(sap, material, capsys):
 
 
 @pytest.mark.skipif(
-    not ALLOW_WRITE, reason="Yazma testleri icin SAP_INTEGRATION_ALLOW_WRITE=1 gerekli."
+    not ALLOW_WRITE,
+    reason="Yazma icin SAP_INTEGRATION_ALLOW_WRITE=1 ve SAP_DRY_RUN=false gerekli.",
 )
 def test_policy_gate_blocks_unauthorized_write(sap):
     """Gercek sistemde de yetkisiz actor handler'a ulasamaz."""

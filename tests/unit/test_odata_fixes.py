@@ -119,8 +119,8 @@ INFO_ROW = {
 BASE_ROUTES = {
     "A_Product": [PRODUCT_ROW],
     "A_PurchasingInfoRecord": [INFO_ROW],
-    "A_MaterialValuation": [{"Material": "MAT-1", "MovingAveragePrice": "90",
-                             "Currency": "EUR", "PriceUnitQty": "1"}],
+    "A_ProductValuation": [{"Product": "MAT-1", "MovingAveragePrice": "90",
+                            "Currency": "EUR", "PriceUnitQty": "1"}],
     "A_Supplier": [{"Supplier": "V-1", "SupplierName": "Test Tedarikci"}],
 }
 
@@ -195,6 +195,11 @@ def test_tedarikci_adlari_v2_filter_ile_okunur(settings_factory, tmp_path):
 
     assert not fake.paths("$batch"), "V2 servise V4 $batch gonderildi"
     assert records and records[0].vendor_name == "Test Tedarikci"
+    assert records[0].payment_terms == "NT30"
+    info_call = fake.paths("A_PurchasingInfoRecord")[0]
+    assert "PaymentTerms" not in info_call.url.params.get("$select", ""), (
+        "API Hub bu alani select'te gorunce Info Record sonucunu sessizce bosaltiyor"
+    )
     supplier_calls = fake.paths("A_Supplier")
     assert len(supplier_calls) == 1, "tedarikci adlari tek cagride okunmali"
     assert "Supplier eq 'V-1'" in supplier_calls[0].url.params.get("$filter", "")
@@ -242,9 +247,10 @@ def test_cok_kalemli_talep_sabit_sayida_cagri_yapar(settings_factory, tmp_path):
         PurchaseRequisitionItem(material_id=f"MAT-{i}", quantity=1) for i in range(1, 6)
     ]
     backend.prepare_purchase_requisition(items)
-    assert len(fake.paths("A_Product")) == 1
+    product_reads = [r for r in fake.requests if r.url.path.endswith("/A_Product")]
+    assert len(product_reads) == 1
     assert len(fake.paths("A_PurchasingInfoRecord")) == 1
-    assert len(fake.paths("A_MaterialValuation")) == 1
+    assert len(fake.paths("A_ProductValuation")) == 1
 
 
 def test_coklu_malzeme_stogu_tek_cagride_okunur(settings_factory, tmp_path):

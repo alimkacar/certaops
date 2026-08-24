@@ -497,3 +497,55 @@ def test_unconfigured_provider_blocks_production(settings_factory, tmp_path):
     )
     blockers = settings.production_blockers()
     assert any("yapilandirilmamis" in b for b in blockers)
+
+
+# --- Operator kapatma anahtari ---------------------------------------------
+def test_disabled_tool_is_hidden_from_model_and_denied_when_called(monkeypatch):
+    """Kapatma anahtari iki katmanli olmali.
+
+    Modele gostermemek yetmez: model tool adini tahmin edip cagirabilir.
+    Policy kapisi da reddetmelidir. Ve bu red, yetki/risk/onay
+    degerlendirmesinden ONCE gelmelidir - olay sirasinda "kapali" karari
+    tartisilmaz.
+    """
+    import json
+
+    from robotics_agent.config import get_settings
+    from robotics_agent.contracts import ActorContext
+    from robotics_agent.core.router import domains_for_packs
+    from robotics_agent.sap import build_backend
+    from robotics_agent.tools import (
+        ToolContext,
+        execute_tool,
+        load_all_tools,
+        visible_tool_names,
+    )
+
+    monkeypatch.setenv("AGENT_DISABLED_TOOLS", "sap_pr_submit")
+    monkeypatch.setenv("SAP_BACKEND", "mock")
+    settings = get_settings(reload=True)
+    settings.ensure_dirs()
+    load_all_tools()
+
+    actor = ActorContext.local_operator(
+        subject="ops@firma.test", tenant=settings.sap.tenant,
+        roles=("PURCHASER", "APPROVER"),
+        company_code=settings.sap.company_code, plant=settings.sap.plant,
+        purchasing_org=settings.sap.purch_org,
+    )
+
+    visible = visible_tool_names(domains_for_packs(("bootstrap", "procurement_write")), actor)
+    assert "sap_pr_submit" not in visible, "kapatilan tool modele gosterilmemeli"
+    assert "sap_pr_prepare" in visible, "digerleri etkilenmemeli"
+
+    ctx = ToolContext(settings=settings, sap=build_backend(settings), actor=actor)
+    payload, is_error = execute_tool(
+        "sap_pr_submit",
+        {"items": [{"material_id": "X", "quantity": 1}], "idempotency_key": "k:v1"},
+        ctx,
+    )
+    body = json.loads(payload)
+    assert is_error
+    assert body["denial_code"] == "TOOL_DISABLED"
+
+    get_settings(reload=True)  # sonraki testler icin ortami geri al

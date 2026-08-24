@@ -6,10 +6,10 @@ sonuc token sayisi olculur ve tool'un **kendi bildirdigi** performans
 butcesiyle karsilastirilir. Butce asilirsa sifir disi kod doner ve CI
 performans kapisi kirmizi olur.
 
-Onemli sinir: bu benchmark mock backend uzerinde calisir. Olculen sey SAP'in
-gercek gecikmesi degil, **bizim katmanimizin** (policy, DLP, cache, butce,
-serilestirme) ek maliyetidir. Gercek SLO kalibrasyonu quality tenant'ta
-`tests/integration` ile yapilir; ikisi birbirinin yerine gecmez.
+Onemli sinir: bu benchmark `.env` ne derse desin mock backend uzerinde calisir.
+Olculen cagri sayisi tool'un adaptere yaptigi mantiksal cagri sayisidir; gercek
+HTTP alt-cagrilari adapter regresyon testlerinde ayrica dogrulanir. Gercek SLO
+kalibrasyonu quality tenant'ta `tests/integration` ile yapilir.
 
 Kullanim:
     python scripts/perf_benchmark.py
@@ -50,6 +50,33 @@ SCENARIOS: tuple[tuple[str, dict[str, Any]], ...] = (
 )
 
 
+class _CountingBackend:
+    """Tool -> SAP adapter sinirindaki mantiksal cagrilari sayar."""
+
+    _NOT_OPERATIONS = frozenset({
+        "close", "set_acting_subject", "set_active_profile", "capabilities",
+    })
+
+    def __init__(self, backend: Any) -> None:
+        self._backend = backend
+        self._calls = 0
+
+    @property
+    def sap_call_count(self) -> int:
+        return self._calls
+
+    def __getattr__(self, name: str) -> Any:
+        value = getattr(self._backend, name)
+        if not callable(value) or name in self._NOT_OPERATIONS:
+            return value
+
+        def counted(*args: Any, **kwargs: Any) -> Any:
+            self._calls += 1
+            return value(*args, **kwargs)
+
+        return counted
+
+
 def _percentile(values: list[float], pct: float) -> float:
     """Kesikli p-yuzdelik. Kucuk orneklem icin statistics.quantiles guvenilmez."""
     if not values:
@@ -61,6 +88,11 @@ def _percentile(values: list[float], pct: float) -> float:
 
 def _context() -> ToolContext:
     settings = get_settings()
+    # Gelistiricinin `.env` dosyasinda canli Hub/tenant tanimli olsa bile bir
+    # performans testi dis sisteme cikamaz veya belge olusturamaz.
+    object.__setattr__(settings.sap, "backend", "mock")
+    object.__setattr__(settings.sap, "dry_run", True)
+    object.__setattr__(settings.security, "disabled_tools", ())
     settings.ensure_dirs()
     actor = ActorContext.local_operator(
         subject="perf-benchmark",
@@ -70,12 +102,15 @@ def _context() -> ToolContext:
         plant=settings.sap.plant,
         purchasing_org=settings.sap.purch_org,
     )
-    return ToolContext(settings=settings, sap=build_backend(settings), actor=actor)
+    return ToolContext(
+        settings=settings, sap=_CountingBackend(build_backend(settings)), actor=actor
+    )
 
 
 def measure(tool_name: str, arguments: dict[str, Any], *, iterations: int) -> dict[str, Any]:
     spec = REGISTRY[tool_name]
     durations: list[float] = []
+    adapter_calls: list[int] = []
     tokens = 0
 
     for _ in range(iterations):
@@ -84,16 +119,22 @@ def measure(tool_name: str, arguments: dict[str, Any], *, iterations: int) -> di
         reset_tool_cache()
         ctx = _context()
         started = time.perf_counter()
-        payload, is_error = execute_tool(tool_name, dict(arguments), ctx)
-        durations.append((time.perf_counter() - started) * 1000)
-        if is_error:
-            return {"tool": tool_name, "error": payload[:200], "ok": False}
-        tokens = estimate_tokens(payload)
+        try:
+            payload, is_error = execute_tool(tool_name, dict(arguments), ctx)
+            durations.append((time.perf_counter() - started) * 1000)
+            adapter_calls.append(ctx.sap_call_count)
+            if is_error:
+                return {"tool": tool_name, "error": payload[:200], "ok": False}
+            tokens = estimate_tokens(payload)
+        finally:
+            ctx.sap.close()
 
     budget = spec.performance_budget
     p50, p95 = _percentile(durations, 50), _percentile(durations, 95)
     within_latency = p95 <= budget.p95_ms
     within_tokens = tokens <= budget.max_result_tokens
+    max_adapter_calls = max(adapter_calls, default=0)
+    within_calls = max_adapter_calls <= budget.max_sap_calls
     return {
         "tool": tool_name,
         "iterations": iterations,
@@ -101,11 +142,14 @@ def measure(tool_name: str, arguments: dict[str, Any], *, iterations: int) -> di
         "p95_ms": round(p95, 2),
         "max_ms": round(max(durations), 2),
         "result_tokens": tokens,
+        "max_adapter_calls": max_adapter_calls,
         "budget_p95_ms": budget.p95_ms,
         "budget_tokens": budget.max_result_tokens,
+        "budget_sap_calls": budget.max_sap_calls,
         "within_latency_budget": within_latency,
         "within_token_budget": within_tokens,
-        "ok": within_latency and within_tokens,
+        "within_sap_call_budget": within_calls,
+        "ok": within_latency and within_tokens and within_calls,
     }
 
 
@@ -119,15 +163,19 @@ def main() -> int:
     rows = [measure(name, arguments, iterations=args.iterations) for name, arguments in SCENARIOS]
     reset_tool_cache()
 
-    print(f"{'tool':<32} {'p50':>8} {'p95':>8} {'butce':>8} {'token':>7} {'durum':>7}")
-    print("-" * 78)
+    print(
+        f"{'tool':<32} {'p50':>8} {'p95':>8} {'butce':>8} "
+        f"{'cagri':>7} {'c.butce':>7} {'token':>7} {'durum':>7}"
+    )
+    print("-" * 94)
     for row in rows:
         if not row.get("ok") and "error" in row:
             print(f"{row['tool']:<32} {'HATA':>41}")
             continue
         print(
             f"{row['tool']:<32} {row['p50_ms']:>8.1f} {row['p95_ms']:>8.1f} "
-            f"{row['budget_p95_ms']:>8} {row['result_tokens']:>7} "
+            f"{row['budget_p95_ms']:>8} {row['max_adapter_calls']:>7} "
+            f"{row['budget_sap_calls']:>7} {row['result_tokens']:>7} "
             f"{'OK' if row['ok'] else 'ASIM':>7}"
         )
 

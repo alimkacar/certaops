@@ -71,7 +71,7 @@ from robotics_agent.observability import TelemetryCollector
 from robotics_agent.privacy import is_secret_field, sanitize_for_client, sanitize_text
 from robotics_agent.privacy.output import REDACTED as SECRET_REDACTED
 from robotics_agent.prompts import build_runtime_prompt, prompt_version
-from robotics_agent.sap import get_backend
+from robotics_agent.sap import build_backend
 from robotics_agent.tools import (
     ToolContext,
     execute_tool,
@@ -263,7 +263,10 @@ class SAPAgentRuntime:
         self.channel = channel
         self.telemetry = telemetry or TelemetryCollector()
         self.ctx = ToolContext(
-            settings=self.settings, sap=get_backend(self.settings), actor=self.actor
+            # Adapter aktif actor/profil ve HTTP sayaclari tasir. Farkli
+            # oturumlar ayni ornegi paylasirsa paralel cagrilar kimligi ve
+            # audit baglamini birbirine karistirabilir.
+            settings=self.settings, sap=build_backend(self.settings), actor=self.actor
         )
         self._custom_prompt = system_prompt
         self.prompt_version = prompt_version() if system_prompt is None else "custom"
@@ -892,7 +895,10 @@ class SAPAgentRuntime:
         }
 
     def close(self) -> None:
-        self.provider.close()
+        try:
+            self.provider.close()
+        finally:
+            self.ctx.sap.close()
 
 
 #: Kisayol yolunda actor yetkisini kontrol etmek icin tum domainler.

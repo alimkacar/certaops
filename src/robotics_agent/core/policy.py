@@ -252,6 +252,8 @@ class PolicyDecisionPoint:
     # Bu tutarin uzerindeki R3 islemleri approval_policy="threshold" olsa bile onay ister.
     approval_threshold: float = 25_000.0
     known_tools: frozenset[str] = field(default_factory=frozenset)
+    #: Operator tarafindan kapatilmis tool adlari (bkz. AGENT_DISABLED_TOOLS).
+    disabled_tools: frozenset[str] = field(default_factory=frozenset)
     # Handler'in arguman yoksa kullanacagi organizasyon degerleri de actor
     # kapsamina karsi denetlenir.
     org_defaults: OrgDefaults = field(default_factory=OrgDefaults)
@@ -276,6 +278,18 @@ class PolicyDecisionPoint:
                 risk_tier=RiskTier.R0,
                 reasons=(f"Bilinmeyen tool: {name}",),
                 denial_code="UNKNOWN_TOOL",
+            )
+
+        if name in self.disabled_tools:
+            # Operator kapatma anahtari her seyden ONCE bakilir: yetki, risk ve
+            # onay degerlendirmesine bile girilmez. Bir olay sirasinda "bu tool
+            # simdilik kapali" karari tartisilmaz olmalidir.
+            return PolicyDecision(
+                outcome=PolicyOutcome.DENY,
+                tool=name,
+                risk_tier=spec.risk_tier,
+                reasons=(f"Tool operator tarafindan kapatildi: {name}",),
+                denial_code="TOOL_DISABLED",
             )
 
         # 1b. Runtime etki degerlendirmesi.

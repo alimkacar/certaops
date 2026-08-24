@@ -26,7 +26,7 @@ from ..contracts import (
     resolve_detail,
 )
 from ..core import plan_agents
-from ..core.agents import PACK_TO_AGENT, subsumed_packs
+from ..core.domain_profiles import PACK_TO_AGENT, subsumed_packs
 from .registry import ToolContext, tool
 
 

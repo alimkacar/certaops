@@ -1,5 +1,6 @@
 .env*
 !.env.example
+!.env.cal.example
 .venv/
 venv/
 __pycache__/
@@ -14,6 +15,7 @@ htmlcov/
 dist/
 build/
 output/
+artifacts/
 *.log
 .DS_Store
 *.sqlite

@@ -22,8 +22,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def make_settings(tmp_path: Path, **overrides) -> Settings:
-    """Izole durum/cikti dizinleriyle ayar nesnesi uretir."""
+    """Izole durum/cikti dizinleriyle ayar nesnesi uretir.
+
+    Unit/security testleri gelistiricinin ``.env`` dosyasindaki canli SAP
+    ayarini miras almamali. Gercek baglanti yalniz integration testlerinin
+    acik ve kontrollu fixture'i tarafindan kurulabilir.
+    """
     settings = Settings()
+    object.__setattr__(settings.sap, "backend", "mock")
+    object.__setattr__(settings.sap, "dry_run", True)
+    object.__setattr__(settings.security, "allowed_sap_hosts", ())
+    object.__setattr__(settings.security, "disabled_tools", ())
     object.__setattr__(settings, "output_dir", tmp_path / "out")
     object.__setattr__(settings.state, "dir", tmp_path / "state")
     settings.ensure_dirs()
@@ -37,8 +46,9 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_state():
-    """Her testten once/sonra paylasilan onbellekleri temizler."""
+def _isolate_state(monkeypatch):
+    """Test durumunu ve kullanicinin `.env` kill-switch'lerini izole eder."""
+    monkeypatch.setenv("AGENT_DISABLED_TOOLS", "")
     reset_state_db_cache()
     reset_audit_cache()
     yield

@@ -226,7 +226,11 @@ def sap_generate_report(
         except ImportError:
             return {"error": "Excel cikti icin XlsxWriter kurulmalidir."}
         path = out_dir / f"{stem}.xlsx"
-        workbook = xlsxwriter.Workbook(str(path))
+        # SAP/metin verisi "=", "+", "-" veya "@" ile baslayabilir. Excel'e
+        # aktarilan guvenilmeyen metni formul ya da URL olarak yorumlatmayiz.
+        workbook = xlsxwriter.Workbook(
+            str(path), {"strings_to_formulas": False, "strings_to_urls": False}
+        )
         heading = workbook.add_format({"bold": True, "bg_color": "#0A6ED1", "font_color": "white"})
         cell = workbook.add_format({"border": 1, "text_wrap": True, "valign": "top"})
         number = workbook.add_format({"border": 1, "num_format": "#,##0.00"})

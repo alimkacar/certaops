@@ -61,6 +61,7 @@ from ..adapters.sap import (
     resolve_connection,
     verify_contract,
 )
+from ..core.tenant_profile import DEFAULT_DOCUMENT_TYPE
 from .base import SAPBackend, effective_unit_price
 from .models import (
     AtpResult,
@@ -200,6 +201,8 @@ class ECCSAPBackend(SAPBackend):
 
     def __init__(self, settings) -> None:
         self.settings = settings
+        #: Aktif tenant profili (belge tipi, zorunlu alanlar, Z-alan eslemesi).
+        self._profile: Any = None
         cfg = settings.sap
         problems = cfg.validate()
         if problems:
@@ -217,6 +220,7 @@ class ECCSAPBackend(SAPBackend):
             client=http_client,
             odata_version="v2",
             sap_client=cfg.client,
+            accept_language=cfg.description_language,
             allowed_hosts=settings.security.allowed_sap_hosts,
             token_provider=self.connection.token_provider,
             breaker=self.breaker,
@@ -332,6 +336,14 @@ class ECCSAPBackend(SAPBackend):
             "okuma (yalniz belgelenmis istisna). ECC 6.0 EHP8'de released public OData "
             "API ve OData V4 YOKTUR."
         )
+
+    def set_active_profile(self, profile: Any) -> None:
+        self._profile = profile
+
+    @property
+    def document_type(self) -> str:
+        """Belge tipi sirkete gore degisir; profil yoksa SAP standardi."""
+        return getattr(self._profile, "document_type", None) or DEFAULT_DOCUMENT_TYPE
 
     def capabilities(self) -> dict[str, Any]:
         payload = super().capabilities()
@@ -1137,7 +1149,7 @@ class ECCSAPBackend(SAPBackend):
 
         total = round(total, 2)
         payload = {
-            "DocumentType": "NB",
+            "DocumentType": self.document_type,
             "HeaderText": header_text[:40],
             "items": odata_items,
         }
@@ -1183,7 +1195,7 @@ class ECCSAPBackend(SAPBackend):
 
         token = reference_token(external_reference)
         body = {
-            "DocumentType": draft.payload.get("DocumentType", "NB"),
+            "DocumentType": draft.payload.get("DocumentType", self.document_type),
             "HeaderText": draft.header_text[:40],
             "IdempotencyKey": token,
             "ToItems": draft.payload.get("items", []),

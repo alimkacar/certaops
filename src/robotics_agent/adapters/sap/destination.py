@@ -60,10 +60,30 @@ class ResolvedConnection:
     proxy_auth_provider: Callable[[], str] | None = None
     #: Coklu Cloud Connector kurulumunda hedef location.
     location_id: str = ""
+    #: Destination'in kimlik dogrulama tipi. Principal propagation'i bundan
+    #: anlariz: SAP yetkileri son kullaniciya mi yoksa teknik kullaniciya mi
+    #: gore uygulaniyor?
+    auth_type: str = ""
+
+    #: SAP yetkilerini SON KULLANICIYA gore uygulayan kimlik akislari.
+    PRINCIPAL_AUTH_TYPES = frozenset(
+        {"PrincipalPropagation", "SAMLAssertion", "OAuth2SAMLBearerAssertion"}
+    )
 
     @property
     def is_on_premise(self) -> bool:
         return self.proxy_type.lower() == "onpremise"
+
+    @property
+    def principal_propagation(self) -> bool:
+        """SAP calisan kisiyi goruyor mu?
+
+        False ise SAP'in KENDI denetim kaydinda yalnizca teknik kullanici
+        gorunur; "bu belgeyi kim actirdi" sorusunun cevabi SAP tarafinda
+        yoktur, yalnizca bizim audit zincirimizdedir. Yazma yollarinda bu
+        onemli bir sinirlamadir ve gizlenmemelidir.
+        """
+        return self.auth_type in self.PRINCIPAL_AUTH_TYPES
 
     def describe(self) -> dict[str, Any]:
         """Secret icermeyen ozet (health/capability tool'lari icin)."""
@@ -75,6 +95,10 @@ class ResolvedConnection:
             "verify_ssl": self.verify_ssl,
             "via_connectivity_proxy": bool(self.proxy_url),
             "location_id": self.location_id,
+            "auth_type": self.auth_type,
+            # SAP tarafinda islemin insana atfedilip atfedilemedigi.
+            "principal_propagation": self.principal_propagation,
+            "sap_attribution": "principal" if self.principal_propagation else "technical_user",
             "warnings": list(self.warnings),
         }
 
@@ -255,6 +279,7 @@ class DestinationResolver:
             base_url=snapshot.base_url,
             headers=headers,
             proxy_type=snapshot.proxy_type,
+            auth_type=snapshot.auth_type,
             origin=f"destination:{name}",
             warnings=snapshot.warnings,
         )
@@ -356,6 +381,7 @@ def resolve_connection(cfg: SAPSettings) -> ResolvedConnection:
             token_provider=provider if snapshot.token else None,
             verify_ssl=cfg.verify_ssl,
             proxy_type=snapshot.proxy_type,
+            auth_type=snapshot.auth_type,
             origin=f"destination:{cfg.destination_name}",
             warnings=tuple(warnings),
             proxy_url=proxy_url,
@@ -414,7 +440,7 @@ def build_http_client(connection: ResolvedConnection, cfg: SAPSettings) -> httpx
     `Proxy-Authorization` ve `SAP-Connectivity-SCC-Location-ID` proxy'nin
     kendisine aittir; hedef SAP sistemine gonderilmez.
     """
-    headers = {"Accept": "application/json", "Accept-Language": "TR"}
+    headers = {"Accept": "application/json", "Accept-Language": cfg.description_language}
     headers.update(connection.headers)
 
     kwargs: dict[str, Any] = {

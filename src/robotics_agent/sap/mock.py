@@ -15,7 +15,9 @@ import itertools
 import logging
 import re
 from datetime import date, datetime, timedelta, timezone
+from typing import Any
 
+from ..core.tenant_profile import DEFAULT_DOCUMENT_TYPE
 from . import mock_data
 from .base import SAPBackend, SAPError, effective_unit_price
 from .models import (
@@ -76,6 +78,9 @@ class MockSAPBackend(SAPBackend):
 
     def __init__(self, settings) -> None:
         self.settings = settings
+        #: Aktif tenant profili. Simulator de profili onemser: aksi halde
+        #: profil davranisi yalniz gercek sistemde sinanabilirdi.
+        self._profile: Any = None
         self._materials = {m["material_id"]: m for m in mock_data.MATERIALS}
         self._stock = {s["material_id"]: s for s in mock_data.STOCK}
         self._vendors = {v["vendor_id"]: v for v in mock_data.VENDORS}
@@ -631,7 +636,7 @@ class MockSAPBackend(SAPBackend):
 
         total = round(total, 2)
         payload = {
-            "PurchaseRequisitionType": "NB",
+            "PurchaseRequisitionType": self.document_type,
             "PurchaseRequisitionHeaderText": header_text[:40],
             "PurchasingGroup": purchase_group or cfg.purch_group,
             "PurchasingOrganization": cfg.purch_org,
@@ -1138,6 +1143,14 @@ class MockSAPBackend(SAPBackend):
                 continue
             out.append(ProjectCost(currency=self.settings.sap.currency, **raw))
         return out
+
+    def set_active_profile(self, profile: Any) -> None:
+        self._profile = profile
+
+    @property
+    def document_type(self) -> str:
+        """Belge tipi profilden gelir; yoksa SAP standardi."""
+        return getattr(self._profile, "document_type", None) or DEFAULT_DOCUMENT_TYPE
 
     def ping(self) -> dict[str, str]:
         return {

@@ -167,7 +167,7 @@ def run_prompt_injection(report: EvalReport, settings) -> None:
       1. Metin modele giderken temizleniyor mu (DLP `sink="model"`)?
       2. Model talimati UYGULARSA deterministik katman tutuyor mu?
     """
-    from robotics_agent.agent import SAPAgentRuntime
+    from robotics_agent.compat_agent import SAPAgentRuntime
 
     actor = viewer_actor()
     for case in INJECTION_CASES:
@@ -218,7 +218,7 @@ def run_sensitive_leakage(report: EvalReport) -> None:
 
 def run_unauthorized(report: EvalReport, settings) -> None:
     """Yetkisiz istek reddediliyor ve SAP'a yazma yapilmiyor mu?"""
-    from robotics_agent.agent import SAPAgentRuntime
+    from robotics_agent.compat_agent import SAPAgentRuntime
 
     load_all_tools()
 

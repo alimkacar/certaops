@@ -11,6 +11,7 @@ davranisi degistiremez.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import threading
@@ -90,6 +91,8 @@ class ToolContext:
     approvals: ApprovalStore | None = None
     approval_gateway: ApprovalGateway | None = None
     idempotency: IdempotencyStore | None = None
+    #: Tenant profili deposu (sirkete ozgu SAP gercekleri).
+    profiles: Any = None
     evidence: BaseEvidenceStore | None = None
     metrics: TurnMetrics | None = None
     # Policy karari, calisan tool'a yukumlulukleri gormesi icin verilir.
@@ -156,11 +159,29 @@ class ToolContext:
                 approval_threshold=self.settings.sap.approval_threshold,
                 org_defaults=OrgDefaults.from_settings(self.settings),
                 risk_mode=self.settings.risk.scoring_mode,
+                disabled_tools=frozenset(self.settings.security.disabled_tools),
             )
         if self.dlp is None:
             self.dlp = build_dlp_engine(self.settings)
         if self.cache is None:
             self.cache = get_tool_cache(self.settings)
+        if self.profiles is None:
+            from ..core.profile_store import TenantProfileStore
+
+            self.profiles = TenantProfileStore(get_state_db(self.settings.state.db_path))
+
+    def tenant_profile(self):
+        """Bu actor'un tenant'i icin cozulmus SAP profili.
+
+        Her zaman bir profil doner; tanimli degilse SAP standardi varsayilanlar.
+        Cagri yerlerinin "profil var mi" diye dallanmasi gerekmez.
+        """
+        from ..core.tenant_profile import SapTenantProfile
+
+        tenant = self.actor.tenant if self.actor else self.settings.sap.tenant
+        if self.profiles is None:
+            return SapTenantProfile.default(tenant)
+        return self.profiles.load(tenant)
 
     # --- Kolaylik yardimcilari ---------------------------------------------
     def write_guard(self) -> WriteGuard:
@@ -515,9 +536,10 @@ def visible_tool_names(domains: frozenset[str], actor: ActorContext) -> list[str
     Kullanicinin yetkisi olmayan mutating tool modele hic gosterilmez. Bu hem
     token maliyetini hem saldiri yuzeyini azaltir.
     """
+    disabled = frozenset(get_settings().security.disabled_tools)
     out: list[str] = []
     for spec in REGISTRY.values():
-        if spec.domain not in domains:
+        if spec.domain not in domains or spec.name in disabled:
             continue
         if spec.required_scopes and actor.missing_scopes(spec.required_scopes):
             continue
@@ -649,6 +671,16 @@ def _run_with_timeout(
     return box.get("result")
 
 
+def _sap_attribution(ctx: ToolContext) -> str:
+    """SAP kendi denetim kaydinda islemi insana atfedebiliyor mu?
+
+    `principal`        -> SAP yetkileri son kullaniciya gore uygulaniyor
+    `technical_user`   -> SAP yalniz servis hesabini goruyor
+    """
+    connection = getattr(ctx.sap, "connection", None)
+    return "principal" if getattr(connection, "principal_propagation", False) else "technical_user"
+
+
 def execute_tool(
     name: str, arguments: dict[str, Any], ctx: ToolContext
 ) -> tuple[str, bool]:
@@ -714,6 +746,17 @@ def execute_tool(
     # --- 3. Handler (sozlesmedeki timeout siniri altinda) ------------------
     # Handler oncesi/sonrasi fark = bu tool'un yaptigi gercek SAP cagrisi.
     _sap_calls_before = getattr(ctx.sap, "sap_call_count", 0)
+    # Cagriyi tetikleyen insani SAP'a bildir (izlenebilirlik; yetkilendirme
+    # degil). Handler bittiginde temizlenir ki bir sonraki tur baskasinin
+    # kimligiyle cagri yapmasin.
+    if ctx.actor is not None:
+        with contextlib.suppress(Exception):
+            ctx.sap.set_acting_subject(ctx.actor.subject)
+        # Tenant profili: belge tipi, zorunlu alanlar, Z-alan eslemesi. Bunlar
+        # `$metadata`dan okunamaz; sirket bildirir, biz uygularız. Profil yoksa
+        # SAP standardi davranis surer.
+        with contextlib.suppress(Exception):
+            ctx.sap.set_active_profile(ctx.tenant_profile())
     try:
         result = _run_with_timeout(spec, arguments, ctx)
     except ToolExecutorSaturated as exc:
@@ -813,9 +856,32 @@ def execute_tool(
         ctx.decision = None
         # Her cikis yolunda guncellenir: basari, timeout ve hata dallarinda da
         # yapilan SAP cagrilari butceye ve telemetriye yazilmalidir.
-        ctx.sap_call_count += (
-            getattr(ctx.sap, "sap_call_count", 0) - _sap_calls_before
-        )
+        _sap_calls = getattr(ctx.sap, "sap_call_count", 0) - _sap_calls_before
+        ctx.sap_call_count += _sap_calls
+        with contextlib.suppress(Exception):
+            ctx.sap.set_acting_subject("")
+        with contextlib.suppress(Exception):
+            ctx.sap.set_active_profile(None)
+        # Yazma yapildi ve SAP calisan kisiyi GORMUYOR ise, bunu denetim
+        # defterine acikca yaz. Aksi halde "SAP'ta da izi var" varsayimi
+        # sessizce yanlis kalir: SAP'in kendi kaydinda yalnizca teknik
+        # kullanici gorunur.
+        if spec is not None and spec.risk_tier.is_mutating and _sap_calls > 0:
+            _attribution = _sap_attribution(ctx)
+            ctx.audit.append(
+                "sap.attribution",
+                execution=ctx.execution,
+                tool=name,
+                risk_tier=spec.risk_tier.value,
+                outcome="ok" if _attribution == "principal" else "needs_review",
+                detail={"sap_attribution": _attribution, "sap_calls": _sap_calls},
+            )
+            if _attribution != "principal":
+                log.warning(
+                    "SAP tarafinda atfedilemez yazma | %s | SAP yalniz teknik "
+                    "kullaniciyi goruyor; principal propagation kapali",
+                    name,
+                )
 
     # --- 4. Alan politikasi ve DLP (modele verilmeden ONCE) -----------------
     serialized = strip_empty(_serialize(result))

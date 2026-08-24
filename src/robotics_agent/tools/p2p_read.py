@@ -262,7 +262,7 @@ def _flow_interpretation(by_type: dict[str, list[Any]]) -> str:
     data_policy=_P2P_DATA_POLICY,
     impact_profile=READ_ONLY,
     cache_policy=_P2P_CACHE,
-    performance_budget=PerformanceBudget(p95_ms=4000, max_sap_calls=4, max_records=200),
+    performance_budget=PerformanceBudget(p95_ms=6000, max_sap_calls=6, max_records=200),
     description=(
         "Tek bir satinalma siparisinin tam durumu: kalemler, teslimat plani satirlari, "
         "teyit edilen tarihler ve gecikme gunu, yapilan mal kabuller, faturalanan miktar ve "
@@ -282,23 +282,51 @@ def sap_purchase_order_360(
     ctx: ToolContext, po_id: str, detail: str = "standard"
 ) -> ToolResult | dict[str, Any]:
     level = resolve_detail(detail)
+    # Yetenekler bagimsizdir; dort okumanin tamami ayni hata korumasindan
+    # gecmelidir.
     try:
         items = ctx.sap.get_purchase_order_items(po_id)
+        if not items:
+            return {
+                "po_id": po_id,
+                "error": f"Satinalma siparisi {po_id} bulunamadi veya kalem icermiyor.",
+                "sap_code": "EKPO_NOT_FOUND",
+            }
+        schedule = ctx.sap.get_schedule_lines(po_id)
+        receipts = ctx.sap.get_goods_receipts(po_id=po_id)
+        invoices = ctx.sap.get_supplier_invoices(po_id=po_id)
     except SAPNotSupported as exc:
         return {"error": str(exc), "remediation": exc.hint, "denial_code": "CAPABILITY_NOT_SUPPORTED"}
     except SAPError as exc:
         return {"error": str(exc), "sap_code": exc.code}
 
-    if not items:
-        return {
-            "po_id": po_id,
-            "error": f"Satinalma siparisi {po_id} bulunamadi veya kalem icermiyor.",
-            "sap_code": "EKPO_NOT_FOUND",
-        }
-
-    schedule = ctx.sap.get_schedule_lines(po_id)
-    receipts = ctx.sap.get_goods_receipts(po_id=po_id)
-    invoices = ctx.sap.get_supplier_invoices(po_id=po_id)
+    # Released PO API kismi teslim/fatura miktarini kalemde yayinlamaz. Bunlar
+    # ayni kosuda okunan MSEG/RSEG referanslarindan netlestirilir; "complete"
+    # bayragindan miktar tahmin edilmez.
+    delivered_by_item: dict[str, float] = {}
+    for receipt in receipts:
+        if not receipt.po_item:
+            continue
+        sign = -1.0 if receipt.is_reversal or receipt.reversed else 1.0
+        delivered_by_item[receipt.po_item] = round(
+            delivered_by_item.get(receipt.po_item, 0.0) + sign * receipt.quantity,
+            3,
+        )
+    invoiced_by_item: dict[str, float] = {}
+    for invoice in invoices:
+        for key, quantity in invoice.po_item_quantities.items():
+            item_po, _, item_no = key.partition("/")
+            if item_po != po_id or not item_no:
+                continue
+            invoiced_by_item[item_no] = round(
+                invoiced_by_item.get(item_no, 0.0) + quantity,
+                3,
+            )
+    for item in items:
+        if item.item_no in delivered_by_item:
+            item.delivered_qty = max(0.0, delivered_by_item[item.item_no])
+        if item.item_no in invoiced_by_item:
+            item.invoiced_qty = max(0.0, invoiced_by_item[item.item_no])
 
     # --- Deterministik hesaplar: LLM toplam hesaplamaz ----------------------
     total_value = round(sum(i.net_value for i in items), 2)

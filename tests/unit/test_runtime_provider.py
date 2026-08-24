@@ -307,7 +307,7 @@ def test_turn_geriye_donuk_alanlari_korur(env):
 
 
 def test_multi_agent_facade_calisir_ve_uyarir(env):
-    from robotics_agent.agent import SAPMultiAgent
+    from robotics_agent.compat_agent import SAPMultiAgent
 
     with pytest.warns(DeprecationWarning):
         agent = SAPMultiAgent(env, provider=FakeModelProvider([reply("ok")]))

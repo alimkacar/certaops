@@ -1,6 +1,6 @@
 """Tek runtime icin SAP domain profili ve geriye uyumluluk metadata'si.
 
-Gercek yurutme :mod:`robotics_agent.agent` icindeki tek runtime'da ve router'in
+Gercek yurutme :mod:`robotics_agent.compat_agent` icindeki tek runtime'da ve router'in
 sectigi exact tool-pack birlesimiyle yapilir. ``AgentSpec``, ``plan_agents`` ve
 ``HandoffEnvelope`` eski istemcilerin veri sozlesmesini kirmamak icin korunur;
 ayri model istemcisi, history veya runtime handoff'u olusturmazlar.

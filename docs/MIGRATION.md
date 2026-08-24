@@ -49,7 +49,7 @@ iki domainli bir istekte `provider.call_count == 1` oldugunu dogrular.
 
 ```python
 # Eski
-from robotics_agent.agent import SAPMultiAgent
+from robotics_agent.compat_agent import SAPMultiAgent
 agent = SAPMultiAgent(settings, actor=actor)
 
 # Yeni

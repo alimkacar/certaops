@@ -197,6 +197,14 @@ class SecuritySettings:
     oidc_audience: str = field(default_factory=lambda: _env("AGENT_OIDC_AUDIENCE"))
     oidc_jwks_url: str = field(default_factory=lambda: _env("AGENT_OIDC_JWKS_URL"))
     oidc_roles_claim: str = field(default_factory=lambda: _env("AGENT_OIDC_ROLES_CLAIM", "groups"))
+    # Operatorun yeniden dagitim yapmadan kapatabilecegi tool'lar. Olay aninda
+    # tek bir yolu kesmek gerekir; `SAP_DRY_RUN` hepsini birden kapatir, bu ise
+    # cerrahi mudahaledir. Kapatilan tool modele HIC gosterilmez ve cagrilirsa
+    # policy kapisinda reddedilir - iki katman, cunku model listeyi gormese de
+    # adi tahmin edebilir.
+    disabled_tools: tuple[str, ...] = field(
+        default_factory=lambda: _env_tuple("AGENT_DISABLED_TOOLS", "")
+    )
 
     rate_limit_per_minute: int = field(default_factory=lambda: _env_int("AGENT_RATE_LIMIT", 30))
     max_request_bytes: int = field(default_factory=lambda: _env_int("AGENT_MAX_REQUEST_BYTES", 65_536))
@@ -839,7 +847,10 @@ def get_settings(reload: bool = False) -> Settings:
     global _settings
     if _settings is None or reload:
         if reload:
-            load_dotenv(override=True)
+            # Calisan surecin acik ortam degiskenleri `.env` dosyasindan daha
+            # yuksek onceliklidir. Aksi halde container/CI secret'lari ve acil
+            # guvenlik kapilari reload sirasinda sessizce geri alinabilir.
+            load_dotenv(override=False)
         _settings = Settings()
         _settings.ensure_dirs()
     return _settings

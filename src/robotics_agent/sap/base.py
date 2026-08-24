@@ -14,7 +14,7 @@ Portlar:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import date
 from typing import Any
 
@@ -94,15 +94,6 @@ class ProductPort(ABC):
 
     name: str = "abstract"
 
-    @property
-    def sap_call_count(self) -> int:
-        """Bu backend uzerinden SAP'a giden gercek istek sayisi.
-
-        Varsayilan 0'dir: simulator gibi HTTP yapmayan backend'ler icin dogru
-        cevap budur. HTTP yapan backend bunu ezer.
-        """
-        return 0
-
     @abstractmethod
     def search_materials(
         self,
@@ -121,6 +112,28 @@ class ProductPort(ABC):
 
     @abstractmethod
     def get_material(self, material_id: str, *, plant: str | None = None) -> Material | None: ...
+
+    def get_materials(
+        self, material_ids: Sequence[str], *, plant: str | None = None
+    ) -> dict[str, Material]:
+        """Birden cok malzemenin ana verisi. Bulunamayan id sonuca GIRMEZ.
+
+        Varsayilan uygulama tek tek okur; N kalem = N round-trip. Toplu okumayi
+        destekleyen adapter bunu ezer (bkz. `ODataSAPBackend.get_materials`).
+        Cagiran taraf her zaman bu metodu kullanmalidir: boylece verimli adapter
+        otomatik devreye girer, verimsiz olan da dogru sonucu verir.
+
+        Sonucta bir id'nin BULUNMAMASI anlamlidir: o malzeme sistemde yoktur.
+        "Var ama stogu sifir" ile "hic yok" ayrimi buradan yapilir.
+        """
+        out: dict[str, Material] = {}
+        for material_id in dict.fromkeys(material_ids):
+            if not material_id:
+                continue
+            material = self.get_material(material_id, plant=plant)
+            if material is not None:
+                out[material_id] = material
+        return out
 
     def get_material_classification(
         self, material_id: str, *, class_type: str = "001"
@@ -193,8 +206,44 @@ class ProcurementPort(ABC):
     def get_info_records(self, material_id: str, *, plant: str | None = None) -> list[InfoRecord]:
         """Malzeme icin gecerli tedarikci fiyat/teslim kosullari."""
 
+    def get_info_records_bulk(
+        self, material_ids: Sequence[str], *, plant: str | None = None
+    ) -> dict[str, list[InfoRecord]]:
+        """Birden cok malzemenin bilgi kayitlari.
+
+        Varsayilan uygulama tek tek okur; toplu okumayi destekleyen adapter
+        ezer (bkz. `ODataSAPBackend.get_info_records_bulk`).
+        """
+        return {
+            material_id: self.get_info_records(material_id, plant=plant)
+            for material_id in dict.fromkeys(material_ids)
+            if material_id
+        }
+
     @abstractmethod
     def get_vendor(self, vendor_id: str) -> Vendor | None: ...
+
+    def get_vendors(self, vendor_ids: Sequence[str]) -> dict[str, Vendor]:
+        """Birden cok tedarikciyi getirir.
+
+        Eski/ECC adapterleri icin guvenli varsayilan tekil okumadir. OData
+        adapteri bunu toplu sorgularla ezerek vendor karsilastirmasindaki N+1
+        cagrilarini kaldirir.
+        """
+        out: dict[str, Vendor] = {}
+        for vendor_id in dict.fromkeys(vendor_ids):
+            if vendor_id and (vendor := self.get_vendor(vendor_id)) is not None:
+                out[vendor_id] = vendor
+        return out
+
+    def get_vendor_master(self, vendor_id: str) -> Vendor | None:
+        """Yalniz tedarikci ana verisi; skor zenginlestirmesi yapmaz.
+
+        Skoru ayrica okuyacak tool'lar ayni pahali analitik sorguyu iki kez
+        calistirmemek icin bu yolu kullanir. Eski adapterler icin guvenli
+        varsayilan mevcut ``get_vendor`` davranisidir.
+        """
+        return self.get_vendor(vendor_id)
 
     def get_supplier_score(
         self, vendor_id: str, *, purchasing_org: str | None = None
@@ -368,6 +417,35 @@ class SAPBackend(
     """S/4HANA is nesnelerine erisim arayuzu (tum portlarin birlesimi)."""
 
     name: str = "abstract"
+
+    # --- Baglanti duzeyi ust veri -------------------------------------------
+    # Bu ikisi is nesnesi degil BAGLANTI ozelligidir; bu yuzden port'larda
+    # degil, portlari birlestiren backend arayuzunde tanimlidir.
+
+    def set_active_profile(self, profile: Any) -> None:
+        """Bu tur icin gecerli tenant profilini bildirir.
+
+        Profil, `$metadata`dan okunamayan sirket gerceklerini tasir (belge
+        tipi, zorunlu alanlar, Z-alan eslemesi). Varsayilan no-op: profil
+        desteklemeyen backend SAP standardi davranisini surdurur.
+        """
+        return None
+
+    def set_acting_subject(self, subject: str) -> None:
+        """Cagriyi tetikleyen insanin kimligini bildirir.
+
+        Varsayilan no-op: HTTP yapmayan backend'lerde (simulator) iletilecek
+        bir yer yoktur. HTTP yapan backend bunu ezer.
+        """
+        return None
+
+    @property
+    def sap_call_count(self) -> int:
+        """Bu backend uzerinden SAP'a giden gercek istek sayisi.
+
+        Varsayilan 0'dir: HTTP yapmayan backend icin dogru cevap budur.
+        """
+        return 0
 
     def capabilities(self) -> dict[str, Any]:
         """Bu backend'in gercekten destekledigi yetenekler.

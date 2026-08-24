@@ -171,6 +171,34 @@ def test_arama_tirnagi_kacisla_gonderir(settings_factory, tmp_path):
     assert "O''Brien" in fake.filter_of("A_ProductDescription")
 
 
+def test_guncel_product_api_mrp_area_alanlarini_esler(settings_factory, tmp_path):
+    backend, fake = build(
+        settings_factory,
+        tmp_path,
+        {"A_Product": [{
+            "Product": "R-1000",
+            "ProductType": "HALB",
+            "to_Plant": {"results": [{
+                "Plant": "1100",
+                "ProcurementType": "F",
+                "MRPResponsible": "007",
+                "to_PlantMRPArea": {"results": [{
+                    "MRPArea": "1100",
+                    "PlannedDeliveryDurationInDays": "18",
+                }]},
+            }]},
+        }]},
+    )
+
+    material = backend.get_material("R-1000")
+
+    assert material is not None
+    assert material.mrp_controller == "007"
+    assert material.planned_delivery_days == 18
+    request = fake.calls_to("A_Product")[0]
+    assert "to_Plant/to_PlantMRPArea" in request.url.params.get("$expand", "")
+
+
 # ---------------------------------------------------------------------------
 # Stok - acik siparisten teslim edilen dusulur
 # ---------------------------------------------------------------------------
@@ -186,7 +214,7 @@ def test_acik_siparis_teslim_edileni_duser(settings_factory, tmp_path):
             ],
             "PurchaseOrderItem": [
                 {"PurchaseOrder": "4500001", "OrderQuantity": "20",
-                 "_PurchaseOrderScheduleLine": [{"ScheduleLineDeliveredQuantity": "8"}]},
+                 "_PurchaseOrderScheduleLineTP": [{"OpenPurchaseOrderQuantity": "12"}]},
             ],
             "SupplyDemandItems": [],
         },
@@ -227,6 +255,34 @@ def test_atp_bos_yanitta_acik_hata(settings_factory, tmp_path):
     assert "sap_discover_capabilities" in str(exc.value)
 
 
+def test_guncel_mrp_tarihi_eslenir(settings_factory, tmp_path):
+    backend, _ = build(
+        settings_factory,
+        tmp_path,
+        {"SupplyDemandItems": [{
+            "Material": "R-1000",
+            "MRPElement": "AR",
+            "MRPElementOpenQuantity": "4",
+            "MRPElementAvailyOrRqmtDate": "2026-09-10",
+        }]},
+    )
+
+    items = backend.get_supply_demand("R-1000")
+
+    assert items and items[0].availability_date == date(2026, 9, 10)
+
+
+def test_mrp_malzeme_yok_kodu_bos_sonuc_doner(settings_factory, tmp_path, monkeypatch):
+    backend, _ = build(settings_factory, tmp_path)
+
+    def no_material(*_args, **_kwargs):
+        raise SAPError("No material found for the specified selection criteria", code="PP_MRP_RSC/010")
+
+    monkeypatch.setattr(backend.v2, "read", no_material)
+
+    assert backend.get_supply_demand("R-1000") == []
+
+
 # ---------------------------------------------------------------------------
 # Invariant C - PO okumasinda N+1 yok, agirlikli termin
 # ---------------------------------------------------------------------------
@@ -240,12 +296,13 @@ def test_po_expand_ile_tek_cagri_ve_agirlikli_termin(settings_factory, tmp_path)
             "PurchaseOrderItemText": "Robot kolu",
             "_PurchaseOrder": [{"Supplier": "V-100", "SupplierName": "Acme",
                                 "CreationDate": "2026-08-01"}],
-            "_PurchaseOrderScheduleLine": [
+            "_PurchaseOrderScheduleLineTP": [
                 {"ScheduleLineDeliveryDate": erken.isoformat(),
-                 "ScheduleLineOrderQuantity": "9", "ScheduleLineDeliveredQuantity": "4"},
+                 "ScheduleLineOrderQuantity": "9", "OpenPurchaseOrderQuantity": "5"},
                 {"ScheduleLineDeliveryDate": gec.isoformat(),
-                 "ScheduleLineOrderQuantity": "1", "ScheduleLineDeliveredQuantity": "0"},
+                 "ScheduleLineOrderQuantity": "1", "OpenPurchaseOrderQuantity": "1"},
             ],
+            "_PurOrdAccountAssignment": [{"WBSElementExternalID": "P-100.1"}],
         }]},
     )
     orders = backend.get_purchase_orders(material_id="R-1000")
@@ -255,6 +312,7 @@ def test_po_expand_ile_tek_cagri_ve_agirlikli_termin(settings_factory, tmp_path)
     assert po.vendor_name == "Acme"
     assert po.status == "partially_delivered"
     assert po.delivered_qty == 4.0
+    assert po.wbs_element == "P-100.1"
     # 9 birim erken, 1 birim gec -> agirlikli tarih erkene yakin olmali
     assert erken <= po.requested_delivery_date <= erken + timedelta(days=15)
 
@@ -271,6 +329,104 @@ def test_skor_okunamazsa_estimated_isaretlenir(settings_factory, tmp_path):
     assert score.overall_score is None, "okunamayan skor 0.0 degil None olmali"
     assert "overall_score" in score.estimated_fields
     assert score.has_real_data is False
+
+
+def test_guncel_supplier_score_sutunlarini_ortalar(settings_factory, tmp_path):
+    backend, fake = build(
+        settings_factory,
+        tmp_path,
+        {"Results": [
+            {
+                "Supplier": "V-100", "PurchasingOrganization": "1000",
+                "SupplierOperationalScore": "80", "PriceVarianceScore": "70",
+                "TimeVarianceScore": "90", "QuantityVarianceScore": "60",
+                "InspectionLotQualityScore": "100", "QualityNotificationScore": "80",
+            },
+            {
+                "Supplier": "V-100", "PurchasingOrganization": "1000",
+                "SupplierOperationalScore": "100", "PriceVarianceScore": "90",
+                "TimeVarianceScore": "70", "QuantityVarianceScore": "80",
+                "InspectionLotQualityScore": "80", "QualityNotificationScore": "60",
+            },
+        ]},
+    )
+
+    score = backend.get_supplier_score("V-100")
+
+    assert score is not None
+    assert score.overall_score == 90
+    assert score.delivery_score == 80
+    assert score.quality_score == 80
+    calls = fake.calls_to("Results")
+    assert calls and "P_DateFunction='YEARTODATE'" in calls[0].url.path
+
+
+def test_guncel_tedarikci_kok_ve_adres_alanlari_eslenir(settings_factory, tmp_path):
+    backend, fake = build(
+        settings_factory,
+        tmp_path,
+        {
+            "A_Supplier": [{
+                "Supplier": "V-100", "SupplierName": "Acme", "PurchasingIsBlocked": True,
+            }],
+            "A_BusinessPartnerAddress": [{
+                "BusinessPartner": "V-100", "Country": "DE", "CityName": "Berlin",
+            }],
+            "Results": [],
+        },
+    )
+
+    vendor = backend.get_vendor("V-100")
+
+    assert vendor is not None
+    assert vendor.country == "DE" and vendor.city == "Berlin" and vendor.blocked is True
+    assert "Country" not in fake.calls_to("A_Supplier")[0].url.params.get("$select", "")
+
+
+def test_tedarikciler_ana_veri_adres_ve_skoru_toplu_okur(settings_factory, tmp_path):
+    backend, fake = build(
+        settings_factory,
+        tmp_path,
+        {
+            "A_Supplier": [
+                {"Supplier": "V-100", "SupplierName": "Acme"},
+                {"Supplier": "V-200", "SupplierName": "Beta"},
+            ],
+            "A_BusinessPartnerAddress": [
+                {"BusinessPartner": "V-100", "Country": "DE", "CityName": "Berlin"},
+                {"BusinessPartner": "V-200", "Country": "TR", "CityName": "Istanbul"},
+            ],
+            "Results": [
+                {"Supplier": "V-100", "PurchasingOrganization": "1000",
+                 "SupplierOperationalScore": "90", "TimeVarianceScore": "80"},
+                {"Supplier": "V-200", "PurchasingOrganization": "1000",
+                 "SupplierOperationalScore": "70", "TimeVarianceScore": "60"},
+            ],
+        },
+    )
+
+    vendors = backend.get_vendors(["V-100", "V-200"])
+
+    assert set(vendors) == {"V-100", "V-200"}
+    assert vendors["V-100"].country == "DE"
+    assert vendors["V-200"].on_time_delivery_pct == 60
+    supplier_calls = [
+        request for request in fake.requests
+        if request.url.path.rstrip("/").rsplit("/", 1)[-1] == "A_Supplier"
+    ]
+    assert len(supplier_calls) == 1
+    assert len(fake.calls_to("A_BusinessPartnerAddress")) == 1
+    assert len(fake.calls_to("Results")) == 1
+
+
+def test_v4_po_wbs_hesap_atamasindan_filtrelenir(settings_factory, tmp_path):
+    backend, fake = build(settings_factory, tmp_path, {"PurchaseOrderItem": []})
+
+    backend.get_purchase_orders(wbs_element="P-100.1")
+
+    request = fake.calls_to("PurchaseOrderItem")[0]
+    assert "_PurOrdAccountAssignment/any" in request.url.params.get("$filter", "")
+    assert "_PurOrdAccountAssignment" in request.url.params.get("$expand", "")
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +449,7 @@ def _pr_routes() -> dict:
                 "MaterialPlannedDeliveryDurn": "30"}]},
         }],
         "A_Supplier": [{"Supplier": "V-100", "SupplierName": "Acme"}],
-        "A_MaterialValuation": [],
+        "A_ProductValuation": [],
     }
 
 
@@ -397,3 +553,276 @@ def test_izinsiz_host_engellenir(settings_factory, tmp_path):
     backend._core_v2.allowed_hosts = ("baska.host",)
     with pytest.raises(HostNotAllowed):
         backend.search_materials("robot")
+
+
+# ---------------------------------------------------------------------------
+# Released P2P API'leri - PO / malzeme belgesi / tedarikci faturasi
+# ---------------------------------------------------------------------------
+def test_p2p_released_servisleri_referanslardan_eslenir(settings_factory, tmp_path):
+    backend, fake = build(
+        settings_factory,
+        tmp_path,
+        {
+            "A_PurchaseOrderItem": [{
+                "PurchaseOrder": "4500001",
+                "PurchaseOrderItem": "00010",
+                "PurchaseOrderItemText": "Robot kolu",
+                "Material": "R-1000",
+                "Plant": "1100",
+                "OrderQuantity": "10",
+                "PurchaseOrderQuantityUnit": "ST",
+                "DocumentCurrency": "EUR",
+                "NetPriceAmount": "2500",
+                "NetPriceQuantity": "1",
+                "GoodsReceiptIsExpected": True,
+                "InvoiceIsExpected": True,
+                "PurchaseRequisition": "100001",
+                "PurchaseRequisitionItem": "00010",
+                "to_AccountAssignment": {"results": [{
+                    "WBSElementExternalID": "P-100.1",
+                }]},
+            }],
+            "A_PurchaseOrderScheduleLine": [{
+                "PurchasingDocument": "4500001",
+                "PurchasingDocumentItem": "00010",
+                "ScheduleLine": "0001",
+                "ScheduleLineDeliveryDate": "2026-09-15",
+                "ScheduleLineOrderQuantity": "10",
+                "PurchaseOrderQuantityUnit": "ST",
+            }],
+            "A_MaterialDocumentItem": [{
+                "MaterialDocument": "5000001",
+                "MaterialDocumentYear": "2026",
+                "MaterialDocumentItem": "0001",
+                "Material": "R-1000",
+                "Plant": "1100",
+                "GoodsMovementType": "101",
+                "PurchaseOrder": "4500001",
+                "PurchaseOrderItem": "00010",
+                "QuantityInEntryUnit": "6",
+                "EntryUnit": "ST",
+                "GoodsMovementIsCancelled": False,
+                "to_MaterialDocumentHeader": {"results": [{"PostingDate": "2026-08-18"}]},
+            }],
+            "A_SuplrInvcItemPurOrdRef": [{
+                "SupplierInvoice": "5100001",
+                "FiscalYear": "2026",
+                "SupplierInvoiceItem": "0001",
+                "PurchaseOrder": "4500001",
+                "PurchaseOrderItem": "00010",
+                "QuantityInPurchaseOrderUnit": "4",
+                "SupplierInvoiceItemAmount": "10000",
+            }],
+            "A_SupplierInvoice": [{
+                "SupplierInvoice": "5100001",
+                "FiscalYear": "2026",
+                "CompanyCode": "1000",
+                "DocumentDate": "2026-08-19",
+                "PostingDate": "2026-08-20",
+                "InvoicingParty": "V-100",
+                "DocumentCurrency": "EUR",
+                "InvoiceGrossAmount": "11900",
+                "PaymentTerms": "NT30",
+                "DueCalculationBaseDate": "2026-08-20",
+                "NetPaymentDays": "30",
+                "PaymentBlockingReason": "PP",
+                "SupplierInvoiceStatus": "POSTED",
+                "to_SuplrInvcItemPurOrdRef": {"results": []},
+                "to_SupplierInvoiceTax": {"results": [{"TaxAmount": "1900"}]},
+            }],
+            "A_Supplier": [{"Supplier": "V-100", "SupplierName": "Acme"}],
+        },
+    )
+
+    items = backend.get_purchase_order_items("4500001")
+    schedules = backend.get_schedule_lines("4500001")
+    receipts = backend.get_goods_receipts(po_id="4500001")
+    invoices = backend.get_supplier_invoices(po_id="4500001")
+
+    assert items[0].net_value == 25_000
+    assert items[0].wbs_element == "P-100.1"
+    assert schedules[0].requested_date == date(2026, 9, 15)
+    assert schedules[0].confirmed_date is None, "istatistik tarihi teyit diye uydurulmamali"
+    assert receipts[0].po_item == "00010" and receipts[0].quantity == 6
+    assert invoices[0].po_item_quantities == {"4500001/00010": 4.0}
+    assert invoices[0].gross_amount == 11_900
+    assert invoices[0].tax_amount == 1_900
+    assert invoices[0].net_amount == 10_000
+    assert invoices[0].status == "blocked"
+    assert invoices[0].blocks[0].tolerance_key == "PP"
+    assert len(fake.calls_to("A_SuplrInvcItemPurOrdRef")) == 1
+    assert len(fake.calls_to("A_SupplierInvoice")) == 1, "fatura basliginda N+1 olmamali"
+
+
+def test_p2p_miktarlari_gr_ve_fatura_referansindan_netlesir(
+    settings_factory, tmp_path
+):
+    """PO complete bayragi yerine gercek 101/102 ve RSEG miktarlari kullanilir."""
+    backend, _ = build(
+        settings_factory,
+        tmp_path,
+        {
+            "A_PurchaseOrderItem": [{
+                "PurchaseOrder": "4500001", "PurchaseOrderItem": "00010",
+                "Material": "R-1000", "OrderQuantity": "10",
+                "PurchaseOrderQuantityUnit": "ST", "DocumentCurrency": "EUR",
+                "NetPriceAmount": "100", "NetPriceQuantity": "1",
+            }],
+            "A_PurchaseOrderScheduleLine": [],
+            "A_MaterialDocumentItem": [
+                {"MaterialDocument": "5001", "MaterialDocumentYear": "2026",
+                 "MaterialDocumentItem": "0001", "GoodsMovementType": "101",
+                 "PurchaseOrder": "4500001", "PurchaseOrderItem": "00010",
+                 "QuantityInEntryUnit": "8", "EntryUnit": "ST"},
+                {"MaterialDocument": "5002", "MaterialDocumentYear": "2026",
+                 "MaterialDocumentItem": "0001", "GoodsMovementType": "102",
+                 "PurchaseOrder": "4500001", "PurchaseOrderItem": "00010",
+                 "QuantityInEntryUnit": "2", "EntryUnit": "ST"},
+            ],
+            "A_SuplrInvcItemPurOrdRef": [{
+                "SupplierInvoice": "5101", "FiscalYear": "2026",
+                "SupplierInvoiceItem": "0001", "PurchaseOrder": "4500001",
+                "PurchaseOrderItem": "00010", "QuantityInPurchaseOrderUnit": "4",
+            }],
+            "A_SupplierInvoice": [{
+                "SupplierInvoice": "5101", "FiscalYear": "2026",
+                "DocumentCurrency": "EUR", "InvoiceGrossAmount": "400",
+            }],
+        },
+    )
+    items = backend.get_purchase_order_items("4500001")
+    receipts = backend.get_goods_receipts(po_id="4500001")
+    invoices = backend.get_supplier_invoices(po_id="4500001")
+
+    delivered = sum((-1 if gr.is_reversal else 1) * gr.quantity for gr in receipts)
+    invoiced = sum(inv.po_item_quantities.get("4500001/00010", 0) for inv in invoices)
+    items[0].delivered_qty = delivered
+    items[0].invoiced_qty = invoiced
+    assert items[0].delivered_qty == 6
+    assert items[0].invoiced_qty == 4
+    assert items[0].uninvoiced_qty == 2
+
+
+# ---------------------------------------------------------------------------
+# Kimlik iletimi ve SAP tarafi atfedilebilirlik
+# ---------------------------------------------------------------------------
+def test_calisan_kisinin_kimligi_sap_istegine_eklenir(settings_factory, tmp_path):
+    """SAP'a giden istek, cagriyi tetikleyen insani tasimali.
+
+    Bu bir YETKILENDIRME degil izlenebilirlik ozelligidir: SAP yetkileri hala
+    baglantinin kimligine gore uygulanir. Ama baslik olmadan SAP tarafindaki
+    gateway izleri hicbir insana baglanamaz.
+    """
+    backend, fake = build(
+        settings_factory, tmp_path,
+        {"A_Product": [{"Product": "R-1000", "ProductType": "HALB"}]},
+    )
+    backend.set_acting_subject("ali@firma.test")
+    backend.get_material("R-1000")
+
+    sent = [r for r in fake.requests if r.method == "GET"]
+    assert sent, "hic GET gitmedi"
+    assert any(r.headers.get("X-CertaOps-On-Behalf-Of") == "ali@firma.test" for r in sent)
+
+
+def test_kimlik_temizlenince_baslik_gonderilmez(settings_factory, tmp_path):
+    """Bos kimlik baslik uretmemeli: onceki turun kullanicisi sizmamali."""
+    backend, fake = build(
+        settings_factory, tmp_path,
+        {"A_Product": [{"Product": "R-1000", "ProductType": "HALB"}]},
+    )
+    backend.set_acting_subject("ali@firma.test")
+    backend.get_material("R-1000")
+    backend.set_acting_subject("")
+    fake.requests.clear()
+    backend.get_material("R-1000")
+
+    assert all("X-CertaOps-On-Behalf-Of" not in r.headers for r in fake.requests)
+
+
+def test_basic_auth_sap_tarafinda_atfedilemez_sayilir(settings_factory, tmp_path):
+    """Teknik kullanici ile baglanan bir sistem islemi insana atfedemez.
+
+    Bunun gorunur olmasi onemli: aksi halde "SAP'ta da izi var" varsayimi
+    sessizce yanlis kalir.
+    """
+    backend, _ = build(settings_factory, tmp_path)
+    described = backend.connection.describe()
+
+    assert described["principal_propagation"] is False
+    assert described["sap_attribution"] == "technical_user"
+
+
+def test_principal_propagation_destination_ile_taninir():
+    """Destination principal propagation kullaniyorsa SAP kisiyi gorur."""
+    from robotics_agent.adapters.sap.destination import ResolvedConnection
+
+    for auth_type in ("PrincipalPropagation", "SAMLAssertion", "OAuth2SAMLBearerAssertion"):
+        connection = ResolvedConnection(base_url=BASE, auth_type=auth_type)
+        assert connection.principal_propagation is True
+        assert connection.describe()["sap_attribution"] == "principal"
+
+    assert ResolvedConnection(base_url=BASE, auth_type="BasicAuthentication").principal_propagation is False
+
+
+# ---------------------------------------------------------------------------
+# Regresyon: gercek SAP hazirlik incelemesinde bulunan adapter hatalari.
+# ---------------------------------------------------------------------------
+def test_arama_eslesme_bulamayinca_filtresiz_okuma_yapmaz(settings_factory, tmp_path):
+    backend, fake = build(
+        settings_factory, tmp_path,
+        routes={"A_ProductDescription": [], "A_Product": []},
+    )
+
+    assert backend.search_materials("kalorifer kazani", limit=5) == []
+    unfiltered = [r for r in fake.calls_to("A_Product") if not r.url.params.get("$filter")]
+    assert not unfiltered
+
+
+def test_aciklama_aramasi_buyuk_harf_varyantini_da_dener(settings_factory, tmp_path):
+    backend, fake = build(
+        settings_factory, tmp_path,
+        routes={"A_ProductDescription": [], "A_Product": []},
+    )
+    backend.search_materials("vana", limit=5)
+
+    filter_expr = fake.filter_of("A_ProductDescription")
+    assert "substringof('vana',ProductDescription)" in filter_expr
+    assert "substringof('VANA',ProductDescription)" in filter_expr
+
+
+def test_arama_sonucu_okumasi_alan_secimi_yapar(settings_factory, tmp_path):
+    backend, fake = build(
+        settings_factory, tmp_path,
+        routes={
+            "A_ProductDescription": [{"Product": "100000", "ProductDescription": "VANA"}],
+            "A_Product": [{"Product": "100000", "ProductType": "ROH"}],
+        },
+    )
+    backend.search_materials("vana", limit=5)
+
+    select = fake.calls_to("A_Product")[-1].url.params.get("$select", "")
+    assert "ProductGroup" in select and "to_Plant/Plant" in select
+
+
+def test_stok_okumasi_malzeme_sayisindan_bagimsiz_cagri_yapar(settings_factory, tmp_path):
+    ids = [f"MAT-{i}" for i in range(10)]
+    backend, fake = build(
+        settings_factory, tmp_path,
+        routes={"A_MatlStkInAcctMod": [], "A_PurchaseOrderItem": [], "SupplyDemandItems": []},
+    )
+    backend.get_stock(ids)
+
+    assert len(fake.calls_to("SupplyDemandItems")) == 1
+    filter_expr = fake.filter_of("SupplyDemandItems")
+    assert "MAT-0" in filter_expr and "MAT-9" in filter_expr
+
+
+def test_metadata_istegi_format_json_tasimaz(settings_factory, tmp_path):
+    backend, fake = build(settings_factory, tmp_path)
+    backend.metadata_contract("product")
+
+    metadata_calls = [r for r in fake.requests if "$metadata" in r.url.path]
+    assert metadata_calls
+    for request in metadata_calls:
+        assert "$format" not in request.url.params, request.url

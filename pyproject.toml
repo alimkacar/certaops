@@ -62,6 +62,9 @@ gemini = ["google-genai>=1.0"]
 # MODEL_PROVIDER=anthropic kullanacaksaniz. Cekirdek runtime bu paketi
 # ISTEMEZ; saglayici adaptoru import edilene kadar hic yuklenmez.
 anthropic = ["anthropic>=0.40.0"]
+# MCP sunucu cephesi (`certaops-mcp`). Cekirdek runtime bu paketi ISTEMEZ;
+# tool'lari MCP istemcilerine acmak isteyenler icindir.
+mcp = ["mcp>=1.0,<2"]
 dev = [
     "pytest>=8.2",
     "pytest-cov>=5.0",
@@ -71,6 +74,7 @@ dev = [
 
 [project.scripts]
 certaops = "certaops.cli:main"
+certaops-mcp = "certaops.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -89,7 +93,7 @@ filterwarnings = [
 ]
 
 [tool.coverage.run]
-source = ["src/robotics_agent"]
+source = ["src/robotics_agent", "src/certaops"]
 branch = true
 omit = ["*/__init__.py"]
 

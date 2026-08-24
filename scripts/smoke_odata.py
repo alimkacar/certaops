@@ -21,8 +21,9 @@ Iki modda calisir:
        SAP_AUTH_MODE=oauth2 ... \\
        python scripts/smoke_odata.py --external
 
-UYARI: `--write` bayragi GERCEKTEN satinalma talebi olusturur. Gercek bir
-sisteme baglaniyorsaniz once `--write` OLMADAN calistirin.
+UYARI: `--write` bayragi GERCEKTEN satinalma talebi olusturur. Dis sistemde
+yazma icin ayrica `SAP_DRY_RUN=false` ve `SAP_INTEGRATION_ALLOW_WRITE=1`
+kapilarinin ikisi de acik olmalidir.
 """
 
 from __future__ import annotations
@@ -82,9 +83,21 @@ def main(argv: list[str] | None = None) -> int:
                         help="Sahte Gateway baslatma; ortam degiskenlerini kullan.")
     parser.add_argument("--port", type=int, default=8099)
     parser.add_argument("--write", action="store_true",
-                        help="GERCEK yazma dene (SAP_DRY_RUN=false gibi davranir).")
+                        help="Yazma dene; dis sistemde iki ek guvenlik kapisi gerekir.")
     parser.add_argument("--material", default="MAT-1")
     args = parser.parse_args(argv)
+
+    if args.external and args.write:
+        dry_run_off = os.getenv("SAP_DRY_RUN", "true").strip().lower() in {
+            "0", "false", "no",
+        }
+        integration_write = os.getenv("SAP_INTEGRATION_ALLOW_WRITE", "") == "1"
+        if not (dry_run_off and integration_write):
+            print(
+                f"{RED}Dis sisteme yazma engellendi.{RESET} --write yaninda "
+                "SAP_DRY_RUN=false ve SAP_INTEGRATION_ALLOW_WRITE=1 birlikte gerekli."
+            )
+            return 2
 
     tracker = None
     if not args.external:

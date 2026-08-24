@@ -49,6 +49,30 @@ CREATE TABLE IF NOT EXISTS approvals (
     reservation_expires_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS sap_tenant_profile (
+    tenant               TEXT PRIMARY KEY,
+    document_type        TEXT NOT NULL DEFAULT '',
+    required_fields_json TEXT NOT NULL DEFAULT '[]',
+    defaults_json        TEXT NOT NULL DEFAULT '{}',
+    field_map_json       TEXT NOT NULL DEFAULT '{}',
+    updated_at           TEXT NOT NULL
+);
+
+-- SAP'in reddettigi yazmalar. Ongorulemeyen sirket kurallarini (field
+-- selection, BAdI) ancak gozleyerek ogrenebiliriz; burasi o gozlemin yeri.
+-- Kurala YUKSELTME karari insanindir: tek seferlik red bir kural degildir.
+CREATE TABLE IF NOT EXISTS sap_rejection_log (
+    tenant      TEXT NOT NULL,
+    tool        TEXT NOT NULL,
+    sap_code    TEXT NOT NULL DEFAULT '',
+    field       TEXT NOT NULL DEFAULT '',
+    message     TEXT NOT NULL DEFAULT '',
+    seen_count  INTEGER NOT NULL DEFAULT 1,
+    first_seen  TEXT NOT NULL,
+    last_seen   TEXT NOT NULL,
+    PRIMARY KEY (tenant, tool, sap_code, field)
+);
+
 CREATE TABLE IF NOT EXISTS idempotency (
     key                TEXT NOT NULL,
     tenant             TEXT NOT NULL,

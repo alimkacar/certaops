@@ -77,6 +77,7 @@ class ODataHttpCore:
     client: httpx.Client
     odata_version: str = "v4"
     sap_client: str = ""
+    accept_language: str = "TR"
     allowed_hosts: tuple[str, ...] = ()
     max_retries: int = 3
     csrf_enabled: bool = True
@@ -88,6 +89,15 @@ class ODataHttpCore:
     #: Ardisik altyapi hatasinda hizli hata veren devre kesici. Varsayilan
     #: ornek devre disidir; `build_*_client` yapilandirmadan gercek kesiciyi verir.
     breaker: CircuitBreaker = field(default_factory=null_breaker)
+
+    #: Cagriyi tetikleyen insanin kimligini donduren saglayici.
+    #:
+    #: DIKKAT: bu bir YETKILENDIRME mekanizmasi DEGILDIR. SAP yetkileri hala
+    #: baglantinin kimligine gore uygulanir. Bu baslik yalnizca IZLENEBILIRLIK
+    #: icindir: SAP tarafindaki gateway izlerini insana baglar. Yetkilerin
+    #: gercekten son kullaniciya gore uygulanmasi icin destination'da
+    #: principal propagation gerekir (bkz. ResolvedConnection).
+    identity_provider: Callable[[], str] | None = None
 
     _csrf_token: str = field(default="", init=False, repr=False)
     # Gercekten SAP'a giden istek sayisi. Butce ve telemetri bunu okur.
@@ -156,16 +166,22 @@ class ODataHttpCore:
         correlation_id: str = "",
         etag: str = "",
         expect_json: bool = True,
+        odata_format: bool = True,
     ) -> ODataResponse:
         method = method.upper()
         self.call_count += 1
         merged_headers: dict[str, str] = {
             "Accept": "application/json",
-            "Accept-Language": "TR",
+            "Accept-Language": self.accept_language,
         }
         if correlation_id:
             merged_headers["sap-correlationid"] = correlation_id
             merged_headers["X-Correlation-ID"] = correlation_id
+        if self.identity_provider is not None:
+            subject = str(self.identity_provider() or "").strip()
+            if subject:
+                # Kendi basligimiz: SAP standardi gibi gosterilmemeli.
+                merged_headers["X-CertaOps-On-Behalf-Of"] = subject[:128]
         if self.token_provider is not None:
             merged_headers["Authorization"] = f"Bearer {self.token_provider()}"
         if method in MODIFYING_METHODS:
@@ -176,7 +192,7 @@ class ODataHttpCore:
         if headers:
             merged_headers.update(headers)
 
-        query = self._params(params)
+        query = self._params(params, odata_format=odata_format)
         attempt = 0
         last_fault: SAPFault | None = None
 
@@ -277,11 +293,16 @@ class ODataHttpCore:
         raise SAPError("SAP cagrisi tamamlanamadi.", code="UNKNOWN")
 
     # --- Yardimcilar --------------------------------------------------------
-    def _params(self, extra: Mapping[str, Any] | None) -> dict[str, Any]:
+    def _params(
+        self, extra: Mapping[str, Any] | None, *, odata_format: bool = True
+    ) -> dict[str, Any]:
         params: dict[str, Any] = {}
         if self.sap_client:
             params["sap-client"] = self.sap_client
-        if self.odata_version == "v2":
+        # `$metadata` her zaman EDMX XML'dir. V2'nin varsayilan
+        # `$format=json` parametresi metadata isteginde Hub/Gateway tarafindan
+        # reddedilebilir.
+        if self.odata_version == "v2" and odata_format:
             params["$format"] = "json"
         if extra:
             params.update({k: v for k, v in extra.items() if v is not None})
@@ -354,6 +375,7 @@ class ODataHttpCore:
             service_root=service_root,
             correlation_id=correlation_id,
             expect_json=False,
+            odata_format=False,
         )
         return str(response.data or "")
 

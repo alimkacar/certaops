@@ -20,7 +20,7 @@ Gecis
 -----
 Eski::
 
-    from robotics_agent.agent import SAPMultiAgent
+    from robotics_agent.compat_agent import SAPMultiAgent
     agent = SAPMultiAgent()
 
 Yeni::

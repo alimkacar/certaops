@@ -23,7 +23,7 @@ from ..contracts import (
     page_limit,
     resolve_detail,
 )
-from .registry import ToolContext, tool
+from .registry import PerformanceBudget, ToolContext, tool
 
 
 def _parse_date(value: str | None) -> date | None:
@@ -43,6 +43,7 @@ def _parse_date(value: str | None) -> date | None:
     risk_tier=RiskTier.R1,
     required_scopes=(SCOPE_SAP_READ,),
     result_token_budget=900,
+    performance_budget=PerformanceBudget(p95_ms=8000, max_sap_calls=8, max_records=100),
     description=(
         "GERCEK ATP kontrolu: istenen miktarin hangi tarihte teyit edilebilecegini SAP'in "
         "availability kontrol kuralina gore dondurur (API_PRODUCT_AVAILY_INFO). Kismi teyit "

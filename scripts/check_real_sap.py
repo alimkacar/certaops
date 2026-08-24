@@ -78,6 +78,9 @@ def main(argv: list[str] | None = None) -> int:
 
     backend = build_backend(settings)
     connection = backend.connection.describe()
+    # V4 -> V2 secimini raporlayan bu yardimci yalniz S/4 adapterinde var.
+    # ECC tek protokol kullandigi icin burada guvenli bir bos deger kullanilir.
+    resolved = getattr(backend, "resolved_services", dict)()
 
     if not args.json:
         print(f"{BOLD}Hedef sistem{RESET}")
@@ -101,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
             "connection": connection,
             "ping": health,
             "services": results,
-            "resolved": backend.resolved_services(),
+            "resolved": resolved,
         }, ensure_ascii=False, indent=2))
     else:
         print(f"\n{BOLD}Servis kontratlari{RESET}")
@@ -124,10 +127,11 @@ def main(argv: list[str] | None = None) -> int:
             for entity_set, fields in (entry.get("missing_properties") or {}).items():
                 print(f"      {DIM}{entity_set}: eksik alan -> {', '.join(fields)}{RESET}")
 
-        print(f"\n{BOLD}Fiilen secilen servis surumu{RESET}")
-        print("  " + "-" * 60)
-        for job, info in backend.resolved_services().items():
-            print(f"  {job:24} -> {info['odata']} ({info['status']}) {info['service']}")
+        if resolved:
+            print(f"\n{BOLD}Fiilen secilen servis surumu{RESET}")
+            print("  " + "-" * 60)
+            for job, info in resolved.items():
+                print(f"  {job:24} -> {info['odata']} ({info['status']}) {info['service']}")
 
         ok = sum(1 for r in results if r.get("contract_ok"))
         missing = sum(1 for r in results if not r.get("available"))

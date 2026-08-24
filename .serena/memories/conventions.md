@@ -1,0 +1,4 @@
+- Public-facing imports should use `certaops`; internal modules and existing tests commonly use `robotics_agent`.
+- Compatibility facades are intentional: `certaops.api`, `certaops.cli`, `certaops.auth`, lazy exports in `certaops.__init__`, and `robotics_agent.api`/legacy agent/provider exports.
+- Security behavior is fail-closed; preserve policy, approval, idempotency, DLP, audit and tenant-boundary layers when pruning.
+- Avoid deleting migration shims or modules only referenced by tests/docs without confirming compatibility scope.

@@ -111,7 +111,7 @@ def test_public_paket_yeni_adlari_disari_verir():
 
 
 def test_eski_facade_calisir_ve_deprecation_uyarir(settings, purchaser):
-    from robotics_agent.agent import SAPDomainAgent, SAPMultiAgent
+    from robotics_agent.compat_agent import SAPDomainAgent, SAPMultiAgent
 
     with pytest.warns(DeprecationWarning):
         legacy = SAPMultiAgent(

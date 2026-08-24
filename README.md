@@ -256,6 +256,44 @@ pytest tests/integration -v
 Write-path integration tests additionally require `SAP_INTEGRATION_ALLOW_WRITE=1` and
 `SAP_DRY_RUN=false`.
 
+### SAP API Business Hub read-only acceptance
+
+With the API Hub sandbox profile active in `.env`, run the complete MCP transport and
+tool acceptance gate:
+
+```bash
+python scripts/api_hub_acceptance.py
+```
+
+The gate starts the MCP server over stdio, verifies `initialize` and `tools/list`, calls
+all 18 Hub-safe tools, follows an `evidence_id` through `get_evidence`, and fails if a
+write or local-file side-effect tool is exposed. The expected result is `18/18`. It
+always forces `SAP_DRY_RUN=true` and never enables the integration write gate. The set
+includes real PO item, material-document and supplier-invoice reads for four P2P tools.
+
+### SAP CAL cost-controlled acceptance
+
+SAP S/4HANA Fully-Activated Appliance açılmadan önce bütün yerel hazırlık
+kapılarını çalıştırın:
+
+```bash
+python scripts/cal_acceptance.py --pre-cal
+```
+
+CAL aktifken bağlantı, kontrat, read, P2P, güvenlik ve PR dry-run aşamalarını;
+ardından ham SAP kaydı saklamayan servis/veri profili ve tool fırsat analizini
+tek fail-fast koşuda çalıştırın:
+
+```bash
+python scripts/cal_acceptance.py --live --env-file .env.cal
+```
+
+Aşamalar ayrı JSON, birleşik Markdown ve JUnit raporu üretir. Ayrıca
+`service_inventory.json`, `data_profile.json`, `tool_opportunities.json` ve
+`development_notes.md` oluşur. Kurulum,
+maliyet, gerçek süre beklentisi ve kontrollü tek-PR yazma komutu için
+[`docs/CAL_TEST_PLANI.md`](docs/CAL_TEST_PLANI.md) belgesine bakın.
+
 ## Safe write protocol
 
 `sap_pr_submit` cannot write directly from an unverified model request. The runtime:
@@ -278,7 +316,7 @@ outbound SAP host.
 
 | Layer | Current evidence |
 |---|---|
-| Full suite | 705 passing, 15 skipped (720 collected) |
+| Full suite | 754 passing, 15 skipped (769 collected) |
 | Local security and policy runtime | `tests/policy` + `security` + `privacy` + `concurrency`: all passing |
 | Acceptance behavior | 28/28 executable checks with evidence output |
 | SAP tool behavior | End-to-end against the bundled S/4HANA simulator |

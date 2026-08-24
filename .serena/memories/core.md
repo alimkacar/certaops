@@ -1,0 +1,5 @@
+- Public namespace: `certaops`; `robotics_agent` remains the internal/compatibility implementation namespace.
+- Runtime flow: CLI/API/MCP facades -> `certaops.runtime.SAPAgentRuntime` or tool layer -> `robotics_agent.core` policy/runtime -> tools -> SAP backend/adapters.
+- `docs/MIGRATION.md` explicitly defers full `robotics_agent.*` -> `certaops.*` migration; do not delete old namespace modules solely because they look duplicated.
+- Main source roots: `src/certaops`, `src/robotics_agent`; tests under `tests`; operational scripts under `scripts`.
+- Generated/runtime artifacts include `__pycache__`, `*.egg-info`, `.DS_Store`, and `state/`; these are ignored by git.

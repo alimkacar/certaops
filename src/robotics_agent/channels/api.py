@@ -46,7 +46,7 @@ from ..core import (
 )
 from ..observability import TelemetryCollector, mask_payload, truncate_preview
 from ..privacy import RetentionSweeper, sanitize_for_client
-from ..sap import reset_backend
+from ..sap import get_backend, reset_backend
 from ..tools import REGISTRY, load_all_tools, registry_contracts
 from .auth import AuthenticationError, Authenticator, SharedRateLimiter
 
@@ -235,6 +235,25 @@ async def _guard_middleware(request: Request, call_next):
             },
         )
 
+    # Content-Length bulunmayabilir (chunked transfer) veya kotu niyetli bir
+    # istemci tarafindan eksik bildirilebilir. Gercek govdeyi de limitli oku;
+    # Starlette'in alt katmani icin onbellege koyarak yeniden oynat.
+    chunks: list[bytes] = []
+    actual_size = 0
+    async for chunk in request.stream():
+        actual_size += len(chunk)
+        if actual_size > limit:
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "error": f"Istek govdesi {limit} bayt sinirini asiyor.",
+                    "code": "REQUEST_TOO_LARGE",
+                    "correlation_id": correlation_id,
+                },
+            )
+        chunks.append(chunk)
+    request._body = b"".join(chunks)  # type: ignore[attr-defined]
+
     try:
         response: Response = await call_next(request)
     except HTTPException:
@@ -339,11 +358,7 @@ def _evict_runtime(actor: ActorContext, session_id: str) -> None:
 
 
 def _shutdown_runtimes() -> None:
-    """Tum runtime'lari kapatir, sonra paylasilan SAP backend'ini BIR KEZ sifirlar.
-
-    Sira onemlidir: once saglayicilar birakilir, sonra paylasilan backend.
-    Backend paylasildigi icin runtime basina degil, sürec basina sifirlanir.
-    """
+    """Tum runtime'lari ve health icin kullanilan paylasilan backend'i kapatir."""
     for agent in list(_agents.values()):
         with suppress(Exception):
             agent.close()
@@ -385,6 +400,16 @@ def health() -> dict[str, Any]:
         # dogrular. Tam dogrulama sap_get_execution_audit ile yapilir.
         "audit_head": ledger.verify(limit=200),
         "audit_checkpoint": ledger.checkpoint(),
+        # Operatorun kapattigi tool'lar: modele gosterilmez ve cagrilirsa
+        # reddedilir. Bir olay sirasinda "neyi kapattik" sorusunun cevabi.
+        "disabled_tools": list(_settings.security.disabled_tools),
+        # SAP KENDI denetim kaydinda islemi insana atfedebiliyor mu?
+        # technical_user ise SAP yalniz servis hesabini gorur; atfedilebilirlik
+        # bizim audit zincirimizle SINIRLIDIR.
+        "sap_attribution": (
+            get_backend(_settings).connection.describe().get("sap_attribution", "unknown")
+            if _settings.sap.backend in {"odata", "ecc"} else "simulation"
+        ),
         "production_ready": posture["production_ready"],
         # Gizlilik, risk ve cache durusu operator icin gorunur olur. Deger
         # degil, yalnizca yapilandirma ve sayim raporlanir.

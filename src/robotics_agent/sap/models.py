@@ -550,6 +550,10 @@ class SupplierInvoice(BaseModel):
     paid_on: date | None = None
     accounting_document: str = Field(default="", description="Muhasebe belgesi (BKPF-BELNR)")
     po_ids: list[str] = Field(default_factory=list, description="Referans verilen PO'lar")
+    po_item_quantities: dict[str, float] = Field(
+        default_factory=dict,
+        description="PO/kalem bazinda faturalanan miktar; anahtar EBELN/EBELP",
+    )
     blocks: list[InvoiceBlock] = Field(default_factory=list)
     source_api: str = ""
 

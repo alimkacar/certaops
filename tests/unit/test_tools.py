@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -99,10 +100,19 @@ def test_stock_overview_is_not_atp(ctx):
         required_date="2026-09-30",
     )
     assert "YOK-123" in result["not_found"]
+    assert all(row["material_id"] != "YOK-123" for row in result["materials"])
     gear = result["materials"][0]
     assert gear["shortfall"] > 0
     assert "unreserved" in gear and "available" not in gear
     assert "ATP" in result["basis"] or "atp" in result["basis"].lower()
+
+
+def test_stock_overview_kucuk_harfli_id_celiskili_raporlanmaz(ctx):
+    result = run("sap_stock_overview", ctx, material_ids=["hd-gear-csf25-100"])
+
+    returned = {row["material_id"] for row in result["materials"]}
+    assert not (returned & set(result["not_found"]))
+    assert returned or result["not_found"]
 
 
 def test_vendor_comparison_is_tco_ranked(ctx):
@@ -177,3 +187,27 @@ def test_sap_report_handles_duplicate_sheet_names(ctx):
         filename="sap_duplicate",
     )
     assert Path(result["created_files"][0]).exists()
+
+
+def test_sap_report_metni_excel_formulu_veya_url_yapmaz(ctx):
+    result = run(
+        "sap_generate_report",
+        ctx,
+        title="Guvenli Excel",
+        format="xlsx",
+        tables=[{
+            "name": "Veri",
+            "columns": ["Deger"],
+            "rows": [["=1+1"], ["https://example.invalid/click"]],
+        }],
+        filename="sap_safe_strings",
+    )
+
+    with zipfile.ZipFile(result["created_files"][0]) as archive:
+        worksheets = "".join(
+            archive.read(name).decode("utf-8")
+            for name in archive.namelist()
+            if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")
+        )
+        assert "<f>" not in worksheets
+        assert "<hyperlink" not in worksheets

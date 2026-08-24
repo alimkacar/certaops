@@ -24,15 +24,25 @@
         <Property Name="Product" Type="Edm.String" MaxLength="40"/>
         <Property Name="Plant" Type="Edm.String" MaxLength="4"/>
         <Property Name="ProcurementType" Type="Edm.String" MaxLength="1"/>
-        <Property Name="PlndDelryDurnInDays" Type="Edm.Decimal"/>
-        <Property Name="MRPController" Type="Edm.String" MaxLength="3"/>
+        <Property Name="MRPResponsible" Type="Edm.String" MaxLength="3"/>
         <Property Name="ABCIndicator" Type="Edm.String" MaxLength="1"/>
         <Property Name="MinimumLotSizeQuantity" Type="Edm.Decimal"/>
+        <NavigationProperty Name="to_PlantMRPArea" Relationship="API_PRODUCT_SRV.assoc_MRPArea"/>
+      </EntityType>
+      <EntityType Name="A_ProductPlantMRPAreaType">
+        <Key><PropertyRef Name="Product"/><PropertyRef Name="Plant"/><PropertyRef Name="MRPArea"/></Key>
+        <Property Name="Product" Type="Edm.String" MaxLength="40"/>
+        <Property Name="Plant" Type="Edm.String" MaxLength="4"/>
+        <Property Name="MRPArea" Type="Edm.String" MaxLength="10"/>
+        <Property Name="MRPResponsible" Type="Edm.String" MaxLength="3"/>
+        <Property Name="PlannedDeliveryDurationInDays" Type="Edm.Decimal"/>
+        <Property Name="IsPlannedDeliveryTime" Type="Edm.Boolean"/>
       </EntityType>
       <EntityContainer Name="API_PRODUCT_SRV_Entities" m:IsDefaultEntityContainer="true">
         <EntitySet Name="A_Product" EntityType="API_PRODUCT_SRV.A_ProductType"/>
         <EntitySet Name="A_ProductDescription" EntityType="API_PRODUCT_SRV.A_ProductDescriptionType"/>
         <EntitySet Name="A_ProductPlant" EntityType="API_PRODUCT_SRV.A_ProductPlantType"/>
+        <EntitySet Name="A_ProductPlantMRPArea" EntityType="API_PRODUCT_SRV.A_ProductPlantMRPAreaType"/>
       </EntityContainer>
     </Schema>
   </edmx:DataServices>

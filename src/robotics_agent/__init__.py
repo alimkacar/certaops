@@ -2,7 +2,7 @@
 
 __version__ = "0.1.0"
 
-from .agent import SAPAgentRuntime, SAPDomainAgent, SAPMultiAgent
+from .compat_agent import SAPAgentRuntime, SAPDomainAgent, SAPMultiAgent
 from .config import Settings, get_settings, setup_logging
 
 __all__ = [
