@@ -32,6 +32,12 @@ from robotics_agent.runtime_config import (
 
 @pytest.fixture
 def env(monkeypatch, tmp_path):
+    # CI, gercek SAP'a yazmayi savunma katmani olarak ortamdan kilitler.
+    # Bu dosyanin varsayilan vakalari ise kilitsiz runtime-config davranisini
+    # sinar; ortam onceligi asagidaki ozel testlerde ayrica dogrulanir.
+    from robotics_agent.runtime_config import store
+
+    monkeypatch.setattr(store, "_SHELL_ENV", frozenset())
     monkeypatch.setenv("AGENT_CONFIG_DIR", str(tmp_path / "config"))
     monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("SAP_BACKEND", "mock")
