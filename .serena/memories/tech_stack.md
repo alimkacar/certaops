@@ -1,4 +1,0 @@
-- Python >=3.10, setuptools package under `src/`.
-- Runtime: FastAPI/Uvicorn, Pydantic, httpx, tenacity, Rich, Google GenAI; optional Anthropic, OIDC, MCP extras.
-- Test/lint: pytest + pytest-cov, Ruff; CI also runs pip-audit, eval, performance and SAP contract gates.
-- Entrypoints: `certaops` -> `certaops.cli:main`; `certaops-mcp` -> `certaops.mcp_server:main`.

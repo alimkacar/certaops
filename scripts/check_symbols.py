@@ -56,15 +56,15 @@ def _bound_names(nodes: list[ast.stmt]) -> set[str]:
     """Verilen govdede modul seviyesinde baglanan tum isimler."""
     names: set[str] = set()
     for node in nodes:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
             names.add(node.name)
         elif isinstance(node, ast.Assign):
             names.update(t.id for t in node.targets if isinstance(t, ast.Name))
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             names.add(node.target.id)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+        elif isinstance(node, ast.Import | ast.ImportFrom):
             names.update(a.asname or a.name.split(".")[0] for a in node.names)
-        elif isinstance(node, (ast.If, ast.Try)):
+        elif isinstance(node, ast.If | ast.Try):
             # try/except ImportError ve if TYPE_CHECKING bloklari da isim baglar.
             for branch in (
                 getattr(node, "body", []),
@@ -187,7 +187,7 @@ def _class_members(class_name: str) -> set[str] | None:
                     members.add(item.target.id)
                 elif isinstance(item, ast.Assign):
                     members.update(t.id for t in item.targets if isinstance(t, ast.Name))
-                elif isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                elif isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef):
                     members.add(item.name)
             return members
     return None

@@ -56,7 +56,7 @@ def _payload(result: Any) -> dict[str, Any]:
 def _find(value: Any, key: str) -> str:
     if isinstance(value, dict):
         candidate = value.get(key)
-        if isinstance(candidate, (str, int)) and str(candidate).strip():
+        if isinstance(candidate, str | int) and str(candidate).strip():
             return str(candidate).strip()
         for child in value.values():
             if found := _find(child, key):

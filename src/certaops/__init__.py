@@ -1,7 +1,7 @@
 """Public CertaOps API.
 
 Yeni kod ``certaops.providers`` ve ``certaops.runtime`` altindadir. Eski
-``robotics_agent`` namespace'i calismaya devam eder (bkz. docs/MIGRATION.md).
+``robotics_agent`` namespace'i geriye donuk uyumluluk icin calismaya devam eder.
 
 Import'lar bilerek TEMBEL: ``certaops.runtime`` modulu ``robotics_agent``i
 import eder; bu modulun tepesinde de ayni import olsaydi dairesel bir
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
-__version__ = "0.2.0"
+__version__ = "0.1.0"
 
 __all__ = [
     "SAPAgentRuntime",

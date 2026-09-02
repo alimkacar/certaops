@@ -1,5 +1,0 @@
-- Install: `python -m pip install -e ".[dev,oidc]"`
-- Smoke/demo: `python demo.py`, `python scripts/verify.py`, `python demo.py --tokens`
-- API: `python run_api.py`; CLI: `python run_cli.py`
-- Tests: `pytest -q`; focused security/eval/performance/contract commands are documented in `.github/workflows/ci.yml`.
-- Lint: `ruff check .`; symbol gate: `python scripts/check_symbols.py --strict`; eval report: `python scripts/run_eval.py --strict`.

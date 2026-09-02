@@ -236,7 +236,7 @@ def _scrub(value: Any, *, actor: ActorContext, settings: Any, dlp: Any) -> Any:
             else:
                 out[key] = _scrub(item, actor=actor, settings=settings, dlp=dlp)
         return out
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return type(value)(_scrub(v, actor=actor, settings=settings, dlp=dlp) for v in value)
     return value
 

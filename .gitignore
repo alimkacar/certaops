@@ -1,9 +1,9 @@
 .env*
 !.env.example
-!.env.cal.example
-!.env.abap-trial.example
 .venv/
 venv/
+.serena/
+.artifacts/
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -32,6 +32,7 @@ artifacts/
 *.tgz
 *.tar.gz
 *.zip
+*.docx
 *~
 
 # Yerel inceleme paketleri ve onceki calisma kopyalari kaynak dagitimina girmez.

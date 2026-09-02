@@ -6,7 +6,7 @@
   <p>
     <img alt="Release 0.1.0" src="https://img.shields.io/badge/release-0.1.0-6D5DFB">
     <img alt="Python 3.10–3.13" src="https://img.shields.io/badge/Python-3.10%E2%80%933.13-3776AB?logo=python&logoColor=white">
-    <img alt="969 tests passing" src="https://img.shields.io/badge/tests-969_passing-2EA44F">
+    <img alt="927 tests passing" src="https://img.shields.io/badge/tests-927_passing-2EA44F">
     <img alt="21 SAP tools" src="https://img.shields.io/badge/SAP_tools-21-0FAAFF">
     <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-0B2239">
   </p>
@@ -87,6 +87,11 @@ DLP, or audit gates.
 
 The simulator, deterministic tools, tests, and acceptance checks do not require a model key or
 SAP tenant.
+
+Reference documentation:
+
+- [Data handling and retention](docs/DATA_HANDLING.md)
+- [ECC ABAP integration requirements](docs/ECC_ABAP_REQUIREMENTS.md)
 
 ## Quick start
 
@@ -352,7 +357,7 @@ Verified locally on 2 September 2026:
 
 | Gate | Result |
 |---|---|
-| Full suite | 969 passed, 14 skipped, 1 expected xfail |
+| Full suite | 927 passed, 15 skipped, 1 expected xfail |
 | Acceptance checks | 28/28 passed |
 | Ruff | Passed |
 | Dependency audit | No known vulnerabilities |

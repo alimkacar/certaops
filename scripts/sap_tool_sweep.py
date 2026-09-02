@@ -93,7 +93,7 @@ def _first(obj: Any, *keys: str) -> str:
         if isinstance(node, dict):
             for key in keys:
                 value = node.get(key)
-                if isinstance(value, (str, int)) and str(value).strip():
+                if isinstance(value, str | int) and str(value).strip():
                     return str(value).strip()
             stack.extend(node.values())
         elif isinstance(node, list):
@@ -109,9 +109,9 @@ def _has_data(payload: Any) -> bool:
         for key, value in payload.items():
             if key in ignored:
                 continue
-            if isinstance(value, (list, dict)) and value:
+            if isinstance(value, list | dict) and value:
                 return True
-            if isinstance(value, (int, float)) and value:
+            if isinstance(value, int | float) and value:
                 return True
             if isinstance(value, str) and value.strip():
                 return True

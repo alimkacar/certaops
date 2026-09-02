@@ -1,3 +1,0 @@
-- Minimum completion checks after cleanup: `ruff check .`, targeted `pytest -q` for affected areas, then `pytest -q` if source/test topology changes.
-- Also run `python scripts/check_symbols.py --strict` when source files are removed or renamed.
-- For entrypoint/runtime changes, run `python demo.py` and `python demo.py --tokens`.

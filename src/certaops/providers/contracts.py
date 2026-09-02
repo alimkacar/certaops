@@ -179,7 +179,7 @@ def _state_to_json(value: Any) -> Any:
         return None
     if isinstance(value, bytes):
         return {_BYTES_TAG: base64.b64encode(value).decode("ascii")}
-    if isinstance(value, (str, int, float, bool)):
+    if isinstance(value, str | int | float | bool):
         return value
     # Taninmayan bir tip sessizce string'e cevrilmez: geri yuklendiginde
     # saglayiciya bozuk bir devam bilgisi gitmesindense hic gitmemesi iyidir.
