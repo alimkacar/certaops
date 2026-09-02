@@ -1,6 +1,7 @@
 .env*
 !.env.example
 !.env.cal.example
+!.env.abap-trial.example
 .venv/
 venv/
 __pycache__/
@@ -23,6 +24,18 @@ artifacts/
 *.pem
 *.key
 *.p12
+*.pfx
+*.jks
+*.keystore
+*.bak
+*.backup
+*.tgz
+*.tar.gz
+*.zip
+*~
+
+# Yerel inceleme paketleri ve onceki calisma kopyalari kaynak dagitimina girmez.
+_to_delete/
 
 # Kalici durum: onay kayitlari, idempotency, oturum ve audit defteri.
 # Isletme verisidir; versiyon kontrolune girmez.
@@ -35,3 +48,7 @@ config/principals.json
 # Performans kapisi ciktilari
 perf.json
 schema-budget.txt
+
+# Arayuzden yapilan calisma zamani ayar degisiklikleri. Deployment'a ozgudur
+# ve surumlenmez; `.env` beyani her zaman kaynak dogrudur.
+config/overrides.json

@@ -13,6 +13,7 @@ import json
 
 import pytest
 
+from certaops.mcp_diagnostics import status_snapshot
 from certaops.mcp_server import build_context, exposed_tool_names, main, run_isolated_tool, run_tool
 from robotics_agent.config import get_settings
 from robotics_agent.contracts import ActorContext
@@ -50,6 +51,28 @@ def test_yazma_toollari_varsayilan_olarak_bildirilmez(mcp_env):
     assert "sap_pr_submit" not in names
     assert "sap_generate_report" not in names, "dosya olusturan tool salt-okunur degildir"
     assert "sap_pr_prepare" in names, "taslak hazirlama yazma degildir, kapanmamali"
+
+
+def test_web_teshis_gorunumu_sir_sizdirmaz_ve_guvenli_config_uretir(
+    mcp_env, monkeypatch
+):
+    settings, _actor = mcp_env
+    monkeypatch.setenv("SAP_PASSWORD", "mcp-secret-password")
+    monkeypatch.setenv("SAP_API_KEY", "mcp-secret-api-key")
+    monkeypatch.setenv("SAP_OAUTH_CLIENT_SECRET", "mcp-secret-oauth")
+
+    snapshot = status_snapshot(settings)
+    rendered = json.dumps(snapshot)
+
+    assert snapshot["ui_uses_mcp"] is False
+    assert snapshot["security"]["write_tools_exposed"] is False
+    assert snapshot["security"]["secrets_in_response"] is False
+    client_env = snapshot["client_config"]["mcpServers"]["certaops"]["env"]
+    assert client_env["SAP_DRY_RUN"] == "true"
+    assert client_env["PYTHONPATH"].endswith("/src")
+    assert "mcp-secret-password" not in rendered
+    assert "mcp-secret-api-key" not in rendered
+    assert "mcp-secret-oauth" not in rendered
 
 
 def test_bildirilmeyen_yazma_toolu_adiyla_cagrilinca_da_reddedilir(mcp_env):
@@ -102,6 +125,7 @@ def test_izole_cagri_backend_kapatir(mcp_env, monkeypatch):
 def test_bayrak_acikken_yazma_toolu_bildirilir(mcp_env, monkeypatch):
     settings, actor = mcp_env
     monkeypatch.setenv("CERTAOPS_MCP_ALLOW_WRITE", "1")
+    object.__setattr__(settings.sap, "read_only", False)
 
     names = exposed_tool_names(settings, actor)
 
@@ -117,6 +141,7 @@ def test_bayrak_acik_olsa_bile_onay_kapisi_calisir(mcp_env, monkeypatch):
     """
     settings, actor = mcp_env
     monkeypatch.setenv("CERTAOPS_MCP_ALLOW_WRITE", "1")
+    monkeypatch.setenv("SAP_READ_ONLY", "false")
     monkeypatch.setenv("SAP_DRY_RUN", "false")
     settings = get_settings(reload=True)
     settings.ensure_dirs()
@@ -144,6 +169,7 @@ def test_esik_altindaki_talep_onay_istemez(mcp_env, monkeypatch):
     """
     settings, actor = mcp_env
     monkeypatch.setenv("CERTAOPS_MCP_ALLOW_WRITE", "1")
+    monkeypatch.setenv("SAP_READ_ONLY", "false")
     monkeypatch.setenv("SAP_DRY_RUN", "false")
     settings = get_settings(reload=True)
     settings.ensure_dirs()

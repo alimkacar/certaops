@@ -131,34 +131,31 @@ class Seeds:
         self.vendor = args.vendor or os.getenv("SAP_INTEGRATION_VENDOR", "")
         self.po = args.po or os.getenv("SAP_INTEGRATION_PO", "")
         self.invoice = args.invoice or os.getenv("SAP_INTEGRATION_INVOICE", "")
-        self.wbs = args.wbs or os.getenv("SAP_INTEGRATION_WBS", "")
         self.evidence_id = ""
         self.discovery: list[str] = []
 
     def discover(self, run, *, needed: set[str] | None = None) -> None:
         """Yalniz secilen tool'larin gerektirdigi cekirdekleri kesfeder.
 
-        Onceki surum `--only sap_purchase_order_360` kosusunda bile WBS bulmak
-        icin custom proje maliyet servisine gidiyordu. Bu hem CAL aktif suresini
-        hem SAP cagrilarini bosa harciyordu.
+        `--only sap_purchase_order_360` kosusunda malzeme veya tedarikci
+        kesfine gidilmez; boylece CAL aktif suresi ve SAP cagrisi bosa gitmez.
         """
         selected = needed or set()
         needs_material = not selected or bool(selected & {
             "sap_search_materials", "sap_material_360", "sap_stock_overview",
-            "sap_atp_check", "sap_mrp_shortage_explain", "sap_compare_vendors",
+            "sap_mrp_shortage_explain", "sap_compare_vendors",
             "sap_track_purchase_orders", "sap_pr_prepare", "sap_pr_submit",
         })
         needs_vendor = not selected or bool(selected & {
             "sap_supplier_score_360", "sap_compare_vendors",
         })
         needs_po = not selected or bool(selected & {
-            "sap_purchase_order_360", "sap_document_flow", "sap_workflow_status",
+            "sap_purchase_order_360", "sap_document_flow",
             "sap_supplier_invoice_status", "sap_track_purchase_orders",
         })
         needs_invoice = not selected or bool(selected & {
             "sap_invoice_block_explain", "sap_supplier_invoice_status",
         })
-        needs_wbs = not selected or "sap_project_cost_status" in selected
 
         if needs_material and not self.material:
             payload, err = run("sap_search_materials", {"limit": 5})
@@ -182,15 +179,10 @@ class Seeds:
             if not err:
                 self.invoice = _first(payload, "invoice_id", "supplier_invoice", "SupplierInvoice")
                 self.discovery.append(f"invoice <- sap_supplier_invoice_status: {self.invoice or 'YOK'}")
-        if needs_wbs and not self.wbs:
-            payload, err = run("sap_project_cost_status", {})
-            if not err:
-                self.wbs = _first(payload, "wbs_element", "wbs", "WBSElement")
-                self.discovery.append(f"wbs <- sap_project_cost_status: {self.wbs or 'YOK'}")
 
     def as_dict(self) -> dict[str, str]:
         return {"material": self.material, "vendor": self.vendor, "po": self.po,
-                "invoice": self.invoice, "wbs": self.wbs}
+                "invoice": self.invoice}
 
 
 # --- Tool -> arguman uretimi ----------------------------------------------
@@ -215,28 +207,20 @@ def build_arguments(name: str, seeds: Seeds) -> dict[str, Any] | None:
         # --- material gerektirenler ---
         "sap_material_360": {"material_id": material} if material else None,
         "sap_stock_overview": {"material_ids": [material]} if material else None,
-        "sap_atp_check": (
-            {"requests": [{"material_id": material, "quantity": 1, "required_date": soon}]}
-            if material else None
-        ),
         "sap_mrp_shortage_explain": {"material_id": material} if material else None,
         "sap_compare_vendors": (
             {"material_id": material, "quantity": 1, "required_date": soon} if material else None
         ),
         "sap_track_purchase_orders": {"material_id": material} if material else {},
-        # --- vendor / po / invoice / wbs ---
+        # --- vendor / po / invoice ---
         "sap_supplier_score_360": {"vendor_ids": [vendor]} if vendor else None,
         "sap_purchase_order_360": {"po_id": po} if po else None,
         "sap_document_flow": {"document_id": po, "document_type": "purchase_order"} if po else None,
-        "sap_workflow_status": (
-            {"object_type": "purchase_order", "object_id": po} if po else None
-        ),
         # En az bir filtre zorunlu (FILTER_REQUIRED): po varsa onu kullan.
         "sap_supplier_invoice_status": (
             {"po_id": po, "limit": 5} if po else {"only_blocked": True, "limit": 5}
         ),
         "sap_invoice_block_explain": {"invoice_id": seeds.invoice} if seeds.invoice else None,
-        "sap_project_cost_status": {"wbs_element": seeds.wbs} if seeds.wbs else {},
         "get_evidence": {"evidence_id": seeds.evidence_id} if seeds.evidence_id else None,
         # --- hesap / taslak (yazma yok) ---
         "sap_pr_prepare": (
@@ -277,7 +261,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--vendor")
     parser.add_argument("--po")
     parser.add_argument("--invoice")
-    parser.add_argument("--wbs")
     parser.add_argument("--only", action="append", help="Yalniz bu tool (tekrarlanabilir).")
     parser.add_argument("--no-discover", action="store_true",
                         help="Kesif adimini atla (cekirdek degerleri elle verdiyseniz).")

@@ -3,7 +3,7 @@
 Gercek S/4HANA'ya erisim olmadan tum akisi ucdan uca calistirmak icin kullanilir.
 Ayni portlari implemente ettigi icin tool katmani mock/gercek ayrimini gormez.
 
-Mock, gercek sistemin **yeteneklerini** de taklit eder: ATP tarih bazli hesaplanir,
+Mock, gercek sistemin **yeteneklerini** de taklit eder: MRP arz/talep zamanlanir,
 MRP arz/talep elementleri uretilir, PR prepare/submit ayrimi ve idempotent
 referans arama gercek backend ile ayni sozlesmeyi izler. Boylece mock uzerinde
 gecen bir akis gercek sisteme tasindiginda kontrat degismez.
@@ -19,17 +19,14 @@ from typing import Any
 
 from ..core.tenant_profile import DEFAULT_DOCUMENT_TYPE
 from . import mock_data
-from .base import SAPBackend, SAPError, effective_unit_price
+from .base import SAPBackend, SAPError, effective_unit_price, wbs_matches
 from .models import (
-    AtpResult,
-    AtpScheduleLine,
     DocumentFlowNode,
     GoodsReceipt,
     InfoRecord,
     InvoiceBlock,
     Material,
     MaterialClassification,
-    ProjectCost,
     PurchaseOrder,
     PurchaseOrderItem,
     PurchaseRequisitionDraft,
@@ -42,15 +39,12 @@ from .models import (
     SupplyDemandItem,
     ValidationFinding,
     Vendor,
-    WorkflowStep,
 )
 
 log = logging.getLogger(__name__)
 
 _TR_MAP = str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosuCGIOSU")
 
-# ATP kontrol kuralinda rezervasyon ve emniyet stogu talep sayilir.
-_ATP_RESPECT_SAFETY_STOCK = True
 # Rezervasyonlarin ortalama ihtiyac tarihi (gun). Gercek sistemde RESB-BDTER.
 _RESERVATION_HORIZON_DAYS = 14
 
@@ -86,7 +80,6 @@ class MockSAPBackend(SAPBackend):
         self._vendors = {v["vendor_id"]: v for v in mock_data.VENDORS}
         self._info_records = mock_data.INFO_RECORDS
         self._purchase_orders = list(mock_data.PURCHASE_ORDERS)
-        self._project_costs = list(mock_data.PROJECT_COSTS)
         # Olusturulan PR'lar oturum boyunca saklanir; external_reference ile
         # timeout sonrasi mutabakat yapilabilir.
         self._created_requisitions: dict[str, dict] = {}
@@ -98,7 +91,6 @@ class MockSAPBackend(SAPBackend):
         self._schedule_lines = list(mock_data.SCHEDULE_LINES)
         self._goods_receipts = list(mock_data.GOODS_RECEIPTS)
         self._supplier_invoices = list(mock_data.SUPPLIER_INVOICES)
-        self._workflow_steps = dict(mock_data.WORKFLOW_STEPS)
         self._payments = list(mock_data.PAYMENTS)
 
     # --- Malzeme ------------------------------------------------------------
@@ -264,106 +256,6 @@ class MockSAPBackend(SAPBackend):
         return min(
             (r.planned_delivery_days for r in records),
             default=master.get("planned_delivery_days", 30),
-        )
-
-    def check_atp(
-        self,
-        material_id: str,
-        *,
-        quantity: float,
-        requested_date: date | None = None,
-        plant: str | None = None,
-    ) -> AtpResult:
-        mid = material_id.upper()
-        master = self._materials.get(mid)
-        if master is None:
-            raise SAPError(
-                f"Malzeme {mid} malzeme ana verisinde bulunamadi.", code="MM_MATNR_NOT_FOUND"
-            )
-        target_plant = plant or self.settings.sap.plant
-        today = date.today()
-        need_by = requested_date or today
-        stock_raw = self._stock.get(mid, {})
-
-        # ATP kontrol kurali: serbest stok - rezervasyon - emniyet stogu
-        on_hand = float(stock_raw.get("unrestricted_qty", 0.0))
-        reserved = float(stock_raw.get("reserved_qty", 0.0))
-        safety = float(stock_raw.get("safety_stock", 0.0)) if _ATP_RESPECT_SAFETY_STOCK else 0.0
-        available_now = max(0.0, on_hand - reserved - safety)
-
-        messages: list[str] = []
-        if safety > 0:
-            messages.append(
-                f"Kontrol kuralinda emniyet stogu ({safety:g}) talep olarak dusuldu."
-            )
-        if stock_raw.get("quality_inspection_qty"):
-            messages.append(
-                f"{stock_raw['quality_inspection_qty']:g} adet kalite kontrolde; ATP'ye dahil degil."
-            )
-        if stock_raw.get("blocked_qty"):
-            messages.append(
-                f"{stock_raw['blocked_qty']:g} adet bloke stok; ATP'ye dahil degil."
-            )
-
-        schedule: list[AtpScheduleLine] = []
-        remaining = float(quantity)
-
-        if available_now > 0 and remaining > 0:
-            take = min(available_now, remaining)
-            schedule.append(
-                AtpScheduleLine(confirmed_date=today, confirmed_qty=round(take, 3),
-                                supply_element="WB serbest stok")
-            )
-            remaining -= take
-
-        for eta, qty, element in self._supply_events(mid):
-            if remaining <= 0:
-                break
-            take = min(qty, remaining)
-            schedule.append(
-                AtpScheduleLine(confirmed_date=eta, confirmed_qty=round(take, 3),
-                                supply_element=element)
-            )
-            remaining -= take
-
-        if remaining > 0:
-            # Yeni tedarik onerisi: dis tedarik icin bilgi kaydi, ic uretim icin
-            # planlanan uretim suresi kullanilir.
-            if master.get("procurement_type") == "E":
-                lead = master.get("planned_delivery_days", 30)
-                element = "Planli uretim emri onerisi"
-            else:
-                lead = self._best_lead_time(mid)
-                element = "Yeni satinalma onerisi"
-            proposal_date = today + timedelta(days=lead)
-            schedule.append(
-                AtpScheduleLine(confirmed_date=proposal_date, confirmed_qty=round(remaining, 3),
-                                supply_element=element)
-            )
-            messages.append(
-                f"{remaining:g} adet mevcut arzdan karsilanamiyor; {lead} gun tedarik/uretim "
-                "suresiyle oneri uretildi."
-            )
-            remaining = 0.0
-
-        confirmed_by_need_by = round(
-            sum(line.confirmed_qty for line in schedule if line.confirmed_date <= need_by), 3
-        )
-        full_date = schedule[-1].confirmed_date if schedule else None
-
-        return AtpResult(
-            material_id=mid,
-            plant=target_plant,
-            requested_qty=float(quantity),
-            requested_date=requested_date,
-            unit=master.get("base_unit", "ST"),
-            confirmed_qty=confirmed_by_need_by,
-            full_confirmation_date=full_date,
-            schedule_lines=schedule,
-            checked_at=datetime.now(timezone.utc),
-            source_api="mock:availability",
-            calendar_considered=False,
-            messages=messages,
         )
 
     # --- MRP ----------------------------------------------------------------
@@ -682,6 +574,11 @@ class MockSAPBackend(SAPBackend):
         external_reference: str,
         correlation_id: str = "",
     ) -> PurchaseRequisitionResult:
+        if self.settings.sap.read_only:
+            raise SAPError(
+                "SAP read-only profili etkin; simulator durumu degistirilemez.",
+                code="READ_ONLY_MODE",
+            )
         if not draft.is_submittable:
             raise SAPError(
                 "Taslakta engelleyici bulgular var; SAP'a gonderilmedi: "
@@ -773,7 +670,9 @@ class MockSAPBackend(SAPBackend):
                 continue
             if vendor_id and raw["vendor_id"] != vendor_id:
                 continue
-            if wbs_element and raw.get("wbs_element") != wbs_element:
+            # Esitlik degil hiyerarsi: `R-2026-021` sorgusu alt elemanlari da
+            # kapsar. Bkz. `wbs_matches`.
+            if wbs_element and not wbs_matches(wbs_element, raw.get("wbs_element") or ""):
                 continue
             if only_open and raw["status"] in {"delivered", "invoiced", "closed"}:
                 continue
@@ -927,26 +826,6 @@ class MockSAPBackend(SAPBackend):
         out.sort(key=lambda inv: (inv.posting_date or date.min), reverse=True)
         return out[:limit]
 
-    def get_workflow_status(self, *, object_type: str, object_id: str) -> list[WorkflowStep]:
-        raw_steps = self._workflow_steps.get(f"{object_type}:{object_id.strip()}", [])
-        steps = [
-            WorkflowStep(
-                workflow_id=raw["workflow_id"],
-                step_no=raw.get("step_no", 0),
-                step_name=raw.get("step_name", ""),
-                status=raw.get("status", "in_progress"),
-                decision=raw.get("decision", ""),
-                processor_name=raw.get("processor_name", ""),
-                processor_role=raw.get("processor_role", ""),
-                started_at=_parse_datetime(raw.get("started_at")),
-                completed_at=_parse_datetime(raw.get("completed_at")),
-                due_at=_parse_datetime(raw.get("due_at")),
-                note=raw.get("note", ""),
-            )
-            for raw in raw_steps
-        ]
-        steps.sort(key=lambda step: step.step_no)
-        return steps
 
     def get_document_flow(
         self,
@@ -1130,19 +1009,6 @@ class MockSAPBackend(SAPBackend):
                     )
                 )
         return nodes
-
-    # --- Kontrolling --------------------------------------------------------
-    def get_project_costs(
-        self, *, wbs_element: str | None = None, fiscal_year: int | None = None
-    ) -> list[ProjectCost]:
-        out: list[ProjectCost] = []
-        for raw in self._project_costs:
-            if wbs_element and not raw["wbs_element"].startswith(wbs_element):
-                continue
-            if fiscal_year and raw.get("fiscal_year") != fiscal_year:
-                continue
-            out.append(ProjectCost(currency=self.settings.sap.currency, **raw))
-        return out
 
     def set_active_profile(self, profile: Any) -> None:
         self._profile = profile

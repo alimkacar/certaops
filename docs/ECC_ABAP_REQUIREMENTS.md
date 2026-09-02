@@ -158,7 +158,7 @@ Kapsadigi yetenekler: `product`, `classification`, `valuation`
 ### `ZAGENT_MM_STOCK_SRV`
 SICF yolu: `/sap/opu/odata/sap/ZAGENT_MM_STOCK_SRV`  
 OData surumu: **V2**  
-Kapsadigi yetenekler: `stock`, `availability`, `mrp`
+Kapsadigi yetenekler: `stock`, `mrp`
 
 #### stock - Depo yeri bazinda stok (MARD/MCHB) + emniyet stogu
 - **Tablolar:** `MARD`, `MCHB`, `MARC`
@@ -180,31 +180,6 @@ Kapsadigi yetenekler: `stock`, `availability`, `mrp`
 
 - Depo yeri bazinda satir dondurulur; toplama Python tarafinda yapilir.
 - SafetyStock MARC-EISBE'den gelir ve tesis bazindadir: her depo yeri satirinda ayni deger tekrarlanir, toplanmamalidir.
-
-
-#### availability - Gercek ATP: BAPI_MATERIAL_AVAILABILITY sarmalayicisi
-- **Fonksiyon modulleri:** `BAPI_MATERIAL_AVAILABILITY`
-
-**`AvailabilitySet`**
-
-| Alan | Onerilen tip |
-|---|---|
-| `Material` | Edm.String |
-| `Plant` | Edm.String |
-| `RequestedQuantity` | Edm.Decimal |
-| `RequestedDate` | Edm.DateTime |
-| `CommittedQuantity` | Edm.Decimal |
-| `CommittedDate` | Edm.DateTime |
-| `SupplyElement` | Edm.String |
-| `CheckingRule` | Edm.String |
-| `CalendarConsidered` | Edm.String(1) |
-| `BaseUnit` | Edm.String |
-
-**Notlar:**
-
-- WMDVEX cikti tablosu ATP agacini verir; her satir bir AvailabilitySet kaydina donusur.
-- CalendarConsidered, kullanilan kontrol kuralinin fabrika takvimini dikkate alip almadigini bildirmeli. Sabit true DONDURULMEMELI.
-- gATP/APO varsa BAPI_APO_AVAILABILITY_CHECK tercih edilir; servis hangisini kullandigini SupplyElement alaninda bildirir.
 
 
 #### mrp - MD04 arz/talep listesi (MD_STOCK_REQUIREMENTS_LIST_API)
@@ -549,68 +524,6 @@ Kapsadigi yetenekler: `supplier_invoice`
 - PaymentBlock = RBKP-ZLSPR. Blokaj nedeni RSEG tolerans kontrollerinden turetilir (OMR6 anahtarlari).
 - ClearingDate BSEG-AUGDT uzerinden; odenmis fatura tespiti buna dayanir.
 - InvoiceStatus: parked (RBKP-RBSTAT='A'), posted ('5'), blocked (ZLSPR dolu), cancelled ('3').
-
-
-### `ZAGENT_WF_STATUS_SRV`
-SICF yolu: `/sap/opu/odata/sap/ZAGENT_WF_STATUS_SRV`  
-OData surumu: **V2**  
-Kapsadigi yetenekler: `workflow`
-
-#### workflow - SAP Business Workflow durumu (SAP_WAPI_* sarmalayicisi)
-- **Fonksiyon modulleri:** `SAP_WAPI_WORKITEMS_TO_OBJECT`, `SAP_WAPI_GET_WORKITEM_DETAIL`, `SAP_WAPI_GET_HEADER`
-
-**`WorkflowStepSet`**
-
-| Alan | Onerilen tip |
-|---|---|
-| `ObjectType` | Edm.String |
-| `ObjectId` | Edm.String |
-| `WorkflowId` | Edm.String |
-| `WorkItemId` | Edm.String |
-| `StepNumber` | Edm.Int32 |
-| `StepName` | Edm.String |
-| `WorkItemStatus` | Edm.String |
-| `Decision` | Edm.String |
-| `ProcessorName` | Edm.String |
-| `ProcessorRole` | Edm.String |
-| `StartedAt` | Edm.DateTime |
-| `CompletedAt` | Edm.DateTime |
-| `DueAt` | Edm.DateTime |
-| `Note` | Edm.String |
-
-**Notlar:**
-
-- ObjectType ornekleri: BUS2105 (PR), BUS2012 (PO), BUS2081 (fatura).
-- ProcessorName kisisel veridir (D2); servis maskeleme yapmaz, Python DLP katmani yapar. Ham deger dondurulmeli.
-- WorkItemStatus SAP kodlari (READY/STARTED/COMPLETED/CANCELLED) oldugu gibi dondurulur; esleme Python tarafinda.
-
-
-### `ZAGENT_PS_COST_SRV`
-SICF yolu: `/sap/opu/odata/sap/ZAGENT_PS_COST_SRV`  
-OData surumu: **V2**  
-Kapsadigi yetenekler: `project_cost`
-
-#### project_cost - WBS plan/fiili/taahhut (PRPS + COSP/COSS + COOI)
-- **Tablolar:** `PRPS`, `PROJ`, `COSP`, `COSS`, `COOI`, `RPSCO`
-- **Fonksiyon modulleri:** `BAPI_PROJECT_GETINFO`
-
-**`ProjectCostSet`**
-
-| Alan | Onerilen tip |
-|---|---|
-| `WBSElement` | Edm.String |
-| `WBSDescription` | Edm.String |
-| `PlanCost` | Edm.Decimal |
-| `ActualCost` | Edm.Decimal |
-| `Commitment` | Edm.Decimal |
-| `Currency` | Edm.String |
-| `FiscalYear` | Edm.Int32 |
-| `CompletionPercent` | Edm.Decimal |
-
-**Notlar:**
-
-- Commitment COOI'den (acik siparis taahhutu) gelir.
-- CompletionPercent PRPS'te standart alan degildir; ilerleme analizi (CNE5) yoksa bos birakilmali.
 
 
 

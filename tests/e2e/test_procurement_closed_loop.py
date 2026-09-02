@@ -1,7 +1,7 @@
 """Uctan uca guvenli satinalma kapali cevrimi kabul testi.
 
 Akis:
-    malzeme ana verisi -> gercek ATP -> MRP shortage -> tedarikci skoru ->
+    malzeme ana verisi -> MRP shortage -> tedarikci skoru ->
     PR prepare (yazmaz) -> onay -> PR submit (idempotent) -> read-after-write ->
     audit zinciri
 
@@ -27,6 +27,7 @@ def _tools_loaded():
 @pytest.fixture
 def writer_ctx(settings, purchaser):
     """Gercek yazma acik (SAP_DRY_RUN=false) satinalmaci baglami."""
+    object.__setattr__(settings.sap, "read_only", False)
     object.__setattr__(settings.sap, "dry_run", False)
     return ToolContext(settings=settings, sap=build_backend(settings), actor=purchaser)
 
@@ -43,28 +44,9 @@ def test_sap_demand_to_verified_requisition(writer_ctx, run_tool, grant_approval
     assert material["material_id"] == material_id
     assert material["price"] > 0
 
-    # --- 3. Gercek ATP: taahhut tarihini SAP'tan al
-    atp = run_tool(
-        "sap_atp_check",
-        ctx,
-        requests=[
-            {
-                "material_id": material_id,
-                "quantity": 30,
-                "required_date": "2026-09-15",
-            }
-        ],
-    )
-    row = atp["results"][0]
-    assert row["schedule_lines"], "ATP teyit satirlari olmadan termin verilemez"
-    assert row["full_confirmation_date"]
-
-    # --- 4. Eksik varsa nedenini acikla
-    if atp["shortage_count"]:
-        shortage = run_tool(
-            "sap_mrp_shortage_explain", ctx, material_id=material_id
-        )
-        assert shortage["interpretation"]
+    # --- 3. Eksigin kaynagini SAP arz/talep elementlerinden acikla
+    shortage = run_tool("sap_mrp_shortage_explain", ctx, material_id=material_id)
+    assert shortage["interpretation"]
 
     # --- 5. Tedarikci degerlendirmesi
     vendors = run_tool("sap_compare_vendors", ctx, material_id=material_id, quantity=30)
@@ -277,6 +259,7 @@ def test_unknown_outcome_requires_review_when_nothing_was_created(
 
 def test_dry_run_environment_blocks_real_write(settings, purchaser, run_tool, grant_approval):
     """SAP_DRY_RUN=true iken onay gecse bile SAP'a yazilmaz."""
+    object.__setattr__(settings.sap, "read_only", False)
     object.__setattr__(settings.sap, "dry_run", True)
     ctx = ToolContext(settings=settings, sap=build_backend(settings), actor=purchaser)
     items = [{"material_id": "SFT-SCN-270", "quantity": 4, "wbs_element": PROJECT}]

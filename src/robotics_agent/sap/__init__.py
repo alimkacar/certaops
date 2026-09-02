@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 from ..config import Settings, get_settings
+from . import schema_cache
 from .base import SAPBackend, SAPError
 
 log = logging.getLogger(__name__)
@@ -51,6 +52,16 @@ def reset_backend() -> None:
     if _backend is not None:
         _backend.close()
     _backend = None
+    # Sema onbellegi de dusurulur: baglanti ya da ayar degistiginde eski
+    # sistemin `$metadata`si ve V4/V2 karari tasinmamali.
+    schema_cache.clear()
 
 
-__all__ = ["SAPBackend", "SAPError", "build_backend", "get_backend", "reset_backend"]
+__all__ = [
+    "SAPBackend",
+    "SAPError",
+    "build_backend",
+    "get_backend",
+    "reset_backend",
+    "schema_cache",
+]

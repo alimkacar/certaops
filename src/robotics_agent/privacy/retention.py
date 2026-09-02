@@ -14,6 +14,7 @@ kayitlari diskte kalabilir. Bu modul su garantileri uygular:
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -22,6 +23,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+_SQL_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 __all__ = [
     "RETENTION_POLICY",
@@ -47,6 +50,12 @@ class RetentionRule:
     # kaydin olusma anini mi (sessions.last_seen)? Ilkinde esik `simdi`dir,
     # ikincisinde `simdi - max_age`.
     absolute_expiry: bool = False
+
+    def __post_init__(self) -> None:
+        """SQL yapisina giren adlari yalniz guvenli tanimlayicilarla sinirla."""
+        for label, value in (("table", self.table), ("timestamp_column", self.timestamp_column)):
+            if not _SQL_IDENTIFIER.fullmatch(value):
+                raise ValueError(f"Gecersiz SQL tanimlayicisi ({label}).")
 
     @property
     def active(self) -> bool:
@@ -204,8 +213,9 @@ class RetentionSweeper:
             with self._db.write() as conn:
                 if not _table_exists(conn, rule.table):
                     return 0, 0
+                # SQL tanimlayicilari RetentionRule.__post_init__ icinde dogrulanir.
                 rows = conn.execute(
-                    f"SELECT rowid FROM {rule.table} "  # noqa: S608 - tablo adi sabit listeden
+                    f"SELECT rowid FROM {rule.table} "  # nosec B608
                     f"WHERE {rule.timestamp_column} IS NOT NULL "
                     f"AND {rule.timestamp_column} < ? LIMIT ?",
                     (cutoff, self._batch_size),
@@ -215,7 +225,8 @@ class RetentionSweeper:
                 ids = [row[0] for row in rows]
                 placeholders = ",".join("?" for _ in ids)
                 conn.execute(
-                    f"DELETE FROM {rule.table} WHERE rowid IN ({placeholders})",  # noqa: S608
+                    # `table` dogrulanir; placeholder sayisi satir sayisindan uretilir.
+                    f"DELETE FROM {rule.table} WHERE rowid IN ({placeholders})",  # nosec B608
                     ids,
                 )
                 total += len(ids)

@@ -1,0 +1,464 @@
+{
+  "scenario": {
+    "id": "CERTAOPS-P2P-001",
+    "title": "Shortage to blocked-invoice purchase-to-pay flow",
+    "description": "A raw material shortage triggers sourcing, a purchase requisition, a partially delivered purchase order, a quantity-blocked invoice and a project cost impact.",
+    "as_of_date": "2026-08-25",
+    "company_code": "T100",
+    "plant": "T110",
+    "purchasing_organization": "T100",
+    "purchasing_group": "T01",
+    "currency": "USD"
+  },
+  "seeds": {
+    "material": "CERTA-RAW-001",
+    "vendor": "SUP-100",
+    "po": "4500001001",
+    "invoice": "5100001001"
+  },
+  "entity_sets": {
+    "MaterialSet": [
+      {
+        "Material": "CERTA-RAW-001",
+        "Plant": "T110",
+        "MaterialDescription": "Precision drive bearing",
+        "MaterialType": "ROH",
+        "MaterialGroup": "BEARING",
+        "BaseUnit": "EA",
+        "GrossWeight": 2.4,
+        "ProcurementType": "F",
+        "PlannedDeliveryDays": 10,
+        "MinimumLotSize": 10,
+        "MRPController": "001",
+        "ABCIndicator": "A",
+        "SafetyStock": 15,
+        "MovingAveragePrice": 12.5,
+        "StandardPrice": 12.0,
+        "PriceUnit": 1,
+        "Currency": "USD"
+      },
+      {
+        "Material": "CERTA-RAW-002",
+        "Plant": "T110",
+        "MaterialDescription": "Standard mounting bracket",
+        "MaterialType": "ROH",
+        "MaterialGroup": "BRACKET",
+        "BaseUnit": "EA",
+        "GrossWeight": 0.8,
+        "ProcurementType": "F",
+        "PlannedDeliveryDays": 5,
+        "MinimumLotSize": 20,
+        "MRPController": "001",
+        "ABCIndicator": "B",
+        "SafetyStock": 20,
+        "MovingAveragePrice": 4.8,
+        "StandardPrice": 5.0,
+        "PriceUnit": 1,
+        "Currency": "USD"
+      }
+    ],
+    "MaterialDescriptionSet": [
+      {
+        "Material": "CERTA-RAW-001",
+        "Language": "EN",
+        "MaterialDescription": "Precision drive bearing"
+      },
+      {
+        "Material": "CERTA-RAW-002",
+        "Language": "EN",
+        "MaterialDescription": "Standard mounting bracket"
+      }
+    ],
+    "MaterialClassSet": [
+      {
+        "Material": "CERTA-RAW-001",
+        "ClassType": "001",
+        "ClassName": "MECHANICAL_COMPONENT"
+      }
+    ],
+    "MaterialCharcValueSet": [
+      {
+        "Material": "CERTA-RAW-001",
+        "ClassType": "001",
+        "Characteristic": "payload_kg",
+        "CharcValue": 250,
+        "CharcValueUnit": "KG"
+      },
+      {
+        "Material": "CERTA-RAW-001",
+        "ClassType": "001",
+        "Characteristic": "inner_diameter_mm",
+        "CharcValue": 40,
+        "CharcValueUnit": "MM"
+      }
+    ],
+    "MaterialValuationSet": [
+      {
+        "Material": "CERTA-RAW-001",
+        "ValuationArea": "T110",
+        "MovingAveragePrice": 12.5,
+        "StandardPrice": 12.0,
+        "PriceUnit": 1,
+        "PriceControl": "V",
+        "Currency": "USD"
+      },
+      {
+        "Material": "CERTA-RAW-002",
+        "ValuationArea": "T110",
+        "MovingAveragePrice": 4.8,
+        "StandardPrice": 5.0,
+        "PriceUnit": 1,
+        "PriceControl": "S",
+        "Currency": "USD"
+      }
+    ],
+    "StockSet": [
+      {
+        "Material": "CERTA-RAW-001",
+        "Plant": "T110",
+        "StorageLocation": "0001",
+        "UnrestrictedQuantity": 20,
+        "QualityInspectionQuantity": 5,
+        "BlockedQuantity": 0,
+        "SafetyStock": 15,
+        "BaseUnit": "EA"
+      },
+      {
+        "Material": "CERTA-RAW-001",
+        "Plant": "T110",
+        "StorageLocation": "0002",
+        "UnrestrictedQuantity": 0,
+        "QualityInspectionQuantity": 0,
+        "BlockedQuantity": 3,
+        "SafetyStock": 15,
+        "BaseUnit": "EA"
+      },
+      {
+        "Material": "CERTA-RAW-002",
+        "Plant": "T110",
+        "StorageLocation": "0001",
+        "UnrestrictedQuantity": 200,
+        "QualityInspectionQuantity": 0,
+        "BlockedQuantity": 0,
+        "SafetyStock": 20,
+        "BaseUnit": "EA"
+      }
+    ],
+    "SupplyDemandSet": [
+      {
+        "Material": "CERTA-RAW-001",
+        "Plant": "T110",
+        "MRPElement": "WB",
+        "MRPElementId": "STOCK-T110",
+        "AvailabilityDate": "2026-08-25T00:00:00",
+        "Quantity": 20,
+        "BaseUnit": "EA",
+        "ElementDescription": "Unrestricted plant stock",
+        "WBSElement": ""
+      },
+      {
+        "Material": "CERTA-RAW-001",
+        "Plant": "T110",
+        "MRPElement": "AR",
+        "MRPElementId": "RES-0001",
+        "AvailabilityDate": "2026-09-10T00:00:00",
+        "Quantity": -80,
+        "BaseUnit": "EA",
+        "ElementDescription": "Project reservation",
+        "WBSElement": "PRJ-001"
+      },
+      {
+        "Material": "CERTA-RAW-001",
+        "Plant": "T110",
+        "MRPElement": "BE",
+        "MRPElementId": "4500001001-00010",
+        "AvailabilityDate": "2026-09-18T00:00:00",
+        "Quantity": 40,
+        "BaseUnit": "EA",
+        "ElementDescription": "Open purchase order quantity",
+        "WBSElement": "PRJ-001"
+      }
+    ],
+    "InfoRecordSet": [
+      {
+        "InfoRecord": "5300001001",
+        "Material": "CERTA-RAW-001",
+        "Supplier": "SUP-100",
+        "SupplierName": "Atlas Precision Supply",
+        "PurchasingOrganization": "T100",
+        "Plant": "T110",
+        "NetPrice": 12.5,
+        "Currency": "USD",
+        "PriceUnit": 1,
+        "MinimumQuantity": 10,
+        "PlannedDeliveryDays": 10,
+        "Incoterms": "DAP",
+        "PaymentTerms": "NT30",
+        "ValidTo": "2027-12-31T00:00:00",
+        "DeletionIndicator": ""
+      },
+      {
+        "InfoRecord": "5300001002",
+        "Material": "CERTA-RAW-001",
+        "Supplier": "SUP-200",
+        "SupplierName": "Budget Industrial Parts",
+        "PurchasingOrganization": "T100",
+        "Plant": "T110",
+        "NetPrice": 11.8,
+        "Currency": "USD",
+        "PriceUnit": 1,
+        "MinimumQuantity": 20,
+        "PlannedDeliveryDays": 20,
+        "Incoterms": "EXW",
+        "PaymentTerms": "NT45",
+        "ValidTo": "2027-12-31T00:00:00",
+        "DeletionIndicator": ""
+      }
+    ],
+    "InfoRecordScaleSet": [
+      {
+        "InfoRecord": "5300001001",
+        "ScaleQuantity": 100,
+        "ScalePrice": 12.1
+      },
+      {
+        "InfoRecord": "5300001002",
+        "ScaleQuantity": 100,
+        "ScalePrice": 11.5
+      }
+    ],
+    "SupplierSet": [
+      {
+        "Supplier": "SUP-100",
+        "SupplierName": "Atlas Precision Supply",
+        "Country": "US",
+        "City": "Chicago",
+        "PurchasingBlock": "",
+        "DeletionIndicator": ""
+      },
+      {
+        "Supplier": "SUP-200",
+        "SupplierName": "Budget Industrial Parts",
+        "Country": "US",
+        "City": "Detroit",
+        "PurchasingBlock": "",
+        "DeletionIndicator": ""
+      }
+    ],
+    "SupplierScoreSet": [
+      {
+        "Supplier": "SUP-100",
+        "PurchasingOrganization": "T100",
+        "OverallScore": 92,
+        "PriceScore": 84,
+        "QualityScore": 97,
+        "DeliveryScore": 95,
+        "ServiceScore": 91,
+        "EvaluationPeriod": "2026-H1"
+      },
+      {
+        "Supplier": "SUP-200",
+        "PurchasingOrganization": "T100",
+        "OverallScore": 78,
+        "PriceScore": 96,
+        "QualityScore": 76,
+        "DeliveryScore": 68,
+        "ServiceScore": 72,
+        "EvaluationPeriod": "2026-H1"
+      }
+    ],
+    "PurchaseRequisitionSet": [
+      {
+        "PurchaseRequisition": "1000001001",
+        "DocumentType": "NB",
+        "HeaderText": "CERTAOPS baseline shortage request",
+        "IdempotencyKey": "fixture:pr:1000001001",
+        "CreatedBy": "DEVELOPER",
+        "CreationDate": "2026-08-20T00:00:00"
+      }
+    ],
+    "PurchaseRequisitionItemSet": [
+      {
+        "PurchaseRequisition": "1000001001",
+        "PurchaseRequisitionItem": "00010",
+        "Material": "CERTA-RAW-001",
+        "Plant": "T110",
+        "Quantity": 100,
+        "BaseUnit": "EA",
+        "DeliveryDate": "2026-09-10T00:00:00",
+        "PurchasingGroup": "T01",
+        "PurchasingOrganization": "T100",
+        "CompanyCode": "T100",
+        "Price": 12.5,
+        "Currency": "USD",
+        "FixedSupplier": "SUP-100",
+        "ItemText": "Replenish shortage for PRJ-001",
+        "WBSElement": "PRJ-001",
+        "CostCenter": "",
+        "DeletionIndicator": ""
+      }
+    ],
+    "IdempotencySet": [
+      {
+        "IdempotencyKey": "fixture:pr:1000001001",
+        "ObjectType": "PURCHASE_REQUISITION",
+        "ObjectId": "1000001001",
+        "CreatedAt": "2026-08-20T08:30:00",
+        "CreatedBy": "DEVELOPER"
+      }
+    ],
+    "PurchaseOrderSet": [
+      {
+        "PurchaseOrder": "4500001001",
+        "Supplier": "SUP-100",
+        "SupplierName": "Atlas Precision Supply",
+        "CreationDate": "2026-08-21T00:00:00",
+        "DocumentCurrency": "USD",
+        "CompanyCode": "T100",
+        "PurchasingOrganization": "T100"
+      }
+    ],
+    "PurchaseOrderItemSet": [
+      {
+        "PurchaseOrder": "4500001001",
+        "PurchaseOrderItem": "00010",
+        "Material": "CERTA-RAW-001",
+        "Plant": "T110",
+        "ItemText": "Precision drive bearing",
+        "Quantity": 100,
+        "BaseUnit": "EA",
+        "NetPrice": 12.5,
+        "NetValue": 1250,
+        "PriceUnit": 1,
+        "DeliveredQuantity": 60,
+        "InvoicedQuantity": 70,
+        "GoodsReceiptIndicator": "X",
+        "InvoiceReceiptIndicator": "X",
+        "DeletionIndicator": "",
+        "AccountAssignmentCategory": "P",
+        "WBSElement": "PRJ-001",
+        "PurchaseRequisition": "1000001001",
+        "PurchaseRequisitionItem": "00010"
+      }
+    ],
+    "ScheduleLineSet": [
+      {
+        "PurchaseOrder": "4500001001",
+        "PurchaseOrderItem": "00010",
+        "ScheduleLine": "0001",
+        "DeliveryDate": "2026-09-10T00:00:00",
+        "ConfirmedDate": "2026-09-12T00:00:00",
+        "ScheduleQuantity": 60,
+        "DeliveredQuantity": 60,
+        "BaseUnit": "EA"
+      },
+      {
+        "PurchaseOrder": "4500001001",
+        "PurchaseOrderItem": "00010",
+        "ScheduleLine": "0002",
+        "DeliveryDate": "2026-09-18T00:00:00",
+        "ConfirmedDate": "2026-09-18T00:00:00",
+        "ScheduleQuantity": 40,
+        "DeliveredQuantity": 0,
+        "BaseUnit": "EA"
+      }
+    ],
+    "PurchaseOrderHistorySet": [
+      {
+        "PurchaseOrder": "4500001001",
+        "PurchaseOrderItem": "00010",
+        "HistoryCategory": "E",
+        "MaterialDocument": "5000001001",
+        "MaterialDocumentYear": "2026",
+        "MaterialDocumentItem": "0001",
+        "PostingDate": "2026-09-12T00:00:00",
+        "Quantity": 60,
+        "Amount": 750,
+        "Currency": "USD",
+        "MovementType": "101",
+        "DebitCreditIndicator": "S",
+        "ReferenceDocument": ""
+      },
+      {
+        "PurchaseOrder": "4500001001",
+        "PurchaseOrderItem": "00010",
+        "HistoryCategory": "Q",
+        "MaterialDocument": "",
+        "MaterialDocumentYear": "2026",
+        "MaterialDocumentItem": "0001",
+        "PostingDate": "2026-09-13T00:00:00",
+        "Quantity": 70,
+        "Amount": 875,
+        "Currency": "USD",
+        "MovementType": "",
+        "DebitCreditIndicator": "S",
+        "ReferenceDocument": "5100001001"
+      }
+    ],
+    "GoodsReceiptSet": [
+      {
+        "MaterialDocument": "5000001001",
+        "MaterialDocumentYear": "2026",
+        "MaterialDocumentItem": "0001",
+        "PostingDate": "2026-09-12T00:00:00",
+        "MovementType": "101",
+        "Material": "CERTA-RAW-001",
+        "Plant": "T110",
+        "Quantity": 60,
+        "BaseUnit": "EA",
+        "PurchaseOrder": "4500001001",
+        "PurchaseOrderItem": "00010",
+        "Batch": "BATCH-2609-A"
+      }
+    ],
+    "SupplierInvoiceSet": [
+      {
+        "SupplierInvoice": "5100001001",
+        "FiscalYear": "2026",
+        "Supplier": "SUP-100",
+        "SupplierName": "Atlas Precision Supply",
+        "CompanyCode": "T100",
+        "DocumentDate": "2026-09-13T00:00:00",
+        "PostingDate": "2026-09-13T00:00:00",
+        "DueDate": "2026-10-13T00:00:00",
+        "GrossAmount": 875,
+        "NetAmount": 875,
+        "TaxAmount": 0,
+        "Currency": "USD",
+        "InvoiceStatus": "BLOCKED",
+        "PaymentBlock": "R",
+        "PaymentTerms": "NT30",
+        "ClearingDate": null,
+        "AccountingDocument": ""
+      }
+    ],
+    "SupplierInvoiceItemSet": [
+      {
+        "SupplierInvoice": "5100001001",
+        "FiscalYear": "2026",
+        "InvoiceItem": "0001",
+        "PurchaseOrder": "4500001001",
+        "PurchaseOrderItem": "00010",
+        "Quantity": 70,
+        "Amount": 875,
+        "Currency": "USD"
+      }
+    ],
+    "InvoiceBlockSet": [
+      {
+        "SupplierInvoice": "5100001001",
+        "FiscalYear": "2026",
+        "InvoiceItem": "0001",
+        "BlockReason": "Invoice quantity exceeds received quantity",
+        "ToleranceKey": "DQ",
+        "ExpectedValue": 60,
+        "ActualValue": 70,
+        "ToleranceLimitAbsolute": 2,
+        "ToleranceLimitPercent": 5,
+        "Currency": "USD",
+        "PurchaseOrder": "4500001001",
+        "PurchaseOrderItem": "00010"
+      }
+    ]
+  }
+}

@@ -62,18 +62,6 @@ def run_demo() -> int:
     master = call(ctx, "sap_material_360", material_id=material, detail="summary")
     print(f"\nAna veri: {material} | {master['description']} | fiyat {master['price']:,.2f} {master['currency']}")
 
-    atp = call(
-        ctx,
-        "sap_atp_check",
-        requests=[{"material_id": material, "quantity": 4, "required_date": "2026-10-15"}],
-    )
-    row = atp["results"][0]
-    print(
-        "ATP: "
-        f"istenen {row['requested_qty']:g}, teyit {row['confirmed_qty']:g}, "
-        f"tam teyit {row.get('full_confirmation_date', '-') }"
-    )
-
     suppliers = call(ctx, "sap_compare_vendors", material_id=material, quantity=4)
     best = suppliers["recommendation"]["best_tco_vendor"]
     print(f"Tedarik: en iyi TCO tedarikcisi {best}")
@@ -91,24 +79,24 @@ def run_demo() -> int:
         f"PR prepare: {prepared['total_value']:,.2f} {prepared['currency']} | "
         f"onay gerekli: {prepared['requires_human_approval']} | SAP'a yazildi: {prepared['written_to_sap']}"
     )
-    submitted = call(
-        ctx,
-        "sap_pr_submit",
-        items=items,
-        header_text="SAP multi-agent demo",
-        idempotency_key="DEMO:SFT-SCN-270:pr:v3",
-    )
-    print(
-        f"PR submit: {submitted['write_status']} | "
-        f"belge: {submitted.get('business_object_id', '-')} | verified: {submitted.get('verified', False)}"
-    )
-
-    finance = call(ctx, "sap_project_cost_status", wbs_element="R-2026-014")
-    summary = finance["portfolio_summary"]
-    print(
-        f"WBS finans: plan {summary['total_plan']:,.0f}, fiili {summary['total_actual']:,.0f}, "
-        f"EAC {summary['total_eac']:,.0f} {finance['currency']}"
-    )
+    if (
+        not ctx.settings.sap.read_only
+        and "sap_pr_submit" not in ctx.settings.security.disabled_tools
+    ):
+        submitted = call(
+            ctx,
+            "sap_pr_submit",
+            items=items,
+            header_text="SAP multi-agent demo",
+            idempotency_key="DEMO:SFT-SCN-270:pr:v3",
+        )
+        print(
+            f"PR submit: {submitted['write_status']} | "
+            f"belge: {submitted.get('business_object_id', '-')} | "
+            f"verified: {submitted.get('verified', False)}"
+        )
+    else:
+        print("PR submit: atlandi (read-only urun profili/operator kill-switch)")
 
     # --- Salt-okunur procure-to-pay gorunurlugu ----------------------------
     print("\nProcure-to-pay gorunurlugu:")
@@ -135,14 +123,6 @@ def run_demo() -> int:
         f"  Blokaj nedeni: fiyat farki %{price['variance_pct']:.2f} "
         f"(tolerans %{price['tolerance_limit_pct']:.0f}, anahtar {price['tolerance_key']})"
     )
-
-    workflow = call(
-        ctx, "sap_workflow_status",
-        object_type="purchase_requisition", object_id="0010004801",
-    )
-    step = workflow["current_step"]
-    # `processor_name` DLP tarafindan maskelenir; karar icin rol yeterlidir.
-    print(f"  Onay: '{step['name']}' adiminda {step['role']} tarafinda {step['waiting_days']} gun")
 
     assert ctx.audit
     print(f"\nAudit zinciri: {ctx.audit.verify()}")

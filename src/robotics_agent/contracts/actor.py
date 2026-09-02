@@ -77,6 +77,10 @@ SCOPE_DATA_CONFIDENTIAL = "sap.data.confidential"  # D2 okuma
 SCOPE_DATA_RESTRICTED = "sap.data.restricted"  # D3 okuma (JIT verilir)
 SCOPE_EXPORT_CONFIDENTIAL = "sap.export.confidential"  # D2/D3 disa aktarim
 SCOPE_PRIVACY_ADMIN = "privacy.admin"  # saklama/purge/DLP yonetimi
+# Calisma zamani platform yapilandirmasi (mode, dry_run, onay gecidi, DLP modu).
+# SAP yazma kapsamlariyla ayni principal uzerinde BULUSMAMALIDIR: kapiyi
+# gevsetebilen kisi ayni anda o kapinin ardina yazamamalidir.
+SCOPE_PLATFORM_CONFIG = "platform.config"
 
 ALL_SCOPES: frozenset[str] = frozenset(
     {
@@ -94,6 +98,7 @@ ALL_SCOPES: frozenset[str] = frozenset(
         SCOPE_DATA_RESTRICTED,
         SCOPE_EXPORT_CONFIDENTIAL,
         SCOPE_PRIVACY_ADMIN,
+        SCOPE_PLATFORM_CONFIG,
     }
 )
 
@@ -127,7 +132,9 @@ ROLE_SCOPES: dict[str, frozenset[str]] = {
     "AUDITOR": frozenset(
         {SCOPE_PLATFORM_READ, SCOPE_SAP_READ, SCOPE_AUDIT_READ, SCOPE_DATA_CONFIDENTIAL}
     ),
-    "PLATFORM_ADMIN": frozenset({SCOPE_PLATFORM_READ, SCOPE_AUDIT_READ}),
+    "PLATFORM_ADMIN": frozenset(
+        {SCOPE_PLATFORM_READ, SCOPE_AUDIT_READ, SCOPE_PLATFORM_CONFIG}
+    ),
     "PRIVACY_ADMIN": frozenset({SCOPE_PLATFORM_READ, SCOPE_AUDIT_READ, SCOPE_PRIVACY_ADMIN}),
 }
 

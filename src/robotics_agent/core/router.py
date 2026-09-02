@@ -78,9 +78,13 @@ PACKS: dict[str, DomainPack] = {
         title="Malzeme ana verisi",
         domains=("master_data",),
         triggers=(
-            "malzeme",
-            "material",
-            "urun",
+            "malzeme bilgisi",
+            "malzeme detayi",
+            "numarali malzeme",
+            "material details",
+            "urun bilgisi",
+            "urun detayi",
+            "ana veri",
             "stok karti",
             "siniflandirma",
             "karakteristik",
@@ -96,9 +100,7 @@ PACKS: dict[str, DomainPack] = {
         domains=("planning", "procurement_read"),
         triggers=(
             "stok",
-            "atp",
             "mrp",
-            "bulunabilirlik",
             "termin",
             "tedarikci",
             "vendor",
@@ -109,15 +111,14 @@ PACKS: dict[str, DomainPack] = {
             "gecikme",
             "eksik",
             "shortage",
-            "teyit",
         ),
-        description="ATP, MRP shortage, tedarikci skoru, TCO ve siparis takibi.",
+        description="Stok, MRP shortage, tedarikci skoru, TCO ve siparis takibi.",
     ),
     "procurement_write": DomainPack(
         key="procurement_write",
         title="Satinalma (yazma)",
         domains=("procurement_write",),
-        # Yazma akisi ATP/tedarikci okumasina ihtiyac duyar; malzeme arama ise
+        # Yazma akisi stok/tedarikci okumasina ihtiyac duyar; malzeme arama ise
         # bu asamada gerekmez (numaralar zaten belirlenmis olur). Ana veri ayri
         # profile birakilir; bu, yazma profilinin sema butcesini
         # (`BUDGET_SCHEMA_TOKENS`, varsayilan 4.000) icinde tutar. Olculen deger
@@ -130,7 +131,6 @@ PACKS: dict[str, DomainPack] = {
             "pr olustur",
             "requisition",
             "siparis ac",
-            "onay",
             "submit",
         ),
         description="PR hazirlama/gonderme ve degisiklik dogrulama.",
@@ -161,21 +161,6 @@ PACKS: dict[str, DomainPack] = {
         ),
         description="PR-PO-mal kabul-fatura zinciri ve siparis 360 gorunumu.",
     ),
-    "p2p_approval": DomainPack(
-        key="p2p_approval",
-        title="Onay is akisi durumu",
-        domains=("p2p_approval",),
-        triggers=(
-            "onayda",
-            "onay bekliyor",
-            "kimde bekliyor",
-            "is akisi",
-            "workflow",
-            "serbest birakma",
-            "release",
-        ),
-        description="Onayin hangi adimda, kimde ve neden bekledigi.",
-    ),
     "p2p_finance": DomainPack(
         key="p2p_finance",
         title="Tedarikci faturasi ve blokaj",
@@ -193,25 +178,6 @@ PACKS: dict[str, DomainPack] = {
             "fiyat farki",
         ),
         description="Fatura muhasebe/odeme durumu ve tolerans blokaji aciklamasi.",
-    ),
-    "project_finance": DomainPack(
-        key="project_finance",
-        title="Proje ve finans",
-        domains=("project_finance",),
-        triggers=(
-            "maliyet",
-            "butce",
-            "marj",
-            "wbs",
-            "proje",
-            "eac",
-            "nakit",
-            "asim",
-            "kontrolling",
-            "forecast",
-            "sap proje maliyeti",
-        ),
-        description="Maliyet tahmini, butce projeksiyonu ve WBS finansal durumu.",
     ),
     "reporting": DomainPack(
         key="reporting",
@@ -232,6 +198,39 @@ _TR_MAP = str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosuCGIOSU")
 
 def _normalize(text: str) -> str:
     return text.translate(_TR_MAP).lower()
+
+
+#: Kelime sinirlarini bulmak icin: harf/rakam disi her sey ayirici sayilir.
+_WORD_RE = re.compile(r"[0-9a-z]+")
+
+#: Bu uzunlugun altindaki tetikleyici kelimeleri ek almis kabul edilmez ve
+#: TAM eslesme aranir. Aksi halde "403" gibi kisa bir tetikleyici
+#: "4031234" icinde eslesir ve yanlis pack acilir.
+_MIN_PREFIX_LEN = 4
+
+
+def _trigger_hits(trigger: str, words: list[str]) -> bool:
+    """Tetikleyici mesajda geciyor mu? Turkce ekleri tolere eder.
+
+    Duz alt-dize eslesmesi Turkce'de kirilir: "siparis durumu" tetikleyicisi
+    "siparisinin durumu" icinde GECMEZ, cunku araya cekim eki girer. Bu da
+    kullanicinin dogal cumlesinde dogru pack'in acilmamasina ve modelin
+    yanlis tool'u secmesine yol acar.
+
+    Cozum: tetikleyicinin her kelimesi, mesajdaki bir kelimenin ONEKI olmali.
+    "siparis" -> "siparisinin" oneki oldugu icin eslesir. Kisa kelimelerde
+    (< `_MIN_PREFIX_LEN`) yanlis pozitifi onlemek icin tam eslesme aranir.
+    """
+    parcalar = _WORD_RE.findall(_normalize(trigger))
+    if not parcalar:
+        return False
+    for parca in parcalar:
+        if len(parca) < _MIN_PREFIX_LEN:
+            if parca not in words:
+                return False
+        elif not any(kelime.startswith(parca) for kelime in words):
+            return False
+    return True
 
 
 @dataclass
@@ -265,6 +264,7 @@ def route(message: str, actor: ActorContext, *, max_packs: int = 2) -> RoutingDe
     hedefini netlestirmesi beklenir. Mutating pack asla varsayilan acilmaz.
     """
     normalized = _normalize(message or "")
+    words = _WORD_RE.findall(normalized)
     scores: list[tuple[int, str, tuple[str, ...]]] = []
 
     for key, pack in PACKS.items():
@@ -272,7 +272,7 @@ def route(message: str, actor: ActorContext, *, max_packs: int = 2) -> RoutingDe
             continue
         if not _actor_may_open(pack.key, actor):
             continue
-        hits = tuple(t for t in pack.triggers if _normalize(t) in normalized)
+        hits = tuple(t for t in pack.triggers if _trigger_hits(t, words))
         if hits:
             scores.append((len(hits), key, hits))
 

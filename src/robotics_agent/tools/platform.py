@@ -15,6 +15,7 @@ from ..adapters.sap import (
     explain_authorization_failure,
     parse_sap_error,
 )
+from ..cache import CachePolicy
 from ..contracts import (
     DETAIL_SCHEMA,
     SCOPE_AUDIT_READ,
@@ -27,10 +28,21 @@ from ..contracts import (
 )
 from ..core import plan_agents
 from ..core.domain_profiles import PACK_TO_AGENT, subsumed_packs
+from ..privacy import DataClass
 from .registry import ToolContext, tool
 
-
 # ---------------------------------------------------------------------------
+#: Servis manifesti ve `$metadata` kontratlari transport import'uyla degisir,
+#: dakikadan dakikaya degil. Bu tool 14 ayri `$metadata` GET'i yapiyor ve
+#: olculen suresi ~5 saniye; bir saatlik TTL onu turun disina cikarir.
+_CAPABILITY_CACHE = CachePolicy(
+    ttl_seconds=3600,
+    vary_by=("tenant",),
+    max_class=DataClass.D1,
+    subject_bound=False,
+)
+
+
 @tool(
     name="sap_discover_capabilities",
     group="platform",
@@ -60,6 +72,7 @@ from .registry import ToolContext, tool
         },
         "required": [],
     },
+    cache_policy=_CAPABILITY_CACHE,
 )
 def sap_discover_capabilities(
     ctx: ToolContext,

@@ -16,7 +16,8 @@ import logging
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
-from xml.etree import ElementTree
+
+from defusedxml import ElementTree
 
 log = logging.getLogger(__name__)
 
@@ -128,24 +129,6 @@ CAPABILITY_MANIFEST: dict[str, ServiceCapability] = {
                 "StorageLocation",
                 "InventoryStockType",
                 "MatlWrhsStkQtyInMatlBaseUnit",
-            )
-        },
-    ),
-    "availability": ServiceCapability(
-        alias="availability",
-        service_path="/sap/opu/odata4/sap/api_productavailyinfo/srvd_a2x/sap/productavailabilityinfo/0001",
-        odata_version="v4",
-        purpose="Gercek ATP: tarih ve miktar bazli teyit (API_PRODUCT_AVAILY_INFO)",
-        entity_sets=("ProductAvailabilityInformation", "AvailabilitySituation"),
-        doc_url="https://api.sap.com/api/API_PRODUCT_AVAILY_INFO",
-        critical_properties={
-            "ProductAvailabilityInformation": (
-                "Product",
-                "Plant",
-                "RequestedQuantity",
-                "RequestedDeliveryDate",
-                "ConfirmedQuantity",
-                "ConfirmedDeliveryDate",
             )
         },
     ),
@@ -360,25 +343,6 @@ CAPABILITY_MANIFEST: dict[str, ServiceCapability] = {
                 "FiscalYear",
                 "TaxAmount",
             ),
-        },
-    ),
-    "project_cost": ServiceCapability(
-        alias="project_cost",
-        service_path="/sap/opu/odata/sap/ZAPI_PROJECT_COST_SRV",
-        odata_version="v2",
-        purpose="WBS plan/fiili/taahhut - released servis yok, kontrollu custom API",
-        entity_sets=("ProjectCostSet",),
-        status=STATUS_CUSTOM,
-        doc_url="https://help.sap.com/docs/ABAP_Cloud/abap-development-tools-user-guide/released-apis",
-        critical_properties={
-            "ProjectCostSet": (
-                "WBSElement",
-                "PlanCost",
-                "ActualCost",
-                "Commitment",
-                "FiscalYear",
-                "CompletionPercent",
-            )
         },
     ),
 }

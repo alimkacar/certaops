@@ -144,6 +144,16 @@ def test_missing_table_does_not_break_the_sweep(db):
     assert report.total_deleted == 0 and not report.errors
 
 
+def test_retention_rule_rejects_unsafe_sql_identifiers():
+    with pytest.raises(ValueError, match="Gecersiz SQL tanimlayicisi"):
+        RetentionRule(
+            name="unsafe",
+            max_age_minutes=10,
+            table="sessions; DROP TABLE sessions",
+            timestamp_column="last_seen",
+        )
+
+
 def test_audit_hook_receives_the_report(db):
     _seed_session(db, "eski", age_minutes=48 * 60)
     seen: list = []

@@ -48,6 +48,7 @@ def make_core(breaker: CircuitBreaker, handler) -> ODataHttpCore:
         allowed_hosts=("s4hana.example",),
         max_retries=1,
         csrf_enabled=False,
+        read_only=False,
         breaker=breaker,
         sleep=lambda _s: None,
     )

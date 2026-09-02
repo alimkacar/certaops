@@ -15,7 +15,7 @@ from robotics_agent.adapters.bpa import ApprovalRequest, LocalApprovalGateway
 from robotics_agent.config import Settings
 from robotics_agent.contracts import ActorContext
 from robotics_agent.core import approval_payload_for, reset_audit_cache, reset_state_db_cache
-from robotics_agent.sap import build_backend
+from robotics_agent.sap import build_backend, schema_cache
 from robotics_agent.tools import ToolContext, execute_tool, load_all_tools
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -30,7 +30,14 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
     """
     settings = Settings()
     object.__setattr__(settings.sap, "backend", "mock")
+    object.__setattr__(settings.sap, "read_only", True)
     object.__setattr__(settings.sap, "dry_run", True)
+    # Unit/eval testlerinin organizasyon kapsami da gelistiricinin `.env`
+    # dosyasindan sizmamali. Fixture actor'leri bu sabit test organizasyonuna
+    # yetkilidir; farkli kapsam senaryolari ilgili testte override edilir.
+    object.__setattr__(settings.sap, "company_code", "1000")
+    object.__setattr__(settings.sap, "plant", "1100")
+    object.__setattr__(settings.sap, "purch_org", "1000")
     object.__setattr__(settings.security, "allowed_sap_hosts", ())
     object.__setattr__(settings.security, "disabled_tools", ())
     object.__setattr__(settings, "output_dir", tmp_path / "out")
@@ -49,11 +56,17 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
 def _isolate_state(monkeypatch):
     """Test durumunu ve kullanicinin `.env` kill-switch'lerini izole eder."""
     monkeypatch.setenv("AGENT_DISABLED_TOOLS", "")
+    monkeypatch.setenv("SAP_READ_ONLY", "true")
     reset_state_db_cache()
     reset_audit_cache()
+    # `$metadata` ve V4/V2 karari surec genelinde paylasilir (performans).
+    # Testler arasi tasinmamali: bir testin sahte sistemi digerinin semasini
+    # belirlemesin.
+    schema_cache.clear()
     yield
     reset_state_db_cache()
     reset_audit_cache()
+    schema_cache.clear()
 
 
 @pytest.fixture(scope="function")
@@ -137,6 +150,7 @@ def ctx(settings, engineer) -> ToolContext:
 def buyer_ctx(settings, purchaser) -> ToolContext:
     """Yazma yetkisi olan satinalmaci baglami (SAP_DRY_RUN kapali)."""
     load_all_tools()
+    object.__setattr__(settings.sap, "read_only", False)
     object.__setattr__(settings.sap, "dry_run", False)
     return ToolContext(settings=settings, sap=build_backend(settings), actor=purchaser)
 

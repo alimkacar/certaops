@@ -30,6 +30,8 @@ from .contracts import (
     StopReason,
     ThinkingLevel,
     TokenUsage,
+    messages_from_dicts,
+    messages_to_dicts,
     redact_provider_state,
 )
 from .fake import FakeModelProvider
@@ -44,6 +46,8 @@ __all__ = [
     "ModelAuthError",
     "ModelBadRequestError",
     "ModelMessage",
+    "messages_from_dicts",
+    "messages_to_dicts",
     "ModelProvider",
     "ModelProviderError",
     "ModelRateLimitError",

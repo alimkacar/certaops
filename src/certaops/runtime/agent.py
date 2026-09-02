@@ -54,7 +54,7 @@ import inspect
 import json
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from robotics_agent.config import Settings, get_settings
@@ -67,7 +67,7 @@ from robotics_agent.core import (
     route,
     summarize_intent,
 )
-from robotics_agent.observability import TelemetryCollector
+from robotics_agent.observability import TelemetryCollector, log_context
 from robotics_agent.privacy import is_secret_field, sanitize_for_client, sanitize_text
 from robotics_agent.privacy.output import REDACTED as SECRET_REDACTED
 from robotics_agent.prompts import build_runtime_prompt, prompt_version
@@ -212,6 +212,22 @@ def _scrub(value: Any, *, actor: ActorContext, settings: Any, dlp: Any) -> Any:
     """
     if isinstance(value, str):
         return sanitize_text(value, actor=actor, sink="model", settings=settings, dlp=dlp)
+    if isinstance(value, ModelMessage):
+        # Oturum kaydindan geri yuklenen gecmis ModelMessage'dir; bu dal
+        # olmadan `_scrub` onu tanimayip DEGISTIRMEDEN geri dondururdu ve
+        # "guvenilmez gecmis temizlenir" garantisi kagit uzerinde kalirdi.
+        return replace(
+            value,
+            text=_scrub(value.text, actor=actor, settings=settings, dlp=dlp),
+            function_calls=tuple(
+                replace(c, arguments=_scrub(c.arguments, actor=actor, settings=settings, dlp=dlp))
+                for c in value.function_calls
+            ),
+            function_results=tuple(
+                replace(r, content=_scrub(r.content, actor=actor, settings=settings, dlp=dlp))
+                for r in value.function_results
+            ),
+        )
     if isinstance(value, dict):
         out: dict[Any, Any] = {}
         for key, item in value.items():
@@ -231,7 +247,7 @@ class SAPAgentRuntime:
     Kullanim::
 
         runtime = SAPAgentRuntime()
-        turn = runtime.chat("HD-GEAR-CSF25-100 icin ATP ve proje etkisi")
+        turn = runtime.chat("HD-GEAR-CSF25-100 icin stok ve tedarikci durumu")
         print(turn.text)
     """
 
@@ -283,9 +299,31 @@ class SAPAgentRuntime:
         # tek seferde temizlenmis metni vermek tercih edilir.
         self.stream = bool(stream) and _supports_streaming(self.provider)
 
-        self.messages: list[ModelMessage] = []
+        self._messages: list[ModelMessage] = []
+        #: Bu indeksten ONCEKI mesajlar bu surecte URETILMEDI: bir oturum
+        #: kaydindan yuklendiler ya da disaridan atandilar. Saglayiciya
+        #: gitmeden once yeniden temizlenirler (bkz. `_history_for_provider`).
+        self._untrusted_before = 0
         self.active_packs: list[str] = ["bootstrap"]
         self.last_routing: RoutingDecision | None = None
+
+    @property
+    def messages(self) -> list[ModelMessage]:
+        return self._messages
+
+    @messages.setter
+    def messages(self, value: list[ModelMessage]) -> None:
+        """Disaridan atanan gecmis GUVENILMEZ isaretlenir.
+
+        Kritik ayrinti: guven **koken** meselesidir, tip meselesi degil.
+        Onceki hali `isinstance(message, ModelMessage)` ile karar veriyordu;
+        oturum kaydi `messages_from_dicts()` ile geri yuklenmeye baslayinca
+        yuklenen kayitlar da ModelMessage oldu ve temizleme dali TAMAMEN
+        OLU KODA dondu - yorum "yeniden temizlenir" diyordu ama hicbir sey
+        temizlenmiyordu. Indeks tabanli isaret bu yanilgiyi ortadan kaldirir.
+        """
+        self._messages = list(value)
+        self._untrusted_before = len(self._messages)
 
     # --- Gorunurluk ---------------------------------------------------------
     def visible_tools(self) -> list[str]:
@@ -295,7 +333,9 @@ class SAPAgentRuntime:
         actor'un sahip oldugu kapsamlar. Yetkisi olmayan bir mutating tool
         modele **hic gosterilmez** - hem token hem saldiri yuzeyi azalir.
         """
-        return visible_tool_names(domains_for_packs(self.active_packs), self.actor)
+        return visible_tool_names(
+            domains_for_packs(self.active_packs), self.actor, settings=self.settings
+        )
 
     def _declarations(self, names: list[str]):
         return [REGISTRY[n].to_function_declaration() for n in names if n in REGISTRY]
@@ -455,17 +495,75 @@ class SAPAgentRuntime:
         match = match_shortcut(user_message)
         if match is None:
             return None
-        permitted = frozenset(visible_tool_names(_ALL_DOMAINS, self.actor))
+        permitted = frozenset(
+            visible_tool_names(_ALL_DOMAINS, self.actor, settings=self.settings)
+        )
         if match.tool not in permitted:
             return None
 
         payload, is_error = execute_tool(match.tool, match.arguments, self.ctx)
-        if is_error:
-            return None
         try:
             body = json.loads(payload)
         except ValueError:
-            return None
+            body = {}
+        if is_error:
+            # Niyet zaten kesin olarak tek bir salt-okunur SAP aracina
+            # eslesti. Tool hatasindan sonra modele dusmek hatayi duzeltemez;
+            # tersine SAP_CALL_BUDGET_EXCEEDED gibi asil nedeni bir provider
+            # rate-limit mesaji altinda gizler. Guvenli hata govdesini yerel
+            # olarak goster ve bu turda saglayiciyi hic cagirma.
+            error = str(body.get("error") or "SAP sorgusu tamamlanamadi.")
+            remediation = str(body.get("remediation") or "")
+            denial_code = str(body.get("denial_code") or "")
+            parts = [f"[SAP sorgusu tamamlanamadi: {error}"]
+            if denial_code:
+                parts.append(f" Kod: {denial_code}.")
+            if remediation:
+                parts.append(f" {remediation}")
+            parts.append("]")
+            text = "".join(parts)
+            text = sanitize_for_client(
+                text,
+                actor=self.actor,
+                settings=self.settings,
+                dlp=self.ctx.dlp,
+            )
+            assert self.ctx.audit
+            self.ctx.audit.append(
+                "turn.direct_answer",
+                execution=execution,
+                tool=match.tool,
+                outcome="error",
+                detail={
+                    "shortcut": match.shortcut.name,
+                    "reason": "shortcut_error",
+                    "denial_code": denial_code,
+                },
+                model="(atlandi)",
+                prompt_version=self.prompt_version,
+            )
+            self.messages.append(ModelMessage(role="user", text=user_message))
+            self.messages.append(ModelMessage(role="assistant", text=text))
+            return AgentTurn(
+                text=text,
+                tool_calls=[
+                    ToolCall(
+                        name=match.tool,
+                        arguments=match.arguments,
+                        result=payload,
+                        is_error=True,
+                    )
+                ],
+                execution_id=execution.execution_id,
+                correlation_id=execution.correlation_id,
+                active_packs=list(self.active_packs),
+                direct_answer=True,
+                direct_answer_reason="shortcut_error",
+                model_calls=0,
+                stop_reason="tool_error",
+                provider=self.provider.name,
+                model=self.provider.model,
+            )
         answer = direct_answer_for(match.tool, body, reason="shortcut")
         if answer is None:
             return None
@@ -507,13 +605,45 @@ class SAPAgentRuntime:
         on_tool_start: Callable[[str, dict], None] | None = None,
         on_tool_end: Callable[[str, bool], None] | None = None,
     ) -> AgentTurn:
-        """Kullanici mesajini isler ve nihai yaniti dondurur."""
+        """Kullanici mesajini isler ve nihai yaniti dondurur.
+
+        Ince bir sarmalayicidir: yurutme kimligini uretir, log baglamini
+        baglar ve isi `_chat`e devreder. Baglamanin burada olmasinin nedeni
+        turun **iki** cikisi olmasi (kisayol ve normal); baglami tek bir
+        `with` bloguna almak, cikislardan birinin baglami sizdirmasini
+        yapisal olarak imkansiz kilar.
+        """
         execution = ExecutionContext(
             actor=self.actor,
             system_alias=self.settings.sap.system_alias,
             channel=self.channel,
             dry_run=self.settings.sap.dry_run,
         )
+        with log_context(
+            correlation_id=execution.correlation_id,
+            execution_id=execution.execution_id,
+            tenant=self.actor.tenant,
+            subject=self.actor.subject,
+            channel=self.channel,
+        ):
+            return self._chat(
+                user_message,
+                execution,
+                on_text=on_text,
+                on_tool_start=on_tool_start,
+                on_tool_end=on_tool_end,
+            )
+
+    def _chat(
+        self,
+        user_message: str,
+        execution: ExecutionContext,
+        *,
+        on_text: Callable[[str], None] | None = None,
+        on_tool_start: Callable[[str, dict], None] | None = None,
+        on_tool_end: Callable[[str, bool], None] | None = None,
+    ) -> AgentTurn:
+        """Turun govdesi. `chat` disindan cagrilmaz: log baglami orada kurulur."""
         self.ctx.execution = execution
         metrics = self.telemetry.start_turn(
             execution_id=execution.execution_id,
@@ -615,15 +745,52 @@ class SAPAgentRuntime:
                     model=self.ctx.model,
                     prompt_version=self.prompt_version,
                 )
-                turn.needs_review = True
-                metrics.needs_review = True
+                # `needs_review` yalniz GERCEKTEN dogrulanacak bir sey varsa
+                # yakilir. Hicbir tool calismadan (ornegin ilk model cagrisi
+                # rate limit'e takilinca) "SAP'ta gerceklesip gerceklesmedigini
+                # dogrulayin" demek yanlis alarmdir: ortada bir islem yoktur.
+                # Yanlis alarm, gercek uyarinin degerini dusurur.
+                calisan = [
+                    result.name for result in executed.values() if not result.is_error
+                ]
+                mutasyon = [
+                    ad
+                    for ad in calisan
+                    if (spec := REGISTRY.get(ad)) is not None and spec.risk_tier.is_mutating
+                ]
+                if exc.kind == "rate_limit":
+                    recovery = (
+                        "Model kotasi dolu; hemen tekrar denemek ayni sonucu verebilir. "
+                        "Kota penceresinin yenilenmesini bekleyin veya model saglayicisinin "
+                        "quota/billing ayarini kontrol edin."
+                    )
+                else:
+                    recovery = "Gecici bir hataysa soruyu daha sonra tekrar sorabilirsiniz."
                 turn.stop_reason = "provider_error"
-                turn.text = (
-                    (turn.text + "\n\n" if turn.text else "")
-                    + f"[Model saglayicisina ulasilamadi ({exc.kind}). "
-                    "Calistirilmis SAP islemleri tekrarlanmadi; devam eden bir islem "
-                    "varsa sap_get_execution_audit ile durumunu dogrulayin.]"
-                )
+                onek = turn.text + "\n\n" if turn.text else ""
+                if mutasyon:
+                    turn.needs_review = True
+                    metrics.needs_review = True
+                    turn.text = (
+                        onek
+                        + f"[Model saglayicisina ulasilamadi ({exc.kind}). "
+                        "Calistirilmis SAP islemleri TEKRARLANMADI; devam eden bir islem "
+                        "varsa sap_get_execution_audit ile durumunu dogrulayin.]"
+                    )
+                elif calisan:
+                    turn.text = (
+                        onek
+                        + f"[Model saglayicisina ulasilamadi ({exc.kind}). "
+                        f"{len(calisan)} salt-okunur SAP sorgusu tamamlandi ama ozetlenemedi; "
+                        f"SAP'ta hicbir sey degismedi. {recovery}]"
+                    )
+                else:
+                    turn.text = (
+                        onek
+                        + f"[Model saglayicisina ulasilamadi ({exc.kind}). "
+                        "Hicbir SAP cagrisi yapilmadi; dogrulanacak islem yok. "
+                        f"{recovery}]"
+                    )
                 break
 
             turn.model_calls += 1
@@ -769,14 +936,20 @@ class SAPAgentRuntime:
     def _history_for_provider(self) -> list[Any]:
         """Saglayiciya gidecek konusma gecmisi.
 
-        Runtime'in kendi urettigi `ModelMessage` kayitlari zaten DLP'den
-        gecmistir. Ama gecmis bir oturum kaydindan yuklenmis ya da disaridan
-        atanmis ham kayitlar gecmemis olabilir; saglayici siniri bu kayitlara
-        GUVENMEZ ve onlari yeniden temizler.
+        Runtime'in bu surecte urettigi kayitlar zaten DLP'den gecmistir. Bir
+        oturum kaydindan yuklenmis ya da disaridan atanmis olanlar gecmemis
+        olabilir; saglayici siniri onlara GUVENMEZ ve yeniden temizler.
+
+        Ayrim TIPE degil KOKENE bakar. Tip kontrolu (`isinstance(...,
+        ModelMessage)`) bu isi yapiyor gorunuyordu ama oturum kayitlari
+        `messages_from_dicts()` ile ModelMessage olarak geri yuklendigi anda
+        her sey "guvenilir" dalina dustu ve temizleme fiilen durdu.
         """
+        if self.actor is None or self._untrusted_before <= 0:
+            return list(self._messages)
         out: list[Any] = []
-        for message in self.messages:
-            if isinstance(message, ModelMessage) or self.actor is None:
+        for index, message in enumerate(self._messages):
+            if index >= self._untrusted_before:
                 out.append(message)
                 continue
             out.append(
@@ -840,7 +1013,10 @@ class SAPAgentRuntime:
 
     # --- Teshis -------------------------------------------------------------
     def reset(self) -> None:
-        self.messages.clear()
+        self._messages.clear()
+        # Guvenilmezlik isareti de sifirlanir; aksi halde bos gecmiste
+        # anlamsiz bir esik kalirdi.
+        self._untrusted_before = 0
         self.active_packs = ["bootstrap"]
         self.last_routing = None
 
@@ -910,7 +1086,8 @@ _ALL_DOMAINS = frozenset(
         "planning",
         "procurement_read",
         "procurement_write",
-        "project_finance",
+        "p2p_flow",
+        "p2p_finance",
         "reporting",
     }
 )

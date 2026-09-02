@@ -626,15 +626,6 @@ PURCHASE_ORDERS: list[dict] = [
 # ---------------------------------------------------------------------------
 # Proje / WBS maliyetleri (PRPS + COSP)
 # ---------------------------------------------------------------------------
-PROJECT_COSTS: list[dict] = [
-    {"wbs_element": "R-2026-014-1", "description": "Otomotiv kaynak hucresi - donanim", "plan_cost": 340000, "actual_cost": 198400, "commitment": 111660, "fiscal_year": 2026, "completion_pct": 58},
-    {"wbs_element": "R-2026-014-2", "description": "Otomotiv kaynak hucresi - guvenlik", "plan_cost": 85000, "actual_cost": 41200, "commitment": 19840, "fiscal_year": 2026, "completion_pct": 52},
-    {"wbs_element": "R-2026-014-3", "description": "Otomotiv kaynak hucresi - muhendislik", "plan_cost": 120000, "actual_cost": 94600, "commitment": 8500, "fiscal_year": 2026, "completion_pct": 76},
-    {"wbs_element": "R-2026-021-1", "description": "Beyaz esya montaj hatti - cobot istasyonlari", "plan_cost": 265000, "actual_cost": 62300, "commitment": 179000, "fiscal_year": 2026, "completion_pct": 24},
-    {"wbs_element": "R-2026-021-2", "description": "Beyaz esya montaj hatti - gorus sistemi", "plan_cost": 78000, "actual_cost": 12400, "commitment": 26700, "fiscal_year": 2026, "completion_pct": 18},
-    {"wbs_element": "R-2026-030-1", "description": "Lojistik AMR filosu - Faz 1", "plan_cost": 420000, "actual_cost": 156000, "commitment": 208000, "fiscal_year": 2026, "completion_pct": 37},
-    {"wbs_element": "R-2026-030-2", "description": "Lojistik AMR filosu - filo yonetim yazilimi", "plan_cost": 95000, "actual_cost": 88700, "commitment": 0, "fiscal_year": 2026, "completion_pct": 91},
-]
 
 # ---------------------------------------------------------------------------
 # Siniflandirma meta verisi (CABN-MSEHI birim, KLAH-CLASS sinif adi)
@@ -786,22 +777,6 @@ SUPPLIER_INVOICES: list[dict] = [
 ]
 
 # Onay is akisi adimlari (SAP Workflow / BPA task).
-WORKFLOW_STEPS: dict[str, list[dict]] = {
-    "purchase_requisition:0010004801": [
-        {"workflow_id": "WS90000012-4801", "step_no": 1, "step_name": "Talep dogrulama", "status": "completed", "decision": "approved", "processor_name": "Selin Aydin", "processor_role": "Planlama sorumlusu", "started_at": "2026-07-20T09:12:00+00:00", "completed_at": "2026-07-20T11:40:00+00:00"},
-        {"workflow_id": "WS90000012-4801", "step_no": 2, "step_name": "Butce onayi (WBS)", "status": "completed", "decision": "approved", "processor_name": "Murat Kaya", "processor_role": "Proje yoneticisi", "started_at": "2026-07-20T11:40:00+00:00", "completed_at": "2026-07-22T08:05:00+00:00"},
-        {"workflow_id": "WS90000012-4801", "step_no": 3, "step_name": "Satinalma mudur onayi", "status": "in_progress", "decision": "", "processor_name": "Ayse Demir", "processor_role": "Satinalma muduru", "started_at": "2026-07-22T08:05:00+00:00", "due_at": "2026-07-25T17:00:00+00:00", "note": "Tutar esik uzeri oldugu icin ikinci onay adimi acildi."},
-    ],
-    "supplier_invoice:5105600231": [
-        {"workflow_id": "WS91000004-0231", "step_no": 1, "step_name": "Fatura blokaj incelemesi", "status": "in_progress", "decision": "", "processor_name": "Kerem Yildiz", "processor_role": "Muhasebe uzmani", "started_at": "2026-07-22T10:00:00+00:00", "due_at": "2026-07-29T17:00:00+00:00", "note": "Fiyat farki tedarikci ile teyit ediliyor."},
-    ],
-    "supplier_invoice:5105600402": [
-        {"workflow_id": "WS91000004-0402", "step_no": 1, "step_name": "Fatura blokaj incelemesi", "status": "ready", "decision": "", "processor_name": "", "processor_role": "Muhasebe uzmani", "started_at": "2026-08-21T09:00:00+00:00", "due_at": "2026-08-28T17:00:00+00:00", "note": "Adim havuzda; henuz bir islemci ustlenmedi."},
-    ],
-    "purchase_order:4500019102": [
-        {"workflow_id": "WS90100007-9102", "step_no": 1, "step_name": "Siparis serbest birakma", "status": "completed", "decision": "approved", "processor_name": "Ayse Demir", "processor_role": "Satinalma muduru", "started_at": "2026-06-09T07:30:00+00:00", "completed_at": "2026-06-09T15:20:00+00:00"},
-    ],
-}
 
 # Odeme belgeleri: fatura -> odeme bagi (REGUH/BSAK karsiligi).
 PAYMENTS: list[dict] = [

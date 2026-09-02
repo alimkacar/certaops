@@ -40,9 +40,6 @@ EXPECTED_TOOLS = {
 FORBIDDEN_TOOLS = {
     "sap_pr_submit",
     "sap_generate_report",
-    "sap_atp_check",
-    "sap_workflow_status",
-    "sap_project_cost_status",
     "sap_get_execution_audit",
 }
 
@@ -84,13 +81,11 @@ async def acceptance() -> int:
         {
             "PYTHONPATH": str(PROJECT_ROOT / "src"),
             "SAP_PURCH_ORG": "1010",
+            "SAP_READ_ONLY": "true",
             "SAP_DRY_RUN": "true",
             "SAP_INTEGRATION_ALLOW_WRITE": "0",
             "CERTAOPS_MCP_ALLOW_WRITE": "",
-            "AGENT_DISABLED_TOOLS": (
-                "sap_pr_submit,sap_generate_report,sap_atp_check,"
-                "sap_workflow_status,sap_project_cost_status"
-            ),
+            "AGENT_DISABLED_TOOLS": "sap_pr_submit,sap_generate_report",
         }
     )
     server = StdioServerParameters(

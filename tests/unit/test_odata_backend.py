@@ -10,7 +10,7 @@ Sahte olan tek sey ag: HTTP cekirdegi, CSRF akisi, V2 `d`/`results` ve V4
 
 Dosyanin dogruladigi invariantlar `odata.py` docstring'inde bildirilenlerdir:
   A. Malzeme aramasi aciklamada da arar.
-  B. `check_atp` gercek ATP servisini kullanir; stok fotografi yerine gecmez.
+  B. Stok fotografi bir ATP teyidi olarak sunulmaz.
   C. PO okumasi V4 `$expand` ile yapilir; baslik basina ek GET yoktur.
   D. Tedarikci skorlari okunamazsa `estimated_fields` ile isaretlenir.
 """
@@ -23,7 +23,7 @@ from datetime import date, timedelta
 import httpx
 import pytest
 
-from robotics_agent.adapters.sap import SAPError, SAPNotSupported
+from robotics_agent.adapters.sap import SAPError
 from robotics_agent.sap.models import PurchaseRequisitionItem
 from robotics_agent.sap.odata import ODataSAPBackend, reference_token
 
@@ -118,6 +118,7 @@ def build(settings_factory, tmp_path, routes=None, create=None, fail=None):
             "sap.username": "svc", "sap.password": "pw", "sap.plant": "1100",
             "sap.purch_org": "1000", "sap.purch_group": "R01",
             "sap.company_code": "1000", "sap.currency": "EUR",
+            "sap.read_only": False,
             "security.allowed_sap_hosts": ("s4.test",),
         },
     )
@@ -228,33 +229,6 @@ def test_acik_siparis_teslim_edileni_duser(settings_factory, tmp_path):
 # ---------------------------------------------------------------------------
 # Invariant B - gercek ATP
 # ---------------------------------------------------------------------------
-def test_atp_kismi_teyit_ve_tam_teyit_tarihi(settings_factory, tmp_path):
-    need = date.today() + timedelta(days=10)
-    gec = need + timedelta(days=15)
-    backend, _ = build(
-        settings_factory, tmp_path,
-        {"ProductAvailabilityInformation": [
-            {"ConfirmedQuantity": "6", "ConfirmedDeliveryDate": need.isoformat(),
-             "AvailabilityCheckType": "ATP"},
-            {"ConfirmedQuantity": "4", "ConfirmedDeliveryDate": gec.isoformat(),
-             "AvailabilityCheckType": "ATP"},
-        ]},
-    )
-    result = backend.check_atp("R-1000", quantity=10, requested_date=need)
-    assert result.confirmed_qty == 6.0, "istenen tarihten sonraki satir sayilmamali"
-    assert result.shortfall_qty == 4.0
-    assert result.full_confirmation_date == gec
-    assert result.late_by_days == 15
-
-
-def test_atp_bos_yanitta_acik_hata(settings_factory, tmp_path):
-    """Stok fotografina sessizce dusmek yerine desteklenmedigini bildirir."""
-    backend, _ = build(settings_factory, tmp_path, {"ProductAvailabilityInformation": []})
-    with pytest.raises(SAPNotSupported) as exc:
-        backend.check_atp("R-1000", quantity=5)
-    assert "sap_discover_capabilities" in str(exc.value)
-
-
 def test_guncel_mrp_tarihi_eslenir(settings_factory, tmp_path):
     backend, _ = build(
         settings_factory,
@@ -517,35 +491,8 @@ def test_referans_aramasi_contains_kullanir(settings_factory, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Clean core - released servisi olmayan alan acikca bildirilir
+# Clean core - egress allowlist
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("status", [404, 403, 500])
-def test_proje_maliyeti_released_servis_yoklugunu_bildirir(
-    settings_factory, tmp_path, status
-):
-    """Servis yoksa SESSIZ BOS LISTE degil, acik hata donmeli.
-
-    Regresyon kaydi: `ODataV2Client.read` 404'u yutup `[]` donduruyordu ve
-    `get_project_costs` bunu "maliyet yok" olarak raporluyordu. Model de
-    "proje butcesinde harcama gorunmuyor" diye ozetliyordu. Veri yoklugu ile
-    yetenek yoklugu ayni sey degildir.
-    """
-    backend, _ = build(
-        settings_factory, tmp_path, {}, fail={"ZAPI_PROJECT_COST_SRV": status}
-    )
-    with pytest.raises(SAPNotSupported):
-        backend.get_project_costs(wbs_element="P-1")
-
-
-def test_proje_maliyeti_gercekten_bos_ise_bos_doner(settings_factory, tmp_path):
-    """Ters yon: servis VAR ve sonuc bos ise hata degil, bos liste donmeli."""
-    backend, _ = build(settings_factory, tmp_path, {"ProjectCostSet": []})
-    # $metadata sahte sistemde ProjectCostSet bildirmiyor -> yetenek yok sayilir.
-    with pytest.raises(SAPNotSupported) as exc:
-        backend.get_project_costs(wbs_element="P-1")
-    assert "ProjectCostSet" in str(exc.value)
-
-
 def test_izinsiz_host_engellenir(settings_factory, tmp_path):
     from robotics_agent.adapters.sap import HostNotAllowed
 
@@ -649,7 +596,15 @@ def test_p2p_released_servisleri_referanslardan_eslenir(settings_factory, tmp_pa
     assert invoices[0].tax_amount == 1_900
     assert invoices[0].net_amount == 10_000
     assert invoices[0].status == "blocked"
-    assert invoices[0].blocks[0].tolerance_key == "PP"
+    # ZLSPR odeme blokaj anahtari, OMR6 tolerans anahtari DEGILDIR: kendi
+    # alaninda tasinir ve neden uydurulmaz. Eskiden anahtar `tolerance_key`e
+    # yazilip neden "manual" deniyordu; 'R' gibi OTOMATIK bir blokaj boylece
+    # elle konmus gibi gorunuyor ve kullaniciyi yanlis islemin ustune
+    # yolluyordu.
+    block = invoices[0].blocks[0]
+    assert block.payment_block_key == "PP"
+    assert block.tolerance_key == "", "odeme blokaj anahtari tolerans anahtari sayilmamali"
+    assert block.block_reason == "unknown", "okunamayan neden uydurulmamali"
     assert len(fake.calls_to("A_SuplrInvcItemPurOrdRef")) == 1
     assert len(fake.calls_to("A_SupplierInvoice")) == 1, "fatura basliginda N+1 olmamali"
 
@@ -701,6 +656,118 @@ def test_p2p_miktarlari_gr_ve_fatura_referansindan_netlesir(
     assert items[0].delivered_qty == 6
     assert items[0].invoiced_qty == 4
     assert items[0].uninvoiced_qty == 2
+
+
+def test_tool_call_budget_is_checked_against_real_odata_roundtrips(
+    settings_factory, tmp_path, purchaser
+):
+    """Mock port metodu degil, OData HTTP transport istekleri sayilir."""
+    from robotics_agent.cache import reset_tool_cache
+    from robotics_agent.tools import ToolContext, execute_tool, load_all_tools
+    from robotics_agent.tools.registry import REGISTRY
+
+    backend, fake = build(
+        settings_factory,
+        tmp_path,
+        {
+            "A_SupplierInvoice": [{
+                "SupplierInvoice": "5100001",
+                "FiscalYear": "2026",
+                "CompanyCode": "1000",
+                "InvoicingParty": "V-100",
+                "DocumentCurrency": "EUR",
+                "InvoiceGrossAmount": "11900",
+                "PaymentBlockingReason": "PP",
+                "SupplierInvoiceStatus": "POSTED",
+                "to_SuplrInvcItemPurOrdRef": {"results": []},
+                "to_SupplierInvoiceTax": {"results": []},
+            }],
+        },
+    )
+    load_all_tools()
+    reset_tool_cache()
+    ctx = ToolContext(settings=backend.settings, sap=backend, actor=purchaser)
+
+    payload, is_error = execute_tool(
+        "sap_supplier_invoice_status", {"only_blocked": True}, ctx
+    )
+
+    assert not is_error, payload
+    actual_roundtrips = len(fake.requests)
+    budget = REGISTRY["sap_supplier_invoice_status"].performance_budget.max_sap_calls
+    assert actual_roundtrips == backend.sap_call_count == ctx.sap_call_count
+    assert actual_roundtrips <= budget
+    reset_tool_cache()
+
+
+def test_supplier_invoice_po_filter_is_rechecked_when_server_ignores_it(
+    settings_factory, tmp_path
+):
+    """Hub sandbox HTTP 200 ile filtresiz veri verse bile baska PO sizmaz."""
+    backend, fake = build(
+        settings_factory,
+        tmp_path,
+        {
+            # FakeS4 kasitli olarak `$filter` uygulamaz. Bu rota hem hedef
+            # PO'yu hem de ilgisiz bir PO'yu dondurerek Hub davranisini taklit
+            # eder.
+            "A_SuplrInvcItemPurOrdRef": [
+                {
+                    "SupplierInvoice": "5100001",
+                    "FiscalYear": "2026",
+                    "SupplierInvoiceItem": "0001",
+                    "PurchaseOrder": "4500000012",
+                    "PurchaseOrderItem": "00010",
+                    "QuantityInPurchaseOrderUnit": "1",
+                    "DocumentCurrency": "USD",
+                    "SupplierInvoiceItemAmount": "100",
+                },
+                {
+                    "SupplierInvoice": "5199999",
+                    "FiscalYear": "2026",
+                    "SupplierInvoiceItem": "0001",
+                    "PurchaseOrder": "4599999999",
+                    "PurchaseOrderItem": "00010",
+                    "QuantityInPurchaseOrderUnit": "9",
+                    "DocumentCurrency": "USD",
+                    "SupplierInvoiceItemAmount": "900",
+                },
+            ],
+            # Ikinci sorgunun filtresi de yok sayilmis gibi iki baslik gelir.
+            "A_SupplierInvoice": [
+                {
+                    "SupplierInvoice": "5100001",
+                    "FiscalYear": "2026",
+                    "CompanyCode": "1000",
+                    "InvoicingParty": "V-100",
+                    "DocumentCurrency": "USD",
+                    "InvoiceGrossAmount": "100",
+                    "SupplierInvoiceStatus": "POSTED",
+                    "to_SuplrInvcItemPurOrdRef": {"results": []},
+                    "to_SupplierInvoiceTax": {"results": []},
+                },
+                {
+                    "SupplierInvoice": "5199999",
+                    "FiscalYear": "2026",
+                    "CompanyCode": "1000",
+                    "InvoicingParty": "V-999",
+                    "DocumentCurrency": "USD",
+                    "InvoiceGrossAmount": "900",
+                    "SupplierInvoiceStatus": "POSTED",
+                    "to_SuplrInvcItemPurOrdRef": {"results": []},
+                    "to_SupplierInvoiceTax": {"results": []},
+                },
+            ],
+        },
+    )
+
+    invoices = backend.get_supplier_invoices(po_id="4500000012")
+
+    assert [invoice.invoice_id for invoice in invoices] == ["5100001"]
+    assert invoices[0].po_ids == ["4500000012"]
+    assert "PurchaseOrder eq '4500000012'" in fake.filter_of(
+        "A_SuplrInvcItemPurOrdRef"
+    )
 
 
 # ---------------------------------------------------------------------------

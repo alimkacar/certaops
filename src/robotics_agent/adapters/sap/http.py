@@ -12,6 +12,7 @@ Sagladigi adapter garantileri:
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -26,6 +27,8 @@ from .errors import RETRYABLE_STATUS, SAPError, SAPFault, parse_sap_error
 log = logging.getLogger(__name__)
 
 MODIFYING_METHODS = frozenset({"POST", "PATCH", "PUT", "DELETE", "MERGE"})
+READ_BATCH_METHODS = frozenset({"GET", "HEAD"})
+MAX_READ_BATCH_REQUESTS = 20
 
 
 def split_link(link: str) -> tuple[str, dict[str, str]]:
@@ -67,6 +70,30 @@ class ODataResponse:
 
 
 @dataclass
+class SAPCallBudget:
+    """Bir tool calisirken izin verilen gercek SAP HTTP denemeleri.
+
+    V2 ve V4 cekirdekleri ayni nesneyi paylasir. `consume()` hem retry hem
+    CSRF metadata isteginden hemen once cagrilir; limit asan istek sokete
+    ulasmadan kesilir.
+    """
+
+    max_calls: int
+    used: int = field(default=0, init=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def consume(self) -> None:
+        with self._lock:
+            if self.used >= self.max_calls:
+                raise SAPError(
+                    f"SAP HTTP cagri butcesi asildi (sinir {self.max_calls}).",
+                    code="SAP_CALL_BUDGET_EXCEEDED",
+                    detail=f"used={self.used}, max={self.max_calls}",
+                )
+            self.used += 1
+
+
+@dataclass
 class ODataHttpCore:
     """Tek SAP sistemine karsi HTTP islerini yapan cekirdek.
 
@@ -81,6 +108,9 @@ class ODataHttpCore:
     allowed_hosts: tuple[str, ...] = ()
     max_retries: int = 3
     csrf_enabled: bool = True
+    #: Savunmanin son hatti: True iken SAP mutasyonu HTTP soketine ulasmaz.
+    #: JSON `$batch` yalniz tum alt istekler GET/HEAD ise istisnadir.
+    read_only: bool = True
     token_provider: Callable[[], str] | None = None
     sleep: Callable[[float], None] = time.sleep
     #: Kimlik suresi dolunca yeni bir HTTP istemcisi uretir (destination token
@@ -101,8 +131,20 @@ class ODataHttpCore:
 
     _csrf_token: str = field(default="", init=False, repr=False)
     # Gercekten SAP'a giden istek sayisi. Butce ve telemetri bunu okur.
+    # Bagimsiz okumalar paralel calistirildiginda birden fazla thread ayni
+    # anda artiriyor; `+= 1` atomik olmadigi icin sayac eksik sayardi ve
+    # audit'teki `sap_calls` gercegin altinda kalirdi. Kilit bunu kapatir.
     call_count: int = field(default=0, init=False)
+    _count_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    call_budget: SAPCallBudget | None = field(default=None, init=False, repr=False)
     _reconnect_used: bool = field(default=False, init=False, repr=False)
+
+    def _record_http_attempt(self) -> None:
+        """Butceyi kontrol eder ve gercek gidiş denemesini atomik sayar."""
+        if self.call_budget is not None:
+            self.call_budget.consume()
+        with self._count_lock:
+            self.call_count += 1
 
     # --- Guvenlik -----------------------------------------------------------
     def _assert_host_allowed(self, url: str) -> None:
@@ -153,6 +195,36 @@ class ODataHttpCore:
         log.info("SAP baglantisi yenilendi (kimlik suresi dolmus olabilir)")
         return True
 
+    @staticmethod
+    def _is_safe_read_batch(method: str, path: str, body: Any) -> bool:
+        """POST ile tasinan ama semantik olarak salt-okunur V4 batch'i tanir.
+
+        Yalniz goreli URL, GET/HEAD, govdesiz ve atomicity-group'suz alt
+        istekler kabul edilir. Boylece performans icin tek round-trip korunur;
+        batch icine saklanmis PATCH/DELETE read-only kilidini asamaz.
+        """
+        if method != "POST" or not urlsplit(str(path)).path.rstrip("/").endswith("/$batch"):
+            return False
+        if not isinstance(body, Mapping):
+            return False
+        requests = body.get("requests")
+        if not isinstance(requests, list) or not 1 <= len(requests) <= MAX_READ_BATCH_REQUESTS:
+            return False
+        for item in requests:
+            if not isinstance(item, Mapping):
+                return False
+            if str(item.get("method", "")).upper() not in READ_BATCH_METHODS:
+                return False
+            if item.get("body") is not None or item.get("atomicityGroup") is not None:
+                return False
+            target = str(item.get("url", ""))
+            parts = urlsplit(target)
+            if not target or parts.scheme or parts.netloc or target.startswith("//"):
+                return False
+            if ".." in parts.path.split("/"):
+                return False
+        return True
+
     # --- Istek --------------------------------------------------------------
     def request(
         self,
@@ -169,7 +241,15 @@ class ODataHttpCore:
         odata_format: bool = True,
     ) -> ODataResponse:
         method = method.upper()
-        self.call_count += 1
+        safe_read_batch = self._is_safe_read_batch(method, path, json_body)
+        mutating_request = method in MODIFYING_METHODS and not safe_read_batch
+        if self.read_only and mutating_request:
+            # Sayac artmadan, CSRF almadan ve sokete dokunmadan kesilir.
+            raise SAPError(
+                f"SAP {method} istegi read-only profilinde engellendi.",
+                code="READ_ONLY_MODE",
+                detail=str(path)[:240],
+            )
         merged_headers: dict[str, str] = {
             "Accept": "application/json",
             "Accept-Language": self.accept_language,
@@ -210,6 +290,7 @@ class ODataHttpCore:
                 url = self.client.base_url.join(path) if self.client.base_url else httpx.URL(path)
                 self._assert_host_allowed(str(url))
 
+                self._record_http_attempt()
                 response = self.client.request(
                     method, path, params=query, json=json_body, headers=merged_headers
                 )
@@ -217,7 +298,7 @@ class ODataHttpCore:
                 self.breaker.record_failure()
                 # Yazma cagrilarinda sonuc bilinmiyor: cekirdek burada retry yapmaz,
                 # karar core.execution'daki idempotency/mutabakat katmanina aittir.
-                if method in MODIFYING_METHODS:
+                if mutating_request:
                     raise
                 if attempt >= self.max_retries:
                     raise
@@ -273,7 +354,7 @@ class ODataHttpCore:
                 continue
 
             if fault.http_status in RETRYABLE_STATUS and attempt < self.max_retries:
-                if method in MODIFYING_METHODS:
+                if mutating_request:
                     # Idempotent olmayan cagriyi kor bir sekilde tekrarlamayiz.
                     break
                 delay = fault.retry_after_s if fault.retry_after_s is not None else min(8.0, 2.0**attempt)
@@ -315,6 +396,7 @@ class ODataHttpCore:
         headers = {"x-csrf-token": "Fetch", "Accept": "application/xml"}
         if self.token_provider is not None:
             headers["Authorization"] = f"Bearer {self.token_provider()}"
+        self._record_http_attempt()
         response = self.client.get(
             f"{root}/$metadata",
             params={"sap-client": self.sap_client} if self.sap_client else None,

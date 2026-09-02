@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
-from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -118,15 +117,6 @@ def main(argv: list[str] | None = None) -> int:
             sample("valuation", "get_valuation", lambda: backend.get_valuation(material_id))
             sample("stock", "get_stock", lambda: backend.get_stock([material_id]))
             sample(
-                "availability",
-                "check_atp",
-                lambda: backend.check_atp(
-                    material_id,
-                    quantity=1,
-                    requested_date=date.today() + timedelta(days=45),
-                ),
-            )
-            sample(
                 "mrp",
                 "get_supply_demand",
                 lambda: backend.get_supply_demand(material_id, horizon_days=180),
@@ -145,7 +135,6 @@ def main(argv: list[str] | None = None) -> int:
                 ("classification", "get_material_classification"),
                 ("valuation", "get_valuation"),
                 ("stock", "get_stock"),
-                ("availability", "check_atp"),
                 ("mrp", "get_supply_demand"),
                 ("info_records", "get_info_records"),
             ):

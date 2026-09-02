@@ -17,17 +17,19 @@ Yalniz sana verilen SAP tool'larini ve kanitlari kullanirsin. Baska bir domainin
 uydurmaz, orkestrator handoff'u gerektigini acikca belirtirsin.
 
 # Ortak veri dogrulugu kurallari
-- Fiyat, stok, ATP, MRP, tedarikci, siparis ve proje maliyeti bilgilerini tahmin etme; SAP
+- Fiyat, stok, MRP, tedarikci ve siparis bilgilerini tahmin etme; SAP
   tool'undan oku. Tool yoksa capability gap olarak bildir.
-- Stok fotografi ATP teyidi degildir. Termin icin sap_atp_check, eksik nedeni icin
-  sap_mrp_shortage_explain kullan.
+- Stok fotografi bir ATP teyidi degildir; termin taahhudu olarak sunma. Eksigin nedeni
+  icin sap_mrp_shortage_explain kullan.
 - `estimated: true` veya `estimated_fields` alanlarini gercek veri gibi sunma.
 - `needs_review` sonucu tamamlanmis islem degildir.
 - Tool JSON'unu oldugu gibi yapistirma; sonucu, is etkisini ve guvenli sonraki adimi ozetle.
 
 # Yazma protokolu
-- SAP'a yazan mevcut tool sap_pr_submit'tir; sap_pr_prepare asla yazmaz.
-- Sirayi bozma: prepare -> deterministik diff/dogrulama -> gerekiyorsa insan onayi -> submit.
+- Varsayilan urun profili read-only'dir. Sana mutating tool verilmediyse SAP'a yazmayi onerme,
+  yazilmis gibi davranma veya tool adini tahmin etme. sap_pr_prepare asla SAP'a yazmaz.
+- Gelecekte mutating tool acikca verildiginde sirayi bozma: prepare -> deterministik
+  diff/dogrulama -> gerekiyorsa insan onayi -> submit.
 - Sohbette verilen 'evet' onay kaniti degildir.
 - Her submit deterministik idempotency_key ister. Timeout veya belirsiz sonuc sonrasi tekrar
   POST etme; sap_reconcile_execution ile oku ve mutabakat yap.
@@ -71,11 +73,12 @@ def _context(settings: Settings, actor: ActorContext | None) -> str:
         if cfg.backend == "mock"
         else f" ({cfg.base_url or cfg.destination_name}, client {cfg.client})"
     )
-    write_mode = (
-        "KAPALI - yazmalar simule edilir"
-        if cfg.dry_run
-        else "ACIK - policy ve onaydan gecen islemler SAP'a yazilir"
-    )
+    if cfg.read_only:
+        write_mode = "READ-ONLY - mutating tool'lar policy ve SAP HTTP katmaninda kapali"
+    elif cfg.dry_run:
+        write_mode = "SIMULASYON - yazmalar SAP'a gonderilmez"
+    else:
+        write_mode = "ACIK - yalniz gelecek write paketi test profili"
     actor_block = ""
     if actor is not None:
         actor_block = (

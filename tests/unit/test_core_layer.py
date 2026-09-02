@@ -393,15 +393,16 @@ def test_router_selects_procurement_for_supplier_question(purchaser):
     assert not decision.fallback
 
 
-def test_orchestrator_selects_finance_agent_for_wbs_question(purchaser):
+def test_orchestrator_does_not_advertise_removed_project_cost_capability(purchaser):
     plan = plan_agents("R-2026-014 WBS proje maliyeti ve EAC durumunu getir", purchaser)
-    assert plan.agents == ("finance",)
+    assert plan.agents == ("platform",)
+    assert plan.routing.fallback is True
 
 
 def test_router_expands_write_pack_dependencies(purchaser):
     decision = route("Satinalma talebi olustur", purchaser)
     assert "procurement_write" in decision.packs
-    # Yazma pack'i ATP/tedarikci okumasini da acar: taslak fiyatlandirma ve
+    # Yazma pack'i stok/tedarikci okumasini da acar: taslak fiyatlandirma ve
     # termin dogrulamasi bunlara dayanir.
     assert "procurement_read" in decision.packs
     # Malzeme arama ayri ana-veri agent'inda kalir.
@@ -445,7 +446,7 @@ def test_agent_catalogue_has_isolated_sap_domains():
 
 
 def test_procurement_plan_deduplicates_supply_chain_dependency(purchaser):
-    plan = plan_agents("ATP kontrol et ve satinalma talebi olustur", purchaser)
+    plan = plan_agents("Stok kontrol et ve satinalma talebi olustur", purchaser)
     assert plan.agents == ("supply_chain", "procurement")
 
 
@@ -468,7 +469,7 @@ def test_write_pack_stays_within_schema_budget(purchaser, settings):
         ("bootstrap",),
         ("bootstrap", "procurement_read"),
         ("bootstrap", "procurement_write", "procurement_read"),
-        ("bootstrap", "project_finance", "reporting"),
+        ("bootstrap", "p2p_finance", "reporting"),
     ):
         names = visible_tool_names(domains_for_packs(packs), purchaser)
         report = schema_token_report(
@@ -572,3 +573,98 @@ def test_risk_tier_semantics():
     assert RiskTier.R4.requires_dual_control
     assert not RiskTier.R3.requires_dual_control
     assert RiskTier.R3.level == 3
+
+
+# --- Oturum gecmisinin kalici depoya gidip geri gelmesi ---------------------
+# Regresyon: `SessionRecord.messages` JSON'a `default=str` ile yaziliyordu.
+# `ModelMessage` bir dataclass oldugu icin json.dumps onu serilestiremiyor ve
+# `default=str` her mesaji `__repr__` string'ine ceviriyordu. Geri yuklenen
+# gecmis duz string listesi oluyor, saglayici siniri `message.role` uzerinde
+# AttributeError veriyordu: ilk soru calisiyor, AYNI oturumdaki ikinci soru
+# 502 ile duşuyordu.
+def test_oturum_gecmisi_json_turundan_modelmessage_olarak_doner():
+    import json
+
+    from certaops.providers import messages_from_dicts, messages_to_dicts
+    from certaops.providers.contracts import FunctionCall, FunctionResult, ModelMessage
+
+    history = [
+        ModelMessage(role="user", text="4500000012 siparis durumu?"),
+        ModelMessage(
+            role="assistant",
+            function_calls=(
+                FunctionCall(
+                    id="c1",
+                    name="sap_purchase_order_360",
+                    arguments={"po_id": "4500000012"},
+                    provider_state=b"\x00opaque\xff",
+                ),
+            ),
+        ),
+        ModelMessage(
+            role="tool",
+            function_results=(
+                FunctionResult(
+                    call_id="c1", name="sap_purchase_order_360", content='{"po_id":"4500000012"}'
+                ),
+            ),
+        ),
+    ]
+
+    # sessions.py ile AYNI serilestirme yolu.
+    raw = json.dumps(messages_to_dicts(history), ensure_ascii=False, default=str)
+    restored = messages_from_dicts(json.loads(raw))
+
+    assert [m.role for m in restored] == ["user", "assistant", "tool"]
+    assert all(isinstance(m, ModelMessage) for m in restored)
+    call = restored[1].function_calls[0]
+    assert call.name == "sap_purchase_order_360"
+    assert call.arguments == {"po_id": "4500000012"}
+    # Opak devam bilgisi (Gemini thought signature) bytes olarak korunmali.
+    assert call.provider_state == b"\x00opaque\xff"
+    assert restored[2].function_results[0].content == '{"po_id":"4500000012"}'
+
+
+def test_bozuk_eski_oturum_kaydi_turu_bastan_bozmaz():
+    """Eski surumun yazdigi `__repr__` string'leri atlanir, hata firlatmaz."""
+    from certaops.providers import messages_from_dicts
+
+    legacy = [
+        "ModelMessage(role='user', text_len=12, calls=0, results=0)",
+        {"role": "user", "text": "saglam kayit"},
+        {"role": "gecersiz-rol", "text": "atlanmali"},
+    ]
+    restored = messages_from_dicts(legacy)
+    assert [m.role for m in restored] == ["user"]
+    assert restored[0].text == "saglam kayit"
+
+
+# --- Router: Turkce cekim ekleri dogru pack'i kapatmamali -------------------
+# Regresyon: tetikleyiciler duz alt-dize ile aranıyordu. "siparis durumu"
+# tetikleyicisi "siparisinin durumu" icinde GECMEDIGI icin `p2p_visibility`
+# acilmiyor, `sap_purchase_order_360` modele hic gosterilmiyor ve model
+# elindeki tek arac olan `sap_track_purchase_orders` ile ALAKASIZ bir acik
+# siparis listesi donduruyordu.
+def test_router_turkce_cekim_ekiyle_dogru_packi_acar():
+    from robotics_agent.contracts import ActorContext
+    from robotics_agent.core import route
+
+    actor = ActorContext.local_operator(subject="t", tenant="100", roles=("AUDITOR",))
+    for soru in (
+        "4500000012 numarali satinalma siparisinin durumu ne?",
+        "4500000012 siparisinin belge akisini goster",
+        "bu siparisin durumu nedir",
+    ):
+        decision = route(soru, actor)
+        assert "p2p_visibility" in decision.packs, soru
+
+
+def test_router_kisa_tetikleyicide_onek_eslesmesi_yapmaz():
+    """`403` tetikleyicisi `4031234` gibi bir sayiyla eslesmemeli."""
+    from robotics_agent.contracts import ActorContext
+    from robotics_agent.core import route
+
+    actor = ActorContext.local_operator(subject="t", tenant="100", roles=("AUDITOR",))
+    assert "diagnostics" in route("403 hatasi aliyorum", actor).packs
+    # Sadece uzun bir sayi: teshis pack'i bu yuzden acilmamali.
+    assert "diagnostics" not in route("4031234 numarali malzeme", actor).packs

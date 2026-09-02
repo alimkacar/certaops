@@ -30,6 +30,7 @@ from typing import Any
 
 from ..config import TOOL_TIMEOUT_CEILING_SECONDS, Settings
 from ..contracts import ActorContext
+from ..security_at_rest import decrypt_if_needed, maybe_cipher
 from .store import StateDatabase, get_state_db
 
 log = logging.getLogger(__name__)
@@ -381,9 +382,17 @@ class MemorySessionStore(SessionStore):
 class SQLiteSessionStore(SessionStore):
     """Restart ve coklu worker'a dayanikli oturum deposu."""
 
-    def __init__(self, db: StateDatabase, **kwargs: Any) -> None:
+    def __init__(self, db: StateDatabase, cipher: Any = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._db = db
+        # `AGENT_SESSION_ENCRYPTION` acikken kurulan AES-GCM zarfi. Konusma
+        # gecmisi SAP is verisi ve kullanici sorulari tasir; diskte sifrelenen
+        # alan `messages_json`dur. Sahiplik/TTL sutunlari sorgulanabilir kalir.
+        self._cipher = cipher
+
+    def _encode_messages(self, messages: Any) -> str:
+        body = json.dumps(messages, ensure_ascii=False, default=str)
+        return self._cipher.encrypt(body) if self._cipher is not None else body
 
     def load(self, session_id: str, *, actor: ActorContext) -> SessionRecord | None:
         row = self._db.query_one(
@@ -411,7 +420,7 @@ class SQLiteSessionStore(SessionStore):
         payload = (
             now.isoformat(),
             record.turn_count,
-            json.dumps(record.messages, ensure_ascii=False, default=str),
+            self._encode_messages(record.messages),
             json.dumps(record.active_packs, ensure_ascii=False),
         )
         with self._db.write() as conn:
@@ -631,7 +640,7 @@ class SQLiteSessionStore(SessionStore):
         payload = (
             now.isoformat(),
             record.turn_count,
-            json.dumps(record.messages, ensure_ascii=False, default=str),
+            self._encode_messages(record.messages),
             json.dumps(record.active_packs, ensure_ascii=False),
         )
         with self._db.write() as conn:
@@ -688,8 +697,7 @@ class SQLiteSessionStore(SessionStore):
         expires_at = row["turn_lease_expires_at"]
         return bool(expires_at and _parse(expires_at) > now)
 
-    @staticmethod
-    def _row_to_record(row: Any) -> SessionRecord:
+    def _row_to_record(self, row: Any) -> SessionRecord:
         keys = row.keys()
         return SessionRecord(
             session_id=row["session_id"],
@@ -698,7 +706,7 @@ class SQLiteSessionStore(SessionStore):
             created_at=_parse(row["created_at"]),
             last_seen=_parse(row["last_seen"]),
             turn_count=int(row["turn_count"] or 0),
-            messages=json.loads(row["messages_json"] or "[]"),
+            messages=json.loads(decrypt_if_needed(self._cipher, row["messages_json"] or "[]")),
             active_packs=json.loads(row["active_packs_json"] or "[]"),
             version=int(row["version"]) if "version" in keys and row["version"] else 1,
         )
@@ -724,4 +732,8 @@ def build_session_store(settings: Settings) -> SessionStore:
     }
     if settings.state.session_backend == "memory":
         return MemorySessionStore(**kwargs)
-    return SQLiteSessionStore(get_state_db(settings.state.db_path), **kwargs)
+    # `maybe_cipher` ayar kapaliyken None doner, acik ama kurulamiyorsa
+    # YUKSELIR. Bu yol bilerek fail-closed: sifreleme istendigi halde duz
+    # metin yazan bir depo, hic sifreleme sunmamaktan daha kotudur.
+    cipher = maybe_cipher(settings.privacy.session_encryption, purpose="session")
+    return SQLiteSessionStore(get_state_db(settings.state.db_path), cipher=cipher, **kwargs)

@@ -54,7 +54,7 @@ def main(argv: list[str] | None = None) -> int:
             if value:
                 seeds = value
         report.seeds = seeds
-        po_id, invoice_id, wbs = seeds.get("po", ""), seeds.get("invoice", ""), seeds.get("wbs", "")
+        po_id, invoice_id = seeds.get("po", ""), seeds.get("invoice", "")
         report.check("Gercek PO secildi", bool(po_id), po_id or "PO bulunamadi")
         ctx = tool_context(settings, backend, roles=("PURCHASER", "AUDITOR"))
 
@@ -139,24 +139,6 @@ def main(argv: list[str] | None = None) -> int:
         else:
             report.add("sap_supplier_invoice_status", WARN, "PO referansli fatura bulunamadi.")
             report.add("sap_invoice_block_explain", WARN, "Fatura cekirdegi olmadan calistirilamaz.")
-
-        workflow_object = po_id or invoice_id
-        if workflow_object:
-            run(
-                "sap_workflow_status",
-                {"object_type": "purchase_order", "object_id": workflow_object},
-                optional=True,
-            )
-        else:
-            report.add("sap_workflow_status", BLOCKED, "Workflow'a baglanacak is nesnesi yok.")
-
-        if wbs:
-            run("sap_project_cost_status", {"wbs_element": wbs}, optional=True)
-        else:
-            report.add(
-                "sap_project_cost_status", BLOCKED,
-                "PO verisinde WBS yok; ayrica ZAPI_PROJECT_COST_SRV standart CAL servisi degildir.",
-            )
 
         run(
             "sap_generate_report",

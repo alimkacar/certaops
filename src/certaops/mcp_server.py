@@ -36,8 +36,9 @@ cephe degil, kimlik dogrulayan HTTP API (`certaops.api`) kullanilmalidir.
 
 Yazma
 -----
-Kimlik istek basina dogrulanamadigi icin **mutating tool'lar varsayilan
-olarak kapalidir**. Acmak icin:
+Urun varsayilan olarak `SAP_READ_ONLY=true` ile calisir ve mutating tool'lar
+tum cephelerde kapalidir. Gelecekteki write paketini gelistirme ortaminda
+sinamak icin once `SAP_READ_ONLY=false`, MCP'de ayrica:
 
     CERTAOPS_MCP_ALLOW_WRITE=1
 
@@ -100,11 +101,12 @@ INSTRUCTIONS = (
 _SIDE_EFFECT_TOOLS = frozenset({"sap_generate_report"})
 
 
-def _allow_write() -> bool:
+def write_enabled() -> bool:
+    """MCP cephesinin yan etkili tool'lari gostermesine izin var mi?"""
     return os.getenv("CERTAOPS_MCP_ALLOW_WRITE", "").strip().lower() in {"1", "true", "yes"}
 
 
-def _actor(settings: Any) -> ActorContext:
+def configured_actor(settings: Any) -> ActorContext:
     """Yapilandirmadan gelen tek kimlik.
 
     stdio'da istek basina kimlik yoktur; bu yuzden actor sabittir ve
@@ -125,12 +127,13 @@ def exposed_tool_names(settings: Any, actor: ActorContext) -> list[str]:
 
     Uc filtre uygulanir:
       1. actor'un yetkisi (`visible_tool_names` - kapatilanlari da eler),
-      2. yazma bayragi kapaliysa mutating ve dosya olusturan tool'lar,
+      2. global read-only profil veya MCP yazma bayragi kapaliysa mutating
+         tool'lar; MCP bayragi kapaliysa yerel dosya olusturan tool'lar,
       3. kayit defterinde olmayanlar.
     """
     all_domains = domains_for_packs(tuple(PACKS))
-    names = visible_tool_names(all_domains, actor)
-    if not _allow_write():
+    names = visible_tool_names(all_domains, actor, settings=settings)
+    if not write_enabled():
         names = [
             n for n in names
             if not REGISTRY[n].risk_tier.is_mutating and n not in _SIDE_EFFECT_TOOLS
@@ -152,14 +155,15 @@ def run_tool(name: str, arguments: dict[str, Any], ctx: ToolContext) -> tuple[st
             {"error": f"Bilinmeyen tool: {name}", "denial_code": "UNKNOWN_TOOL"},
             ensure_ascii=False,
         ), True
-    if (REGISTRY[name].risk_tier.is_mutating or name in _SIDE_EFFECT_TOOLS) and not _allow_write():
+    if (REGISTRY[name].risk_tier.is_mutating or name in _SIDE_EFFECT_TOOLS) and not write_enabled():
         # Bildirilmeyen bir tool yine de adiyla cagrilabilir; kapiyi burada da
         # tutariz. Tek katmanli gorunurluk filtresi yeterli degildir.
         return json.dumps(
             {
                 "error": (
                     f"{name} yan etkili bir tool ve bu MCP cephesinde kapali. "
-                    "Acmak icin CERTAOPS_MCP_ALLOW_WRITE=1."
+                    "Gelecekteki gelistirme profili icin CERTAOPS_MCP_ALLOW_WRITE=1; "
+                    "SAP mutasyonu icin ayrica SAP_READ_ONLY=false gerekir."
                 ),
                 "denial_code": "WRITE_DISABLED_ON_MCP",
             },
@@ -208,12 +212,12 @@ async def serve() -> None:  # pragma: no cover - tasima katmani
     load_all_tools()
     settings = get_settings()
     settings.ensure_dirs()
-    actor = _actor(settings)
+    actor = configured_actor(settings)
     exposed = exposed_tool_names(settings, actor)
     log.info(
         "CertaOps MCP | actor=%s | backend=%s | tool=%d | yazma=%s",
         actor.subject, settings.sap.backend, len(exposed),
-        "acik" if _allow_write() else "kapali",
+        "acik" if write_enabled() else "kapali",
     )
 
     server: Server = Server(SERVER_NAME, instructions=INSTRUCTIONS)
@@ -262,11 +266,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.list:
         load_all_tools()
         settings = get_settings()
-        actor = _actor(settings)
+        actor = configured_actor(settings)
         names = exposed_tool_names(settings, actor)
         print(f"actor  : {actor.subject} ({', '.join(actor.roles)})")
         print(f"backend: {settings.sap.backend}")
-        print(f"yazma  : {'acik' if _allow_write() else 'kapali'}")
+        print(f"yazma  : {'acik' if write_enabled() else 'kapali'}")
         print(f"tool   : {len(names)}")
         for n in names:
             spec = REGISTRY[n]

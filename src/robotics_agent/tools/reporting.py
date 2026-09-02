@@ -7,114 +7,13 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from ..contracts import SCOPE_REPORT_WRITE, SCOPE_SAP_READ, RiskTier
+from ..contracts import SCOPE_REPORT_WRITE, RiskTier
 from .registry import ToolContext, tool
 
 
 def _safe_filename(name: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_")
     return cleaned or "sap_raporu"
-
-
-@tool(
-    name="sap_project_cost_status",
-    group="proje_finans",
-    domain="project_finance",
-    risk_tier=RiskTier.R0,
-    required_scopes=(SCOPE_SAP_READ,),
-    result_token_budget=1400,
-    description=(
-        "SAP PS/CO kaynagindan WBS bazinda plan, fiili ve acik taahhut tutarlarini getirir; "
-        "tamamlanma yuzdesiyle EAC/ETC ve CPI hesaplar, portfoy ozeti ve asim uyarilari uretir. "
-        "SAP'ta ilerleme yuzdesi guncel degilse bunu metodoloji riski olarak aciklar."
-    ),
-    input_schema={
-        "type": "object",
-        "properties": {
-            "wbs_element": {"type": "string", "description": "WBS veya on eki."},
-            "fiscal_year": {"type": "integer"},
-            "overrun_alert_pct": {
-                "type": "number",
-                "description": "Tahmini asim uyari esigi (%).",
-                "default": 5.0,
-            },
-        },
-        "required": [],
-    },
-)
-def sap_project_cost_status(
-    ctx: ToolContext,
-    wbs_element: str | None = None,
-    fiscal_year: int | None = None,
-    overrun_alert_pct: float = 5.0,
-) -> dict[str, Any]:
-    costs = ctx.sap.get_project_costs(wbs_element=wbs_element, fiscal_year=fiscal_year)
-    if not costs:
-        return {"error": "Verilen filtreye uyan WBS elemani bulunamadi.", "filter": wbs_element}
-
-    rows: list[dict[str, Any]] = []
-    alerts: list[str] = []
-    total_plan = total_actual = total_commitment = total_eac = 0.0
-    for cost in costs:
-        progress = max(1.0, cost.completion_pct) / 100
-        eac = max(
-            cost.actual_cost / progress + cost.commitment * (1 - progress),
-            cost.actual_cost + cost.commitment,
-        )
-        etc = max(0.0, eac - cost.actual_cost)
-        cpi = (cost.plan_cost * progress) / cost.actual_cost if cost.actual_cost else None
-        overrun = (eac / cost.plan_cost - 1) * 100 if cost.plan_cost else 0.0
-        total_plan += cost.plan_cost
-        total_actual += cost.actual_cost
-        total_commitment += cost.commitment
-        total_eac += eac
-        if overrun > overrun_alert_pct:
-            alerts.append(
-                f"{cost.wbs_element}: EAC planin %{overrun:.1f} uzerinde "
-                f"({eac:,.0f} / {cost.plan_cost:,.0f} {cost.currency})."
-            )
-        rows.append(
-            {
-                "wbs_element": cost.wbs_element,
-                "description": cost.description,
-                "completion_pct": cost.completion_pct,
-                "plan": cost.plan_cost,
-                "actual": cost.actual_cost,
-                "commitment": cost.commitment,
-                "remaining_budget": cost.remaining_budget,
-                "eac": round(eac, 2),
-                "etc": round(etc, 2),
-                "cpi": round(cpi, 3) if cpi else None,
-                "forecast_variance_pct": round(overrun, 1),
-                "status": "asim riski" if overrun > overrun_alert_pct else "plan dahilinde",
-            }
-        )
-    rows.sort(key=lambda row: -row["forecast_variance_pct"])
-    return {
-        "as_of": date.today().isoformat(),
-        "source_system": ctx.settings.sap.system_alias,
-        "source_api": "project_cost",
-        "currency": ctx.settings.sap.currency,
-        "wbs_count": len(rows),
-        "portfolio_summary": {
-            "total_plan": round(total_plan, 2),
-            "total_actual": round(total_actual, 2),
-            "total_commitment": round(total_commitment, 2),
-            "total_eac": round(total_eac, 2),
-            "forecast_variance": round(total_eac - total_plan, 2),
-            "forecast_variance_pct": (
-                round((total_eac / total_plan - 1) * 100, 1) if total_plan else 0.0
-            ),
-        },
-        "wbs_elements": rows,
-        "alerts": alerts,
-        "method_note": (
-            "EAC = fiili/tamamlanma orani + kalan taahhut. SAP PS ilerleme yuzdesi "
-            "guncel degilse tahmin yaniltici olabilir."
-        ),
-    }
-
-
 @tool(
     name="sap_generate_report",
     group="raporlama",
@@ -125,7 +24,7 @@ def sap_project_cost_status(
     result_token_budget=700,
     description=(
         "SAP tool sonuclarini kaynak referanslariyla Excel veya Markdown raporuna donusturur. "
-        "Ana veri, ATP/MRP, tedarikci, satinalma, audit veya WBS maliyet tablolarini yonetim "
+        "Ana veri, MRP, tedarikci, satinalma veya audit tablolarini yonetim "
         "ozetiyle paketler; yeni fiyat, BOM ya da muhendislik tahmini uretmez."
     ),
     input_schema={

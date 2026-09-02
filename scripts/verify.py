@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from robotics_agent.cache import reset_tool_cache  # noqa: E402
 from robotics_agent.config import get_settings  # noqa: E402
 from robotics_agent.contracts import ActorContext, RiskTier  # noqa: E402
+from robotics_agent.core.router import PACKS, domains_for_packs  # noqa: E402
 from robotics_agent.privacy import DataClass, DataPolicy  # noqa: E402
 from robotics_agent.risk import (  # noqa: E402
     ImpactProfile,
@@ -40,7 +41,12 @@ from robotics_agent.risk import (  # noqa: E402
     score_impact,
 )
 from robotics_agent.sap import build_backend  # noqa: E402
-from robotics_agent.tools import ToolContext, execute_tool, load_all_tools  # noqa: E402
+from robotics_agent.tools import (  # noqa: E402
+    ToolContext,
+    execute_tool,
+    load_all_tools,
+    visible_tool_names,
+)
 from robotics_agent.tools.registry import REGISTRY  # noqa: E402
 
 GREEN, RED, DIM, BOLD, RESET = "\033[32m", "\033[31m", "\033[2m", "\033[1m", "\033[0m"
@@ -93,19 +99,50 @@ def _call(ctx: ToolContext, name: str, **arguments: Any) -> tuple[dict[str, Any]
 def verify_inventory() -> None:
     section("1. Tool envanteri ve sozlesmeler")
     p2p = [
-        "sap_document_flow", "sap_purchase_order_360", "sap_workflow_status",
+        "sap_document_flow", "sap_purchase_order_360",
         "sap_supplier_invoice_status", "sap_invoice_block_explain",
     ]
-    # 26 -> 24: `sap_list_agents` (deprecated takma ad) ve `sap_validate_change`
-    # (dogrulamasi `sap_pr_prepare` ile ortusuyordu) kaldirildi. Modele ayni isi
-    # yapan iki tool gostermek yanlis secim uretir.
-    check("24 tool kayitli", len(REGISTRY) == 24, f"kayitli: {len(REGISTRY)}")
+    # Katalog 21 aractir: 20'si read-only urun profilinde gorunur,
+    # `sap_pr_submit` ise yalniz gelecek write surumunun regresyon testleri icin
+    # kayitli kalir ve policy tarafindan reddedilir. Released API yolu olmayan
+    # ATP/workflow/project-cost araclari bilerek kaldirildi.
+    check("21 tool kayitli", len(REGISTRY) == 21, f"kayitli: {len(REGISTRY)}")
+
+    settings = get_settings()
+    actor = _actor(roles=("BUYER_LEAD", "AUDITOR"))
+    visible = visible_tool_names(
+        domains_for_packs(tuple(PACKS)), actor, settings=settings
+    )
+    catalog_locked = (
+        settings.sap.read_only
+        and "sap_pr_submit" not in visible
+        and "sap_pr_prepare" in visible
+        and all(not REGISTRY[name].risk_tier.is_mutating for name in visible)
+    )
+    check(
+        "Varsayilan urun katalogu yalniz SAP read tool'lari gosteriyor",
+        catalog_locked,
+        f"SAP_READ_ONLY={settings.sap.read_only} | gorunen={len(visible)} | "
+        f"sap_pr_submit={'var' if 'sap_pr_submit' in visible else 'yok'}",
+    )
+
+    guessed, guessed_error = _call(
+        _ctx(actor),
+        "sap_pr_submit",
+        items=[{"material_id": "SFT-SCN-270", "quantity": 1}],
+        idempotency_key="verify:readonly:guess:v1",
+    )
+    check(
+        "Adi tahmin edilen write tool policy'de handler'dan once reddediliyor",
+        guessed_error and guessed.get("denial_code") == "READ_ONLY_MODE",
+        f"denial_code={guessed.get('denial_code', '')}",
+    )
     check(
         "kaldirilan tool'lar geri gelmedi",
         not {"sap_list_agents", "sap_validate_change"} & set(REGISTRY),
         "sap_list_domains ve sap_pr_prepare yerlerini aliyor",
     )
-    check("5 P2P tool'u kayit defterinde", all(n in REGISTRY for n in p2p), ", ".join(p2p))
+    check("4 P2P tool'u kayit defterinde", all(n in REGISTRY for n in p2p), ", ".join(p2p))
 
     read_only = all(not REGISTRY[n].risk_tier.is_mutating for n in p2p)
     check("P2P gorunurluk tool'larinin hicbiri SAP'a yazmiyor", read_only,
@@ -153,12 +190,6 @@ def verify_p2p() -> None:
           f"sapma %{price.get('variance_pct')} > tolerans %{price.get('tolerance_limit_pct')} "
           f"(anahtar {price.get('tolerance_key')})")
 
-    wf, err = _call(ctx, "sap_workflow_status",
-                    object_type="purchase_requisition", object_id="0010004801")
-    step = wf.get("current_step", {})
-    check("Onay is akisi nerede bekledigini gosteriyor", not err and step.get("step_no") == 3,
-          f"'{step.get('name')}' | {step.get('role')} | {step.get('waiting_days')} gun | "
-          f"termin asildi={wf.get('overdue')}")
     reset_tool_cache()
 
 
@@ -181,13 +212,6 @@ def verify_privacy() -> None:
           buyer_view["items"][0]["open_qty"] == watcher_view["items"][0]["open_qty"],
           f"open_qty={watcher_view['items'][0]['open_qty']} (iki rolde de ayni)")
 
-    # Kisisel veri modele gitmiyor.
-    wf, _ = _call(buyer, "sap_workflow_status",
-                  object_type="purchase_requisition", object_id="0010004801")
-    step = wf["current_step"]
-    check("Kisisel veri (islemci adi) modele varsayilan olarak gitmiyor",
-          step["processor_name"] == "***" and step["role"] == "Satinalma muduru",
-          f"processor_name={step['processor_name']} ama role={step['role']} (karar icin yeterli)")
 
     # D3 hicbir hedefe ham gitmiyor.
     from robotics_agent.privacy import DLPEngine, FieldAccessPolicy, get_pseudonymizer
@@ -321,12 +345,11 @@ def verify_authorization() -> None:
         ("sap_purchase_order_360", {"po_id": "4500019014"}),
         ("sap_supplier_invoice_status", {"only_blocked": True}),
         ("sap_invoice_block_explain", {"invoice_id": "5105600231"}),
-        ("sap_workflow_status", {"object_type": "purchase_order", "object_id": "4500019014"}),
     ):
         result, is_error = _call(anon, name, **args)
         denied.append(is_error and result.get("denial_code") == "AUTH_REQUIRED")
     check("Kimligi dogrulanmamis cagirici hicbir P2P verisi goremiyor", all(denied),
-          "5/5 tool AUTH_REQUIRED ile reddedildi")
+          "4/4 tool AUTH_REQUIRED ile reddedildi")
 
     # Yetkisiz tesis.
     wrong_plant = ActorContext(

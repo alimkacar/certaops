@@ -90,6 +90,11 @@ class DirectAnswerSpec:
     sufficient: Callable[[dict[str, Any]], bool] = _always
     #: Kullanicinin sorusundan dogrudan (LLM'siz) tetiklenebilir mi?
     allow_shortcut: bool = True
+    #: Model bu tool'u daha genis bir isin parcasi olarak sectiginde sonucu
+    #: modele geri vermeden tur bitirilebilir mi? Liste araclarinda genellikle
+    #: hayir: veri tek basina dogru olsa bile kullanicinin istedigi sentez
+    #: tamamlanmamis olabilir.
+    allow_self_contained: bool = True
 
 
 # --- Yardimcilar -------------------------------------------------------------
@@ -183,15 +188,43 @@ def _render_material(payload: dict[str, Any]) -> str:
     return _lines(*out) + _meta_note(payload)
 
 
+def _render_material_search(payload: dict[str, Any]) -> str:
+    """Malzeme arama sonucu zaten bir listedir; model yorumu gerektirmez."""
+    rows = payload.get("materials") or []
+    if not rows:
+        return "**Malzeme aramasi**\n- Eslesen malzeme bulunamadi." + _meta_note(payload)
+    out = [f"**Malzeme aramasi** ({payload.get('result_count', len(rows))} sonuc)"]
+    for row in rows[:20]:
+        price = row.get("price")
+        price_text = (
+            f"{_num(price, 2)} {row.get('currency', '')}" if price is not None else "okunamadi"
+        )
+        out.append(
+            f"- **{row.get('material_id', '')}** - {row.get('description', '')}\n"
+            f"  - Grup {row.get('material_group', '?')} | tur {row.get('type', '?')} "
+            f"| birim {row.get('unit', '?')}\n"
+            f"  - Fiyat {price_text} | tedarik {row.get('lead_time_days', '?')} gun"
+        )
+    return _lines(*out) + _meta_note(payload)
+
+
 def _render_purchase_orders(payload: dict[str, Any]) -> str:
     orders = payload.get("orders") or []
     if not orders:
         return ""
-    currency = payload.get("currency", "")
-    out = [
-        f"**Acik satinalma siparisleri** ({payload.get('order_count', len(orders))} adet, "
-        f"toplam {_num(payload.get('total_open_value'), 2)} {currency})"
-    ]
+    count = payload.get("order_count", len(orders))
+    # Karisik para biriminde tek toplam YOKTUR (kur uydurulmaz); toplamlar
+    # para birimi basina gelir ve ozet de oyle yazilir.
+    by_currency = payload.get("open_value_by_currency") or {}
+    if payload.get("total_open_value") is not None:
+        toplam = f"toplam {_num(payload.get('total_open_value'), 2)} {payload.get('currency', '')}"
+    elif by_currency:
+        toplam = "toplam " + " + ".join(
+            f"{_num(value, 2)} {code}" for code, value in by_currency.items()
+        )
+    else:
+        toplam = "tutar okunamadi"
+    out = [f"**Acik satinalma siparisleri** ({count} adet, {toplam})"]
     for order in orders[:20]:
         delay = order.get("delay_days") or 0
         marker = f" - {delay} gun oteleme" if delay else ""
@@ -242,25 +275,6 @@ def _render_supplier_scores(payload: dict[str, Any]) -> str:
     return _lines(*out) + _meta_note(payload)
 
 
-def _render_project_cost(payload: dict[str, Any]) -> str:
-    rows = payload.get("wbs_elements") or payload.get("projects") or []
-    if not rows:
-        return ""
-    currency = payload.get("currency", "")
-    out = [f"**Proje maliyet durumu** ({payload.get('as_of', '')})"]
-    for row in rows[:25]:
-        out.append(
-            f"- {row.get('wbs_element', '')} {row.get('description', '')}: "
-            f"plan {_num(row.get('plan_cost'), 2)}, fiili {_num(row.get('actual_cost'), 2)}, "
-            f"taahhut {_num(row.get('commitment'), 2)} {currency}"
-        )
-    alerts = payload.get("alerts") or []
-    if alerts:
-        out.append("\nUyarilar:")
-        out.extend(f"- {a if isinstance(a, str) else a.get('message', a)}" for a in alerts[:10])
-    return _lines(*out) + _meta_note(payload)
-
-
 def _render_capabilities(payload: dict[str, Any]) -> str:
     services = payload.get("service_manifest") or payload.get("services") or []
     supported = (payload.get("backend_capabilities") or {}).get("supported") or {}
@@ -295,6 +309,182 @@ def _render_capabilities(payload: dict[str, Any]) -> str:
     return _lines(*out) + _meta_note(payload)
 
 
+def _render_purchase_order_360(payload: dict[str, Any]) -> str:
+    """Tek siparisin 360 ozeti.
+
+    Bu tool'un ciktisi zaten deterministik olarak hesaplanmis: gecikme,
+    GR/IR farki, bloke faturalar ve `interpretation` metni kodda uretiliyor.
+    Modelin katkisi bicimlendirmeden ibaret oldugu icin sonucun ikinci kez
+    LLM'e gonderilmesi hem gecikme hem gizlilik maliyeti demekti.
+    """
+    po_id = payload.get("po_id")
+    if not po_id or payload.get("error"):
+        return ""
+    currency = payload.get("currency", "")
+    out = [
+        f"**Satinalma siparisi {po_id}** "
+        f"({payload.get('item_count', 0)} kalem, "
+        f"{payload.get('open_item_count', 0)} acik)",
+        f"- Toplam {_num(payload.get('total_value'), 2)} {currency}"
+        f" | acik {_num(payload.get('open_value'), 2)} {currency}"
+        f" | teslim %{payload.get('delivered_pct', 0)}",
+        f"- Mal kabul: {payload.get('goods_receipt_count', 0)} kayit"
+        f" | fatura: {payload.get('invoice_count', 0)}",
+    ]
+    if payload.get("gr_ir_gap_qty"):
+        out.append(
+            f"- GR/IR farki: {_num(payload.get('gr_ir_gap_qty'))} adet"
+            + (
+                f" ({_num(payload.get('gr_ir_gap_value'), 2)} {currency})"
+                if payload.get("gr_ir_gap_value")
+                else ""
+            )
+        )
+    if payload.get("max_delay_days"):
+        out.append(f"- En buyuk oteleme: {payload['max_delay_days']} gun")
+    if payload.get("blocked_invoices"):
+        out.append(f"- Bloke fatura: {', '.join(payload['blocked_invoices'])}")
+    for warning in payload.get("warnings") or []:
+        out.append(f"- Dikkat: {warning}")
+    if payload.get("interpretation"):
+        out.append(f"\n{payload['interpretation']}")
+    return _lines(*out) + _meta_note(payload)
+
+
+def _render_supplier_invoice_status(payload: dict[str, Any]) -> str:
+    """Tek PO veya tek fatura durumunu LLM kotasindan bagimsiz cevapla."""
+    query = payload.get("query") or {}
+    if not isinstance(query, dict):
+        return ""
+
+    invoice_id = query.get("invoice_id")
+    if invoice_id:
+        rows = payload.get("invoices") or []
+        if not rows:
+            return (
+                f"**Tedarikci faturasi {invoice_id} bulunamadi.**\n"
+                f"{payload.get('interpretation', '')}"
+            ).strip() + _meta_note(payload)
+        row = rows[0]
+        out = [
+            f"**Tedarikci faturasi {row.get('invoice_id', invoice_id)}** "
+            f"(durum: {row.get('status', '?')})",
+            f"- Tedarikci: {row.get('vendor_id', '?')} {row.get('vendor_name', '')}",
+            f"- Tutar: {_num(row.get('gross_amount'), 2)} {row.get('currency', '')}",
+            f"- Kayit: {row.get('posting_date', '?')} | vade: {row.get('due_date', '?')}",
+        ]
+        if row.get("payment_block"):
+            out.append(
+                f"- Odeme blokaji: {row['payment_block']}"
+                + (
+                    f" ({', '.join(row.get('block_reasons') or [])})"
+                    if row.get("block_reasons")
+                    else ""
+                )
+            )
+        if row.get("days_overdue"):
+            out.append(f"- Vadesi {row['days_overdue']} gun gecmis.")
+        if row.get("po_ids"):
+            out.append(f"- Siparisler: {', '.join(row['po_ids'])}")
+        if payload.get("interpretation"):
+            out.append(f"\n{payload['interpretation']}")
+        return _lines(*out) + _meta_note(payload)
+
+    if not query.get("po_id"):
+        return ""
+
+    issued = bool(payload.get("invoice_issued"))
+    parked_count = int(payload.get("parked_count") or 0)
+    if issued:
+        heading = "**Evet - bu siparis icin aktif fatura var.**"
+    elif parked_count:
+        heading = "**Henuz degil - fatura park halinde, muhasebelesmemis.**"
+    else:
+        heading = "**Hayir - bu siparis icin aktif fatura bulunamadi.**"
+
+    out = [
+        heading,
+        f"- Aktif fatura: {payload.get('invoice_count', 0)}"
+        f" | park: {parked_count}"
+        f" | iptal: {payload.get('cancelled_count', 0)}",
+    ]
+    if payload.get("blocked_count"):
+        out.append(f"- Odeme blokajli: {payload['blocked_count']}")
+    if payload.get("overdue_count"):
+        out.append(f"- Vadesi gecmis aktif fatura: {payload['overdue_count']}")
+    totals = payload.get("total_gross_by_currency") or {}
+    if totals:
+        out.append(
+            "- Aktif fatura toplami: "
+            + " + ".join(f"{_num(amount, 2)} {currency}" for currency, amount in totals.items())
+        )
+    if payload.get("interpretation"):
+        out.append(f"\n{payload['interpretation']}")
+    return _lines(*out) + _meta_note(payload)
+
+
+def _render_document_flow(payload: dict[str, Any]) -> str:
+    """Belge zinciri: PR -> PO -> mal kabul -> fatura -> odeme."""
+    stages = payload.get("stages") or []
+    if not stages:
+        return ""
+    out = [
+        f"**Belge akisi: {payload.get('document_id', '')}** "
+        f"({payload.get('resolved_type', 'bilinmiyor')})"
+    ]
+    for stage in stages:
+        documents = stage.get("documents") or []
+        shown = ", ".join(documents[:5])
+        if len(documents) > 5:
+            shown += f" (+{len(documents) - 5})"
+        out.append(f"- {stage.get('stage', stage.get('type', ''))}: {stage.get('count', 0)} - {shown}")
+    out.append(
+        "\nZincir "
+        + ("odemeye kadar tamamlanmis." if payload.get("chain_complete") else "henuz tamamlanmamis.")
+    )
+    if payload.get("interpretation"):
+        out.append(payload["interpretation"])
+    return _lines(*out) + _meta_note(payload)
+
+
+def _render_invoice_block(payload: dict[str, Any]) -> str:
+    """Fatura blokaj aciklamasi.
+
+    Bu tool cevabi ZATEN uretiyor: `interpretation` ve `next_steps` kodda,
+    deterministik olarak hesaplaniyor. Modele geri gondermek yalnizca ayni
+    metni yeniden yazdirmakti.
+    """
+    if not payload.get("invoice_id") or payload.get("error"):
+        return ""
+    if payload.get("blocked") is False:
+        return _lines(
+            f"**Fatura {payload['invoice_id']}** bloke degil "
+            f"(durum: {payload.get('status', '?')})."
+        ) + _meta_note(payload)
+
+    out = [
+        f"**Fatura {payload['invoice_id']} bloke** "
+        f"({_num(payload.get('gross_amount'), 2)} {payload.get('currency', '')}, "
+        f"tedarikci {payload.get('vendor_id', '?')})",
+        f"- Blokaj sayisi: {payload.get('block_count', 0)}"
+        f" | nedenler: {', '.join(payload.get('block_reasons') or ['bilinmiyor'])}",
+    ]
+    if payload.get("payment_block"):
+        out.append(f"- Odeme blokaj anahtari: {payload['payment_block']}")
+    for finding in (payload.get("findings") or [])[:6]:
+        variance = finding.get("variance_pct")
+        out.append(
+            f"- Kalem {finding.get('item_no', '')}: {finding.get('reason', '')}"
+            + (f" (sapma %{variance})" if variance is not None else "")
+            + (f"\n  {finding['resolution']}" if finding.get("resolution") else "")
+        )
+    if payload.get("interpretation"):
+        out.append(f"\n{payload['interpretation']}")
+    for step in (payload.get("next_steps") or [])[:4]:
+        out.append(f"- Sonraki adim: {step}")
+    return _lines(*out) + _meta_note(payload)
+
+
 #: Modeli atlayabilecek tool'lar. Bu liste bir GUVENLIK KONTROLUDUR: burada
 #: olmayan hicbir tool sonucu dogrudan kullaniciya donmez.
 DIRECT_ANSWER_TOOLS: dict[str, DirectAnswerSpec] = {
@@ -302,17 +492,57 @@ DIRECT_ANSWER_TOOLS: dict[str, DirectAnswerSpec] = {
         render=_render_stock, sufficient=_stock_is_sufficient
     ),
     "sap_material_360": DirectAnswerSpec(render=_render_material),
-    "sap_track_purchase_orders": DirectAnswerSpec(render=_render_purchase_orders),
+    "sap_search_materials": DirectAnswerSpec(render=_render_material_search),
+    "sap_track_purchase_orders": DirectAnswerSpec(
+        render=_render_purchase_orders,
+        # "MAT-1 acik siparisleri" kisayolu icin yerel liste yeterlidir.
+        # Modelin sectigi genel liste ise tedarikci risk karsilastirmasi gibi
+        # daha genis bir isin yalniz ilk adimi olabilir; erken bitirilmez.
+        allow_self_contained=False,
+    ),
     "sap_connection_health": DirectAnswerSpec(render=_render_health),
     "sap_supplier_score_360": DirectAnswerSpec(render=_render_supplier_scores),
-    "sap_project_cost_status": DirectAnswerSpec(render=_render_project_cost),
     "sap_discover_capabilities": DirectAnswerSpec(render=_render_capabilities),
+    # Bu ucu de cevabi ZATEN kodda uretiyor (`interpretation`, `next_steps`,
+    # hesaplanmis gecikme/sapma). Sonucu modele geri gondermek ayni metni
+    # yeniden yazdirmakti: bir LLM round-trip'i ve tum SAP payload'inin
+    # ikinci kez saglayiciya cikmasi. Ikisi de gereksiz.
+    "sap_purchase_order_360": DirectAnswerSpec(render=_render_purchase_order_360),
+    "sap_supplier_invoice_status": DirectAnswerSpec(
+        render=_render_supplier_invoice_status,
+        # Tek PO ve tek fatura kesin filtrelerdir. Tedarikci/liste sorgulari
+        # daha genis yorum isteyebilecegi icin model yolunda kalir.
+        sufficient=lambda p: bool(
+            (p.get("query") or {}).get("po_id")
+            or (p.get("query") or {}).get("invoice_id")
+        ),
+    ),
+    "sap_document_flow": DirectAnswerSpec(render=_render_document_flow),
+    "sap_invoice_block_explain": DirectAnswerSpec(
+        render=_render_invoice_block,
+        # Bloke OLMAYAN fatura icin kisayol yeterlidir; bloke olan ve hicbir
+        # kalem bulgusu cikmayan durumda model devreye girsin: neden
+        # okunamadiginda kullaniciya yol gostermek yorum ister.
+        sufficient=lambda p: bool(p.get("blocked") is False or p.get("findings")),
+    ),
 }
 
 
 # --- Niyet kisayollari (LLM cagrilmadan) -------------------------------------
 #: SAP malzeme/belge numarasi: buyuk harf, rakam, tire, alt cizgi, egik cizgi.
-_CODE = r"[A-Z0-9][A-Z0-9\-_/\.]{2,39}"
+#: API Hub gibi sistemlerde ``21`` gibi iki karakterli malzeme kimlikleri de
+#: vardir. Onceki alt sinir uc karakterdi; bu nedenle gecerli bir SAP kimligi
+#: daha regex'e girmeden modele dusuyor ve model kotasina bagimli kaliyordu.
+_CODE = r"[A-Z0-9][A-Z0-9\-_/\.]{1,39}"
+
+
+def _code(match: re.Match[str], *groups: str) -> str:
+    """Alternatif regex gruplarindan ilk SAP kimligini normallestir."""
+    for group in groups:
+        value = match.groupdict().get(group)
+        if value:
+            return value.upper()
+    return ""
 
 
 @dataclass(frozen=True)
@@ -345,9 +575,26 @@ SHORTCUTS: tuple[IntentShortcut, ...] = (
             rf"(?:stok|stock)\s*(?:durumu|seviyesi|level)?\s*[:\-]?\s*(?P<code>{_CODE})\s*\??"
             rf"|(?P<code2>{_CODE})\s*(?:icin|için|of)?\s*(?:stok|stock)"
             r"\s*(?:durumu|seviyesi|level|nedir|ne kadar)?\s*\??"
+            rf"|(?P<code3>{_CODE})\s*(?:numarali|numaralı|nolu|no'lu)?\s*"
+            r"(?:malzemenin|malzeme|materialin|material)\s*"
+            r"(?:stok|stock)\s*(?:durumu|durumunu|seviyesi|seviyesini)?\s*"
+            r"(?:goster|göster|getir|nedir|ne kadar)?\s*\??"
         ),
-        build=lambda m: {"material_ids": [(m.group("code") or m.group("code2")).upper()]},
+        build=lambda m: {"material_ids": [_code(m, "code", "code2", "code3")]},
         description="Tek malzemenin stok fotografi",
+    ),
+    IntentShortcut(
+        name="material_search",
+        tool="sap_search_materials",
+        pattern=_rx(
+            rf"(?P<query>{_CODE})\s+ile\s+(?:baslayan|başlayan)\s+"
+            r"(?:malzemeleri|malzemeler|materials?)\s*"
+            r"(?:ara|bul|listele|goster|göster|getir)\s*\??"
+            rf"|(?P<query2>{_CODE})\s+(?:malzemelerini|malzemeleri|materials?)\s*"
+            r"(?:ara|bul|listele|goster|göster|getir)\s*\??"
+        ),
+        build=lambda m: {"query": _code(m, "query", "query2")},
+        description="Kod/aciklama metniyle malzeme ara",
     ),
     IntentShortcut(
         name="material",
@@ -356,9 +603,53 @@ SHORTCUTS: tuple[IntentShortcut, ...] = (
             rf"(?:malzeme|material)\s*(?:bilgisi|karti|kartı|360|detayi|detayı)?\s*[:\-]?\s*"
             rf"(?P<code>{_CODE})\s*\??"
             rf"|(?P<code2>{_CODE})\s*(?:malzeme|material)\s*(?:bilgisi|karti|kartı|360)\s*\??"
+            rf"|(?P<code3>{_CODE})\s*(?:numarali|numaralı|nolu|no'lu)?\s*"
+            r"(?:malzemenin|malzeme|materialin|material)\s*"
+            r"(?:detayi|detayı|detaylari|detayları|detaylarini|detaylarını|"
+            r"bilgisi|bilgilerini|karti|kartı|360)\s*"
+            r"(?:goster|göster|getir|listele|nedir)?\s*\??"
         ),
-        build=lambda m: {"material_id": (m.group("code") or m.group("code2")).upper()},
+        build=lambda m: {"material_id": _code(m, "code", "code2", "code3")},
         description="Malzeme ana verisi ozeti",
+    ),
+    IntentShortcut(
+        name="purchase_order_invoice_status",
+        tool="sap_supplier_invoice_status",
+        pattern=_rx(
+            rf"(?P<code>{_CODE})\s*(?:numarali|numaralı)?\s*"
+            r"(?:(?:satinalma|satın\s+alma)\s+)?"
+            r"(?:siparisinin|siparişinin|siparisin|siparişin|siparis|sipariş|po(?:['’]nun)?)\s+"
+            r"(?:faturasi|faturası)\s+"
+            r"(?:kesildi\s+mi|kesilmis\s+mi|kesilmiş\s+mi|var\s+mi|var\s+mı|durumu(?:\s+nedir)?)\s*\??"
+        ),
+        build=lambda m: {"po_id": _code(m, "code")},
+        description="Tek siparis icin aktif fatura var/yok durumu",
+    ),
+    IntentShortcut(
+        name="supplier_invoice_status",
+        tool="sap_supplier_invoice_status",
+        pattern=_rx(
+            rf"(?P<code>{_CODE})\s*(?:numarali|numaralı|nolu|no'lu)?\s*"
+            r"(?:tedarikci|tedarikçi|supplier)?\s*"
+            r"(?:faturasinin|faturasının|fatura|invoice)\s*"
+            r"(?:durumu|durumunu|statusu|statüsü|status)\s*"
+            r"(?:nedir|goster|göster|getir)?\s*\??"
+        ),
+        build=lambda m: {"invoice_id": _code(m, "code")},
+        description="Tek tedarikci faturasinin durumu",
+    ),
+    IntentShortcut(
+        name="purchase_order_status",
+        tool="sap_purchase_order_360",
+        pattern=_rx(
+            rf"(?P<code>{_CODE})\s*(?:numarali|numaralı|nolu|no'lu)?\s*"
+            r"(?:(?:satinalma|satın\s+alma)\s+)?"
+            r"(?:siparisinin|siparişinin|siparisin|siparişin|siparis|sipariş|po(?:['’]nun)?)\s*"
+            r"(?:durumu|detayi|detayı|detaylari|detayları|ozeti|özeti|360|nerede)\s*"
+            r"(?:nedir|goster|göster|getir)?\s*\??"
+        ),
+        build=lambda m: {"po_id": _code(m, "code")},
+        description="Tek satinalma siparisinin 360 durumu",
     ),
     IntentShortcut(
         name="purchase_orders",
@@ -367,15 +658,16 @@ SHORTCUTS: tuple[IntentShortcut, ...] = (
             rf"(?:acik|açık|open)?\s*(?:siparis|sipariş|po)\s*(?:durumu|takibi|listesi|status)?"
             rf"\s*[:\-]?\s*(?P<code>{_CODE})\s*\??"
         ),
-        build=lambda m: {"material_id": m.group("code").upper(), "only_open": True},
+        build=lambda m: {"material_id": _code(m, "code"), "only_open": True},
         description="Bir malzemenin acik siparisleri",
     ),
     IntentShortcut(
         name="health",
         tool="sap_connection_health",
         pattern=_rx(
-            r"(?:sap\s*)?(?:baglanti|bağlantı|connection)\s*"
-            r"(?:durumu|saglik|sağlık|health|test|kontrol)?\s*\??"
+            r"(?:sap\s*)?(?:baglantisi|bağlantısı|baglanti|bağlantı|connection)\s*"
+            r"(?:durumu|sagligi|sağlığı|saglik|sağlık|saglikli|sağlıklı|"
+            r"health|test|kontrol)?\s*(?:mi|mı|mu|mü|nedir)?\s*\??"
             r"|(?:sistem|system)\s*(?:durumu|health|status)\s*\??"
             r"|health\s*check\s*\??"
         ),
@@ -385,8 +677,11 @@ SHORTCUTS: tuple[IntentShortcut, ...] = (
         name="capabilities",
         tool="sap_discover_capabilities",
         pattern=_rx(
-            r"(?:hangi\s+)?(?:sap\s*)?(?:yetenek|yetenekler|capabilities?|servisler?)\s*"
-            r"(?:listesi|envanteri|var|nedir)?\s*\??"
+            r"(?:hangi\s+)?(?:sap\s*)?(?:sisteminin\s+)?"
+            r"(?:destekledigi|desteklediği|sundugu|sunduğu|aktif\s+olan\s+)?\s*"
+            r"(?:yetenek|yetenekler|yetenekleri|capabilities?|servis|servisler|servisleri)"
+            r"(?:\s+ve\s+(?:yetenek|yetenekler|yetenekleri|servis|servisler|servisleri))?\s*"
+            r"(?:listesi|envanteri|var|nedir|listele|goster|göster|getir)?\s*\??"
         ),
         description="Hedef sistemde hangi SAP servisleri kullanilabilir",
     ),
@@ -410,6 +705,13 @@ def match_shortcut(message: str) -> ShortcutMatch | None:
     **asla** tahmin etmez: `fullmatch` disinda hicbir sey kisayol saymaz.
     """
     text = " ".join((message or "").split())
+    # Kullanicilar test listesinden kopyalarken "1." / "2)" gibi sira
+    # numarasini da mesaja dahil edebiliyor. Bu sunum on eki niyetin parcasi
+    # degildir; guvenli tek-soru eslesmesinden once atilir.
+    text = re.sub(r"^(?:\d{1,3}[\.)]\s+|[-*]\s+)", "", text)
+    # Kullanici cumleyi nokta/unlemle bitirdiginde niyet degismez. Regex'lerin
+    # kimlik grubunun son noktayi SAP kodunun parcasi sanmasini da engeller.
+    text = text.rstrip(" .,!;:")
     if not text or len(text) > 120:
         # Uzun mesaj = birden fazla istek olma ihtimali yuksek; modele birak.
         return None
@@ -437,18 +739,26 @@ def direct_answer_for(
     Reddedilme sebepleri (hepsi fail-open, yani model devreye girer):
       - tool allowlist'te degil,
       - sonuc hata veya `needs_review` tasiyor,
-      - tool "bu sonuc tek basina yeterli degil" diyor,
+      - modelin sectigi tool "bu sonuc tek basina yeterli degil" diyor,
       - renderer bos metin uretti veya patladi.
     """
     spec = DIRECT_ANSWER_TOOLS.get(tool)
     if spec is None:
+        return None
+    if reason == "self_contained" and not spec.allow_self_contained:
         return None
     if not isinstance(payload, dict) or "error" in payload:
         return None
     if payload.get("needs_review") or payload.get("denial_code"):
         return None
     try:
-        if not spec.sufficient(payload):
+        # Kesin shortcut kaliplari kullanicinin yalnizca ham durumu
+        # istedigini kanitlar. Ornegin "21 ... stok durumunu goster" eksik
+        # stok dondurse bile yerel renderer soruyu eksiksiz cevaplar; alternatif
+        # tedarikci istenmedikce modele ihtiyac yoktur. `self_contained`
+        # yolunda ise model daha genis bir istegi yurutuyor olabilir, bu
+        # nedenle tool'un yeterlilik kosulu aynen korunur.
+        if reason != "shortcut" and not spec.sufficient(payload):
             return None
         text = spec.render(payload).strip()
     except Exception:  # noqa: BLE001 - render hatasi modele dusmeyi engellemez

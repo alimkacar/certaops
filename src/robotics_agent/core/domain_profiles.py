@@ -53,7 +53,7 @@ AGENT_SPECS: dict[str, AgentSpec] = {
         title="SAP Planlama ve Tedarik Zinciri Profili",
         packs=(BOOTSTRAP_PACK, "procurement_read", "p2p_visibility"),
         mission=(
-            "Stok, ATP, MRP arz/talep, tedarikci performansi, TCO, acik siparis takibi ve "
+            "Stok, MRP arz/talep, tedarikci performansi, TCO, acik siparis takibi ve "
             "PR-PO-mal kabul-fatura belge zincirini salt okunur SAP verisiyle yurutur."
         ),
         handoff_targets=("procurement", "master_data", "finance", "platform"),
@@ -61,22 +61,22 @@ AGENT_SPECS: dict[str, AgentSpec] = {
     "procurement": AgentSpec(
         key="procurement",
         title="SAP Satinalma Profili",
-        packs=(BOOTSTRAP_PACK, "procurement_write", "procurement_read", "p2p_approval"),
+        packs=(BOOTSTRAP_PACK, "procurement_write", "procurement_read"),
         mission=(
-            "Satinalma talebini hazirlar, deterministik diff ve dogrulama uretir, onay "
-            "is akisinin nerede bekledigini gosterir; yalniz policy/onay/idempotency "
-            "protokolu izin verirse SAP'a yazar."
+            "Satinalma talebi taslagi hazirlar, deterministik diff ve dogrulama uretir. "
+            "Mevcut read-only surum SAP'a yazmaz; gelecekteki write protokolu yalniz "
+            "policy/onay/idempotency kapilariyla acilabilir."
         ),
         handoff_targets=("supply_chain", "master_data", "finance", "platform"),
     ),
     "finance": AgentSpec(
         key="finance",
-        title="SAP Proje Finans ve Raporlama Profili",
-        packs=(BOOTSTRAP_PACK, "project_finance", "p2p_finance", "reporting"),
+        title="SAP Finans ve Raporlama Profili",
+        packs=(BOOTSTRAP_PACK, "p2p_finance", "reporting"),
         mission=(
-            "SAP WBS plan/fiili/taahhut verisini, EAC/ETC durumunu, tedarikci faturasi "
-            "odeme/blokaj durumunu ve SAP kaynakli yonetim raporlarini uretir. SAP disi "
-            "BOM veya muhendislik tahmini yapmaz."
+            "Tedarikci faturasi odeme/blokaj durumunu ve SAP kaynakli yonetim "
+            "raporlarini uretir. SAP disi BOM, proje maliyeti veya muhendislik "
+            "tahmini yapmaz."
         ),
         handoff_targets=("procurement", "supply_chain", "platform"),
     ),
@@ -89,9 +89,7 @@ PACK_TO_AGENT: dict[str, str] = {
     "procurement_read": "supply_chain",
     "procurement_write": "procurement",
     "p2p_visibility": "supply_chain",
-    "p2p_approval": "procurement",
     "p2p_finance": "finance",
-    "project_finance": "finance",
     "reporting": "finance",
 }
 

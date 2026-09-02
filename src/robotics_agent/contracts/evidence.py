@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from ..security_at_rest import decrypt_if_needed
 from .actor import ActorContext
 
 
@@ -220,10 +221,21 @@ class SQLiteEvidenceStore(BaseEvidenceStore):
     worker'a dusse bile cozulebilir.
     """
 
-    def __init__(self, db: Any, *, ttl_minutes: int = 120, max_entries: int = 500) -> None:
+    def __init__(
+        self,
+        db: Any,
+        *,
+        ttl_minutes: int = 120,
+        max_entries: int = 500,
+        cipher: Any = None,
+    ) -> None:
         self._db = db
         self._ttl = timedelta(minutes=max(1, ttl_minutes))
         self._max_entries = max(10, max_entries)
+        # `AGENT_EVIDENCE_ENCRYPTION` acikken kurulan AES-GCM zarfi. `None`
+        # ise kayitlar duz metin yazilir; ayarin acik ama etkisiz kaldigi
+        # ucuncu bir durum YOKTUR (bkz. core/at_rest.py).
+        self._cipher = cipher
 
     def put(
         self,
@@ -237,6 +249,11 @@ class SQLiteEvidenceStore(BaseEvidenceStore):
         now = datetime.now(timezone.utc)
         evidence_id = self._new_id()
         body = {"payload": payload, "shared_with": list(shared_with)}
+        # Kanit govdesi SAP is verisi tasir (D2/D3'e kadar). Diskte sifrelenen
+        # alan budur; sahiplik/TTL sutunlari sorgulanabilir kalmali.
+        body_json = json.dumps(body, ensure_ascii=False, default=str)
+        if self._cipher is not None:
+            body_json = self._cipher.encrypt(body_json)
         with self._db.write() as conn:
             conn.execute("DELETE FROM evidence WHERE expires_at <= ?", (now.isoformat(),))
             conn.execute(
@@ -250,7 +267,7 @@ class SQLiteEvidenceStore(BaseEvidenceStore):
                     actor.tenant,
                     actor.subject,
                     tool,
-                    json.dumps(body, ensure_ascii=False, default=str),
+                    body_json,
                     json.dumps(evidence.to_dict(), ensure_ascii=False),
                     now.isoformat(),
                     (now + self._ttl).isoformat(),
@@ -275,7 +292,7 @@ class SQLiteEvidenceStore(BaseEvidenceStore):
         expires_at = datetime.fromisoformat(row["expires_at"])
         if expires_at <= datetime.now(timezone.utc):
             raise KeyError(evidence_id)
-        body = json.loads(row["payload_json"] or "{}")
+        body = json.loads(decrypt_if_needed(self._cipher, row["payload_json"] or "{}"))
         entry = _EvidenceEntry(
             evidence_id=row["evidence_id"],
             tenant=row["tenant"],

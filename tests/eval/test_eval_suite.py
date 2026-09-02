@@ -263,6 +263,14 @@ def run_unauthorized(report: EvalReport, settings) -> None:
         "APPROVAL_INVALID",
         "APPROVAL_SCOPE_EXCEEDED",
         "MISSING_SCOPE",
+        # Calisma zamani risk yukseltmesi bu iki vakayi onay kapisindan ONCE
+        # yakalar: dogrulanmis tutar islemi R4'e cikarir ve R4 iki onaylayan
+        # ister. Daha SIKI bir reddir; yazma yine gerceklesmez.
+        "RISK_ESCALATED",
+        # Mevcut urun profili mutasyonu onay kapisindan da once kapatir. Eval
+        # kosucusu current-release vakalarini read-only profilde calistirir;
+        # write protokolu ayri, acik opt-in profilde regresyon olarak korunur.
+        "READ_ONLY_MODE",
     }
     report.record(
         "unauth-no-approval",
@@ -478,6 +486,9 @@ def run_write_flow(report: EvalReport, settings, grant_approval) -> None:
 @pytest.fixture(scope="function")
 def eval_report(settings, settings_factory, tmp_path, grant_approval) -> EvalReport:
     """Tum eval vakalarini calistirir ve raporu dondurur."""
+    # Write guvenlik eval'leri gelecek opt-in paketin onay/idempotency
+    # davranisini korur. Varsayilan read-only profil ayri security kapisidir.
+    object.__setattr__(settings.sap, "read_only", False)
     report = EvalReport()
     run_tool_selection(report)
     run_sensitive_leakage(report)

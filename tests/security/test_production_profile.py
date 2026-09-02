@@ -129,6 +129,7 @@ _SAFE_PRODUCTION = {
     "privacy.dlp_mode": "enforce",
     "privacy.pseudonymization_key_id": "kms://tenant-pseudonym-v1",
     "privacy.kms_key_id": "kms://agent-data-key-v1",
+    "privacy.audit_encryption": True,
     "privacy.retention_sweep_seconds": 900,
     "cache.d3_enabled": False,
     "risk.scoring_mode": "enforce",
@@ -169,6 +170,7 @@ def test_simulation_backend_blocks_production(settings_factory, tmp_path):
         ({"privacy.dlp_mode": "report"}, "AGENT_DLP_MODE"),
         ({"privacy.pseudonymization_key_id": ""}, "AGENT_PSEUDONYMIZATION_KEY_ID"),
         ({"privacy.kms_key_id": ""}, "AGENT_KMS_KEY_ID"),
+        ({"privacy.audit_encryption": False}, "AGENT_AUDIT_ENCRYPTION"),
         ({"privacy.retention_sweep_seconds": 0}, "AGENT_RETENTION_SWEEP_SECONDS"),
         ({"cache.d3_enabled": True}, "AGENT_D3_CACHE_ENABLED"),
         ({"risk.scoring_mode": "report"}, "AGENT_RISK_SCORING_MODE"),
@@ -204,8 +206,51 @@ def test_development_profile_only_warns(settings_factory, tmp_path):
 
 def test_posture_summarizes_configuration(settings_factory, tmp_path):
     posture = settings_factory(tmp_path).posture()
-    for key in ("app_env", "auth_mode", "dry_run", "approval_gateway", "session_backend"):
+    for key in (
+        "app_env",
+        "auth_mode",
+        "read_only",
+        "dry_run",
+        "approval_gateway",
+        "session_backend",
+        "log_masking",
+        "ui_enabled",
+    ):
         assert key in posture
+
+
+# --- Loglama ve arayuz kapilari ---------------------------------------------
+def test_unmasked_logging_blocks_production(settings_factory, tmp_path):
+    """Maskesiz log hassas veriyi audit defterinin disina kopyalar.
+
+    Orada saklama politikasi ve erisim kontrolu bizim degil, altyapinin
+    elindedir; uretimde bu bir yapilandirma hatasi degil, veri sizintisidir.
+    """
+    settings = _prod(settings_factory, tmp_path, **{"logging.mask": False})
+    assert any("LOG_MASK=false" in b for b in settings.production_blockers())
+
+
+def test_masked_logging_is_not_a_blocker(settings_factory, tmp_path):
+    settings = _prod(settings_factory, tmp_path, **{"logging.mask": True})
+    assert not any("LOG_MASK" in b for b in settings.production_blockers())
+
+
+def test_ui_without_authentication_blocks_production(settings_factory, tmp_path):
+    settings = _prod(
+        settings_factory,
+        tmp_path,
+        **{"ui.enabled": True, "security.auth_mode": "none"},
+    )
+    assert any("AGENT_UI_ENABLED=true" in b for b in settings.production_blockers())
+
+
+def test_authenticated_ui_is_not_a_blocker(settings_factory, tmp_path):
+    settings = _prod(
+        settings_factory,
+        tmp_path,
+        **{"ui.enabled": True, "security.auth_mode": "static_token"},
+    )
+    assert not any("AGENT_UI_ENABLED" in b for b in settings.production_blockers())
 
 
 # --- Onay gecidi secimi -----------------------------------------------------

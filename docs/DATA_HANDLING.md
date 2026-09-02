@@ -155,7 +155,8 @@ gercek SAP anahtarina cevirme backend'de yapilir, model gercek kimligi gormez.
 - [ ] `AGENT_AUTH_MODE` none degil
 - [ ] `GEMINI_STORE_INTERACTIONS=false`
 - [ ] Oturum backend'i sqlite (bellek degil)
-- [ ] Evidence sifreleme anahtari tanimli
+- [ ] `AGENT_AT_REST_KEY` guvenli secret kaynagindan saglaniyor
+- [ ] `AGENT_AUDIT_ENCRYPTION=true` (SQLite audit govdesi ve mirror sifreli)
 
 Bloker olmayan ama **onerilen**:
 

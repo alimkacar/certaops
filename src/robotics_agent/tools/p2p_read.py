@@ -1,10 +1,9 @@
 """Salt-okunur procure-to-pay gorunurluk tool'lari.
 
-Bes salt-okunur tool, bir soruyu cevaplar: **"Bu is nerede takildi?"**
+Dort salt-okunur tool, bir soruyu cevaplar: **"Bu is nerede takildi?"**
 
     sap_document_flow             PR -> PO -> mal kabul -> fatura -> odeme zinciri
     sap_purchase_order_360        PO kalem, teslimat plani, GR ve fatura durumu
-    sap_workflow_status           Onay kimde, ne kadardir, neden bekliyor
     sap_supplier_invoice_status   Faturanin muhasebe ve odeme durumu
     sap_invoice_block_explain     Tolerans blokajinin sayisal aciklamasi
 
@@ -22,10 +21,11 @@ Ortak kurallar:
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date
 from typing import Any
 
 from ..adapters.sap import SAPError, SAPNotSupported
+from ..adapters.sap.concurrency import gather_named
 from ..cache import CachePolicy
 from ..contracts import (
     DETAIL_SCHEMA,
@@ -66,7 +66,6 @@ _P2P_DATA_POLICY = DataPolicy(
         "net_value": DataClass.D2,
         "gross_amount": DataClass.D2,
         "amount": DataClass.D2,
-        "processor_name": DataClass.D2,
         "requested_by": DataClass.D2,
         "vendor_name": DataClass.D2,
         "supplier_iban": DataClass.D3,
@@ -156,7 +155,6 @@ def sap_document_flow(
             ),
             "next_steps": [
                 "Belge numarasini ve tipini dogrulayin.",
-                "PR ise sap_workflow_status ile onay adiminda bekleyip beklemedigine bakin.",
             ],
         }
 
@@ -292,9 +290,20 @@ def sap_purchase_order_360(
                 "error": f"Satinalma siparisi {po_id} bulunamadi veya kalem icermiyor.",
                 "sap_code": "EKPO_NOT_FOUND",
             }
-        schedule = ctx.sap.get_schedule_lines(po_id)
-        receipts = ctx.sap.get_goods_receipts(po_id=po_id)
-        invoices = ctx.sap.get_supplier_invoices(po_id=po_id)
+        # Kalemler dondukten SONRA kalan uc okuma birbirinden bagimsizdir ve
+        # paralel gider. Kalem okumasi bilerek disarida: PO yoksa erken donup
+        # uc gereksiz cagriyi hic yapmiyoruz.
+        rest = gather_named(
+            {
+                "schedule": lambda: ctx.sap.get_schedule_lines(po_id),
+                "receipts": lambda: ctx.sap.get_goods_receipts(po_id=po_id),
+                "invoices": lambda: ctx.sap.get_supplier_invoices(po_id=po_id),
+            },
+            max_workers=ctx.settings.risk.max_parallel_reads,
+        )
+        schedule = rest["schedule"]
+        receipts = rest["receipts"]
+        invoices = rest["invoices"]
     except SAPNotSupported as exc:
         return {"error": str(exc), "remediation": exc.hint, "denial_code": "CAPABILITY_NOT_SUPPORTED"}
     except SAPError as exc:
@@ -307,9 +316,11 @@ def sap_purchase_order_360(
     for receipt in receipts:
         if not receipt.po_item:
             continue
-        sign = -1.0 if receipt.is_reversal or receipt.reversed else 1.0
+        # `signed_quantity` isareti hareket tipinden turetir: iptal edilmis
+        # asil satir + , onu goturen ters kayit - . Toplam SAP aritmetigiyle
+        # ayni sonucu verir.
         delivered_by_item[receipt.po_item] = round(
-            delivered_by_item.get(receipt.po_item, 0.0) + sign * receipt.quantity,
+            delivered_by_item.get(receipt.po_item, 0.0) + receipt.signed_quantity,
             3,
         )
     invoiced_by_item: dict[str, float] = {}
@@ -459,153 +470,6 @@ def _po_interpretation(*, open_items, max_delay: int, gap: float, invoices) -> s
             f"{len(blocked)} fatura bloke; nedeni icin sap_invoice_block_explain kullanin."
         )
     return " ".join(parts)
-
-
-# ---------------------------------------------------------------------------
-@tool(
-    name="sap_workflow_status",
-    group="p2p",
-    domain="p2p_approval",
-    risk_tier=RiskTier.R0,
-    required_scopes=(SCOPE_SAP_READ,),
-    result_token_budget=900,
-    data_policy=_P2P_DATA_POLICY,
-    impact_profile=READ_ONLY,
-    cache_policy=CachePolicy(
-        ttl_seconds=30, max_class=DataClass.D2, invalidated_by=("object_id",)
-    ),
-    performance_budget=PerformanceBudget(p95_ms=3000, max_sap_calls=2, max_records=50),
-    description=(
-        "Bir talep, siparis veya faturanin onay is akisinda hangi adimda, kac gundur ve "
-        "neden bekledigini gosterir. Tamamlanan adimlari, bekleyen adimi, termini ve "
-        "gecikmeyi verir. Onaylayan kisi adi kisisel veridir ve varsayilan olarak maskelenir; "
-        "karar icin onemli olan adim ve roldur."
-    ),
-    input_schema={
-        "type": "object",
-        "properties": {
-            "object_type": {
-                "type": "string",
-                "enum": ["purchase_requisition", "purchase_order", "supplier_invoice"],
-            },
-            "object_id": {"type": "string", "description": "Is nesnesi numarasi."},
-            "detail": DETAIL_SCHEMA,
-        },
-        "required": ["object_type", "object_id"],
-    },
-)
-def sap_workflow_status(
-    ctx: ToolContext, object_type: str, object_id: str, detail: str = "standard"
-) -> ToolResult | dict[str, Any]:
-    level = resolve_detail(detail)
-    try:
-        steps = ctx.sap.get_workflow_status(object_type=object_type, object_id=object_id)
-    except SAPNotSupported as exc:
-        return {"error": str(exc), "remediation": exc.hint, "denial_code": "CAPABILITY_NOT_SUPPORTED"}
-    except SAPError as exc:
-        return {"error": str(exc), "sap_code": exc.code}
-
-    if not steps:
-        return {
-            "object_type": object_type,
-            "object_id": object_id,
-            "workflow_found": False,
-            "interpretation": (
-                "Bu belge icin acik veya tamamlanmis bir onay is akisi bulunamadi. "
-                "Belge onay gerektirmemis ya da is akisi henuz baslatilmamis olabilir."
-            ),
-        }
-
-    now = datetime.now(timezone.utc)
-    pending = [s for s in steps if s.is_pending]
-    completed = [s for s in steps if s.status == "completed"]
-    current = pending[0] if pending else None
-    overdue = [
-        s for s in pending if s.due_at is not None and _as_utc(s.due_at) < now
-    ]
-
-    data: dict[str, Any] = {
-        "object_type": object_type,
-        "object_id": object_id,
-        "workflow_id": steps[0].workflow_id,
-        "workflow_found": True,
-        "total_steps": len(steps),
-        "completed_steps": len(completed),
-        "pending_steps": len(pending),
-        "overdue": bool(overdue),
-        "final_decision": next(
-            (s.decision for s in reversed(steps) if s.decision), ""
-        ),
-    }
-    if current is not None:
-        data["current_step"] = {
-            "step_no": current.step_no,
-            "name": current.step_name,
-            "status": current.status,
-            "role": current.processor_role,
-            "processor_name": current.processor_name or None,
-            "waiting_days": current.age_days(now=now),
-            "due_at": _iso(current.due_at),
-            "reason": current.note or None,
-        }
-    if level != "summary":
-        data["steps"] = [
-            {
-                "step_no": s.step_no,
-                "name": s.step_name,
-                "status": s.status,
-                "decision": s.decision or None,
-                "role": s.processor_role or None,
-                "processor_name": s.processor_name or None,
-                "started_at": _iso(s.started_at),
-                "completed_at": _iso(s.completed_at),
-                "note": s.note or None,
-            }
-            for s in steps
-        ]
-
-    data["interpretation"] = _workflow_interpretation(current, overdue, steps)
-    result = ToolResult(
-        data=data,
-        detail=level,
-        evidence=ctx.sap_evidence(
-            "workflow_status",
-            business_object=object_id,
-            record_count=len(steps),
-            notes=("Onay durumu is akisi sisteminden okundu; sohbet onayi degildir.",),
-        ),
-        returned_count=len(steps),
-    )
-    if overdue:
-        result.warn(
-            f"{len(overdue)} onay adimi termini gecmis; sureci hizlandirmak icin "
-            "ilgili rol ile iletisime gecilmeli."
-        )
-    return result
-
-
-def _as_utc(value: datetime) -> datetime:
-    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-
-
-def _workflow_interpretation(current, overdue, steps) -> str:
-    if current is None:
-        decision = next((s.decision for s in reversed(steps) if s.decision), "")
-        if decision == "rejected":
-            return "Is akisi reddedilerek kapanmis."
-        return "Tum onay adimlari tamamlanmis; is akisi kapali."
-    base = (
-        f"Onay '{current.step_name}' adiminda, {current.processor_role or 'atanmis rol'} "
-        f"tarafinda {current.age_days()} gundur bekliyor."
-    )
-    if current.status == "ready" and not current.processor_name:
-        base += " Adim havuzda; henuz bir islemci ustlenmemis."
-    if overdue:
-        base += " Termin asilmis."
-    return base
-
-
-# ---------------------------------------------------------------------------
 @tool(
     name="sap_supplier_invoice_status",
     group="p2p",
@@ -664,15 +528,33 @@ def sap_supplier_invoice_status(
 
     if not invoices:
         return {
+            "query": {"invoice_id": invoice_id, "po_id": po_id, "vendor_id": vendor_id},
             "invoices": [],
             "invoice_count": 0,
-            "interpretation": "Verilen filtreye uyan tedarikci faturasi bulunamadi.",
+            "returned_invoice_count": 0,
+            "parked_count": 0,
+            "cancelled_count": 0,
+            "invoice_record_found": False,
+            "invoice_issued": False,
+            "interpretation": (
+                "Bu siparis icin fatura kaydi bulunamadi."
+                if po_id
+                else "Verilen filtreye uyan tedarikci faturasi bulunamadi."
+            ),
         }
 
     today = _today()
-    blocked = [inv for inv in invoices if inv.is_blocked]
-    overdue = [inv for inv in invoices if inv.days_overdue(today=today) > 0]
-    currency = invoices[0].currency
+    # Iptal belgeler borc/fatura adedine, park belgeler de
+    # muhasebelesmis fatura adedine katilmaz. Ham kayitlar asagidaki tabloda
+    # gorunur kalir; operasyonel karar alanlari yalniz etkin belgelerden
+    # hesaplanir.
+    issued = [inv for inv in invoices if inv.status in {"posted", "blocked", "paid"}]
+    parked = [inv for inv in invoices if inv.status == "parked"]
+    cancelled = [inv for inv in invoices if inv.status == "cancelled"]
+    blocked = [inv for inv in issued if inv.is_blocked]
+    overdue = [inv for inv in issued if inv.days_overdue(today=today) > 0]
+    total_gross_by_currency = _gross_by_currency(issued)
+    blocked_gross_by_currency = _gross_by_currency(blocked)
 
     rows = [
         {
@@ -695,19 +577,39 @@ def sap_supplier_invoice_status(
     ]
 
     data: dict[str, Any] = {
-        "invoice_count": len(invoices),
+        "query": {"invoice_id": invoice_id, "po_id": po_id, "vendor_id": vendor_id},
+        "invoice_count": len(issued),
+        "returned_invoice_count": len(invoices),
+        "parked_count": len(parked),
+        "cancelled_count": len(cancelled),
+        "invoice_record_found": bool(issued or parked),
+        "invoice_issued": bool(issued),
         "blocked_count": len(blocked),
         "overdue_count": len(overdue),
-        "total_gross": round(sum(inv.gross_amount for inv in invoices), 2),
-        "blocked_gross": round(sum(inv.gross_amount for inv in blocked), 2) or None,
-        "currency": currency,
+        # Farkli para birimleri kur bilgisi olmadan toplanamaz. Bu iki alan
+        # her zaman para birimi bazindadir; tekil toplamlar asagida yalniz
+        # gercekten tek para birimi varsa geriye donuk uyumluluk icin eklenir.
+        "total_gross_by_currency": total_gross_by_currency,
+        "blocked_gross_by_currency": blocked_gross_by_currency or None,
+        "currencies": sorted(total_gross_by_currency),
         "invoices": rows if level != "summary" else rows[: page_limit("summary", None, default=20)],
     }
-    data["interpretation"] = _invoice_interpretation(invoices, blocked, overdue, currency)
+    if len(total_gross_by_currency) == 1:
+        currency, total_gross = next(iter(total_gross_by_currency.items()))
+        data["currency"] = currency
+        data["total_gross"] = total_gross
+        data["blocked_gross"] = blocked_gross_by_currency.get(currency) or None
+    data["interpretation"] = (
+        _po_invoice_interpretation(issued, parked, cancelled)
+        if po_id
+        # "incelendi" ham filtre sonucunu anlatir; yalniz muhasebelesmis
+        # faturalarin sayisini degil. Tek bir iptal fatura kimligiyle sorgu
+        # yapildiginda `issued` bos olsa da bir kayit gercekten incelenmistir.
+        else _invoice_interpretation(invoices, blocked, overdue, blocked_gross_by_currency)
+    )
     if blocked:
         data["next_steps"] = [
             "Blokaj nedenini sayisal olarak gormek icin sap_invoice_block_explain calistirin.",
-            "Onay adimi bekliyorsa sap_workflow_status ile kimde bekledigine bakin.",
         ]
 
     result = ToolResult(
@@ -728,16 +630,54 @@ def sap_supplier_invoice_status(
     return result
 
 
-def _invoice_interpretation(invoices, blocked, overdue, currency: str) -> str:
+def _gross_by_currency(invoices) -> dict[str, float]:
+    """Kur uydurmadan fatura tutarlarini belge para biriminde toplar."""
+    totals: dict[str, float] = {}
+    for invoice in invoices:
+        currency = str(invoice.currency or "UNSPECIFIED").strip().upper()
+        totals[currency] = round(totals.get(currency, 0.0) + invoice.gross_amount, 2)
+    return dict(sorted(totals.items()))
+
+
+def _invoice_interpretation(invoices, blocked, overdue, blocked_totals) -> str:
     if not blocked and not overdue:
         return f"{len(invoices)} fatura incelendi; blokaj veya vade gecikmesi yok."
     parts = []
     if blocked:
-        total = sum(inv.gross_amount for inv in blocked)
-        parts.append(f"{len(blocked)} fatura bloke ({total:,.2f} {currency}).")
+        amounts = "; ".join(
+            f"{amount:,.2f} {currency}" for currency, amount in blocked_totals.items()
+        )
+        parts.append(f"{len(blocked)} fatura bloke ({amounts}).")
     if overdue:
         parts.append(f"{len(overdue)} fatura vadesi gecmis.")
     return " ".join(parts)
+
+
+def _po_invoice_interpretation(issued, parked, cancelled) -> str:
+    """Tek PO icin model gerektirmeyen, dogrudan evet/hayir karari."""
+    if issued:
+        statuses: dict[str, int] = {}
+        for invoice in issued:
+            statuses[invoice.status] = statuses.get(invoice.status, 0) + 1
+        status_text = ", ".join(f"{count} {status}" for status, count in sorted(statuses.items()))
+        answer = f"Evet, bu siparis icin {len(issued)} aktif fatura bulundu ({status_text})."
+        if cancelled:
+            answer += f" Ayrica {len(cancelled)} iptal edilmis fatura kaydi var."
+        return answer
+    if parked:
+        answer = (
+            f"Bu siparis icin {len(parked)} park edilmis fatura kaydi var; "
+            "henuz muhasebelesmis aktif fatura yok."
+        )
+        if cancelled:
+            answer += f" Ayrica {len(cancelled)} iptal edilmis kayit var."
+        return answer
+    if cancelled:
+        return (
+            "Hayir, bu siparis icin aktif fatura bulunamadi; "
+            f"yalnizca {len(cancelled)} iptal edilmis fatura kaydi var."
+        )
+    return "Hayir, bu siparis icin fatura kaydi bulunamadi."
 
 
 # ---------------------------------------------------------------------------
@@ -906,6 +846,13 @@ def _resolution_for(reason: str) -> str:
         "quality": "Kalite kaydini ve muayene sonucunu kontrol edin.",
         "amount": "Toplam tutar farkini kalem bazinda ayristirin.",
         "manual": "Blokaji koyan kullanicidan gerekce isteyin.",
+        # Neden kaynak API'dan okunamadiginda uydurulmus bir yonlendirme
+        # vermek, kullaniciyi yanlis islemin ustune yollar. Dogru cevap,
+        # nedenin nereden okunacagini soylemektir.
+        "unknown": (
+            "Blokaj nedeni bu kaynaktan okunamiyor. MIRO/MRBR uzerinden faturanin "
+            "kalem bazli blokaj gerekcelerini ve OMR6 tolerans asimlarini kontrol edin."
+        ),
     }.get(reason, "Blokaj nedenini ilgili satinalma ve muhasebe sorumlusuyla degerlendirin.")
 
 
@@ -918,6 +865,7 @@ def _block_interpretation(invoice, reasons: list[str]) -> str:
         "manual": "manuel blokaj",
         "amount": "tutar farki",
         "order_price_unit": "fiyat birimi uyusmazligi",
+        "unknown": "nedeni bu kaynaktan okunamayan blokaj",
     }
     listed = ", ".join(labels.get(r, r) for r in reasons)
     block_note = (
@@ -937,7 +885,7 @@ def _block_next_steps(reasons: list[str], invoice) -> list[str]:
             "faturalanan miktarini karsilastirin."
         )
     steps.append(
-        f"sap_workflow_status ile {invoice.invoice_id} faturasinin blokaj incelemesinin "
+        f"{invoice.invoice_id} faturasinin blokaj incelemesinin "
         "kimde bekledigini gorun."
     )
     if "quantity" in reasons:

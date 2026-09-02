@@ -1,7 +1,7 @@
 # SAP CAL test planı
 
 Bu plan, SAP S/4HANA 2025 FPS01 Fully-Activated Appliance'ı mümkün olan en
-kısa aktif sürede kullanarak CertaOps'un 24 tool'unu kanıtlı biçimde test etmek
+kısa aktif sürede kullanarak CertaOps'un 21 tool'unu kanıtlı biçimde test etmek
 içindir. Amaç yalnız HTTP 200 görmek değil; gerçek malzeme, PO, mal kabul,
 fatura, yetki reddi ve kontrollü PR yazma sonuçlarını doğrulamaktır.
 
@@ -34,7 +34,7 @@ Resmî kaynaklar:
 
 ## CAL açılmadan tamamlanan işler
 
-- 24 tool envanteri yerel kapıda doğrulanıyor.
+- 21 tool envanteri yerel kapıda doğrulanıyor.
 - API Hub'da 18 salt-okunur/hazırlık tool'u ayrıca doğrulandı.
 - Released API metadata'sına göre aşağıdaki gerçek S/4 OData uygulamaları
   eklendi:
@@ -52,14 +52,10 @@ Resmî kaynaklar:
   adları ve tutarlar bu analiz dosyalarına yazılmıyor.
 - Generated `artifacts/` ve `.env.cal` Git dışında tutuluyor.
 
-İki bilinçli dış bağımlılık kalır:
-
-1. `sap_workflow_status`: appliance'taki flexible workflow/CDS veya SAP Build
-   Process Automation kaynağı görülmeden doğru endpoint seçilemez.
-2. `sap_project_cost_status`: `ZAPI_PROJECT_COST_SRV` standart CAL içeriği
-   değildir; özel released CDS/RAP servisi gerektirir.
-
-Bu ikisi mevcut değilken script `PASS` üretmez; `BLOCKED` yazar.
+Daha önce iki dış bağımlılık (`sap_workflow_status` ve `sap_project_cost_status`)
+CAL kabulünü `BLOCKED` bırakıyordu. Bu iki tool ile `sap_atp_check` projeden
+kaldırıldı: hiçbirinin standart S/4 released API karşılığı yoktu. Kalan 21
+tool'un tamamı gerçek bir released servise dayanır.
 
 ## Aşamalar ve gerçek süre beklentisi
 
@@ -72,7 +68,7 @@ Bu ikisi mevcut değilken script `PASS` üretmez; `BLOCKED` yazar.
 | CAL-04 | `cal_04_p2p_scenarios.py` | 2–8 dk | PO–GR–invoice ve raporlama |
 | CAL-05 | `cal_05_security_scenarios.py` | 1–4 dk | RBAC, negatif kayıt, SSRF, DLP, audit |
 | CAL-06 | `cal_06_write_pr.py` | 1–5 dk | Dry-run veya tek PR + idempotency |
-| CAL-07 | `cal_07_service_inventory.py` | 1–4 dk | 16 alias, fiziksel servisler, entity/alan/join seması |
+| CAL-07 | `cal_07_service_inventory.py` | 1–4 dk | 14 alias, fiziksel servisler, entity/alan/join seması |
 | CAL-08 | `cal_08_data_profile.py` | 1–5 dk | En fazla 20 satırlı doluluk, join ve gecikme profili |
 | CAL-09 | `cal_09_tool_opportunities.py` | < 5 sn | Kanıta dayal yeni tool puanı ve geliştirme kapısı |
 

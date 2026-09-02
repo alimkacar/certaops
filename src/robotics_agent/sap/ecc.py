@@ -16,8 +16,7 @@ Veri dogrulugu invariantlari (odata.py ile ayni sozlesme, farkli yol):
 
   A. Malzeme aramasi aciklamada da arar; siniflandirma yalniz gerektiginde
      okunur (her aramada karakteristik cekmek bosa cagridir).
-  B. `check_atp` gercek ATP'dir (BAPI_MATERIAL_AVAILABILITY). Stok fotografi
-     ATP yerine gecirilmez; MRP arz/talep ayri porttur.
+  B. Stok fotografi ATP yerine gecirilmez; MRP arz/talep ayri porttur.
   C. Belge akisi EKBE'den kurulur. Her dugum kendisini onceki belgeye baglayan
      **gercek SAP alanini** tasir; bag gosterilemiyorsa dugum eklenmez.
   D. Tedarikci skorlari ELBK/ELBP'den okunur. ECC'de standart olmayan alanlar
@@ -33,8 +32,10 @@ sessiz bos veri dondurmez.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
+import threading
 from collections.abc import Iterable, Sequence
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -50,8 +51,8 @@ from ..adapters.ecc.capabilities import DEMAND_ELEMENTS, distinct_service_paths
 from ..adapters.sap import (
     ODataHttpCore,
     ODataV2Client,
+    SAPCallBudget,
     SAPError,
-    SAPNotSupported,
     breaker_for,
     build_http_client,
     expanded_rows,
@@ -62,17 +63,14 @@ from ..adapters.sap import (
     verify_contract,
 )
 from ..core.tenant_profile import DEFAULT_DOCUMENT_TYPE
-from .base import SAPBackend, effective_unit_price
+from .base import SAPBackend, effective_unit_price, wbs_matches
 from .models import (
-    AtpResult,
-    AtpScheduleLine,
     DocumentFlowNode,
     GoodsReceipt,
     InfoRecord,
     InvoiceBlock,
     Material,
     MaterialClassification,
-    ProjectCost,
     PurchaseOrder,
     PurchaseOrderItem,
     PurchaseRequisitionDraft,
@@ -85,7 +83,6 @@ from .models import (
     SupplyDemandItem,
     ValidationFinding,
     Vendor,
-    WorkflowStep,
 )
 
 log = logging.getLogger(__name__)
@@ -203,6 +200,7 @@ class ECCSAPBackend(SAPBackend):
         self.settings = settings
         #: Aktif tenant profili (belge tipi, zorunlu alanlar, Z-alan eslemesi).
         self._profile: Any = None
+        self._call_budget_lock = threading.Lock()
         cfg = settings.sap
         problems = cfg.validate()
         if problems:
@@ -222,6 +220,7 @@ class ECCSAPBackend(SAPBackend):
             sap_client=cfg.client,
             accept_language=cfg.description_language,
             allowed_hosts=settings.security.allowed_sap_hosts,
+            read_only=cfg.read_only,
             token_provider=self.connection.token_provider,
             breaker=self.breaker,
         )
@@ -230,6 +229,21 @@ class ECCSAPBackend(SAPBackend):
 
     def close(self) -> None:
         self._core.close()
+
+    @property
+    def sap_call_count(self) -> int:
+        return self._core.call_count
+
+    @contextlib.contextmanager
+    def enforce_call_budget(self, max_calls: int):
+        """ECC V2 gidiş-donuslarini tool butcesinde gercekten sinirlar."""
+        budget = SAPCallBudget(max_calls=max_calls)
+        with self._call_budget_lock:
+            self._core.call_budget = budget
+            try:
+                yield
+            finally:
+                self._core.call_budget = None
 
     # --- Servis erisimi -----------------------------------------------------
     def _service(self, alias: str) -> str:
@@ -698,90 +712,6 @@ class ECCSAPBackend(SAPBackend):
             out[material_id] = round(out.get(material_id, 0.0) - _num(row.get("Quantity")), 3)
         return out
 
-    def check_atp(
-        self,
-        material_id: str,
-        *,
-        quantity: float,
-        requested_date: date | None = None,
-        plant: str | None = None,
-    ) -> AtpResult:
-        """Gercek ATP teyidi (BAPI_MATERIAL_AVAILABILITY sarmalayicisi).
-
-        Stok fotografi ATP yerine GECIRILMEZ. Servis beklenen alanlari
-        dondurmezse sessiz bos sonuc yerine `SAPNotSupported` firlatilir.
-        """
-        capability = ECC_CAPABILITY_MANIFEST["availability"]
-        target_plant = plant or self.settings.sap.plant
-        need_by = requested_date or date.today()
-
-        filter_expr = _and(
-            f"Material eq '{quote(material_id)}'",
-            f"Plant eq '{quote(target_plant)}'",
-            f"RequestedQuantity eq {_decimal_literal(quantity)}",
-            f"RequestedDate eq {_date_literal(need_by)}",
-        )
-        rows = self._read("availability", "AvailabilitySet", filter_expr=filter_expr, top=100)
-        if not rows:
-            raise SAPNotSupported(
-                "atp_check",
-                backend=self.name,
-                hint=(
-                    f"{capability.service_path}/AvailabilitySet beklenen alanlari dondurmedi. "
-                    "sap_discover_capabilities ile kontrati dogrulayin. Servisin "
-                    "BAPI_MATERIAL_AVAILABILITY cagrisini ve WMDVEX cikti tablosunu "
-                    "dondurdugunden emin olun (bkz. docs/ECC_ABAP_REQUIREMENTS.md#atp)."
-                ),
-            )
-
-        schedule: list[AtpScheduleLine] = []
-        calendar_considered = False
-        unit = "ST"
-        checking_rule = ""
-        for row in rows:
-            confirmed_qty = _num(row.get("CommittedQuantity"))
-            confirmed_date = parse_odata_datetime(row.get("CommittedDate"))
-            calendar_considered = calendar_considered or _flag(row.get("CalendarConsidered"))
-            unit = str(row.get("BaseUnit") or unit)
-            checking_rule = str(row.get("CheckingRule") or checking_rule)
-            if confirmed_qty <= 0 or confirmed_date is None:
-                continue
-            schedule.append(
-                AtpScheduleLine(
-                    confirmed_date=confirmed_date,
-                    confirmed_qty=round(confirmed_qty, 3),
-                    supply_element=str(row.get("SupplyElement") or "ATP"),
-                )
-            )
-
-        schedule.sort(key=lambda line: line.confirmed_date)
-        confirmed_by_need = round(
-            sum(line.confirmed_qty for line in schedule if line.confirmed_date <= need_by), 3
-        )
-        messages = [
-            "Teyit ECC ATP kontrol kuralina gore uretildi "
-            f"(BAPI_MATERIAL_AVAILABILITY{f', kural {checking_rule}' if checking_rule else ''})."
-        ]
-        if not calendar_considered:
-            # Sessizce true varsaymak termin taahhudunu yanlis yapar.
-            messages.append(
-                "Fabrika takvimi dikkate alinmadi; teslim gunu is gunu olmayabilir."
-            )
-        return AtpResult(
-            material_id=material_id,
-            plant=target_plant,
-            requested_qty=float(quantity),
-            requested_date=requested_date,
-            unit=unit,
-            confirmed_qty=confirmed_by_need,
-            full_confirmation_date=schedule[-1].confirmed_date if schedule else None,
-            schedule_lines=schedule,
-            checked_at=datetime.now(timezone.utc),
-            source_api=f"{capability.service_path}/AvailabilitySet",
-            calendar_considered=calendar_considered,
-            messages=messages,
-        )
-
     def get_supply_demand(
         self,
         material_id: str,
@@ -1186,6 +1116,11 @@ class ECCSAPBackend(SAPBackend):
         `etag` alani ECC'de HTTP ETag DEGILDIR: mutabakat anahtaridir. ECC'de
         optimistic concurrency yoktur; kilit ENQUEUE ile pessimistic saglanir.
         """
+        if self.settings.sap.read_only:
+            raise SAPError(
+                "SAP read-only profili etkin; satinalma talebi olusturulamaz.",
+                code="READ_ONLY_MODE",
+            )
         if not draft.is_submittable:
             raise SAPError(
                 "Taslakta engelleyici bulgular var; SAP'a gonderilmedi: "
@@ -1307,7 +1242,11 @@ class ECCSAPBackend(SAPBackend):
         if material_id:
             clauses.append(f"Material eq '{quote(material_id)}'")
         if wbs_element:
-            clauses.append(f"WBSElement eq '{quote(wbs_element)}'")
+            # WBS hiyerarsiktir ve tool sozlesmesi "eleman VEYA on eki" vaat
+            # eder. Sunucuya genis (`startswith`) filtre gonderilir, ata/alt
+            # eleman kurali asagida kesinlestirilir: bu yon guvenlidir - genis
+            # filtre gecerli satir DUSURMEZ, yalniz fazlasini getirir.
+            clauses.append(f"startswith(WBSElement,'{quote(wbs_element)}')")
         if vendor_id:
             # Tedarikci basliktadir; CDS bunu kaleme tasidigi icin filtre
             # sunucuda uygulanir (Python tarafinda ayiklama yapilmaz).
@@ -1323,6 +1262,11 @@ class ECCSAPBackend(SAPBackend):
 
         out: list[PurchaseOrder] = []
         for row in rows:
+            # Sunucuya gonderilen genis `startswith` filtresinin yanlis
+            # pozitiflerini burada eliyoruz: `R-2026-02` sorgusu
+            # `R-2026-021-1`i KAPSAMAZ (ayri proje kodu, ata degil).
+            if wbs_element and not wbs_matches(wbs_element, str(row.get("WBSElement") or "")):
+                continue
             header = _first(expanded_rows(row, "ToHeader"))
             schedule = expanded_rows(row, "ToScheduleLines")
             ordered = _num(row.get("Quantity"))
@@ -1342,7 +1286,10 @@ class ECCSAPBackend(SAPBackend):
                 continue
 
             requested = _weighted_date(schedule, "DeliveryDate")
-            confirmed = _weighted_date(schedule, "ConfirmedDate") or requested
+            # `or requested` KALDIRILDI (OData yolundaki ayni duzeltme). Teyit
+            # yoksa talep tarihini teyit diye yazmak, gecikmeyi her zaman 0
+            # gosteriyor ve olmayan bir teyide dayali uyari uretiyordu.
+            confirmed = _weighted_date(schedule, "ConfirmedDate")
 
             out.append(
                 PurchaseOrder(
@@ -1550,11 +1497,14 @@ class ECCSAPBackend(SAPBackend):
             variance_abs = round(actual - expected, 3)
             if expected:
                 variance_pct = round((actual / expected - 1) * 100, 2)
-        reason = str(row.get("BlockReason") or "price").lower()
+        # Bilinmeyen/eksik neden "price" ya da "manual" sayilmaz: ikisi de
+        # kullaniciyi belirli bir islemin ustune yollayan bir IDDIADIR.
+        # Okunamayan neden `unknown` kalir.
+        reason = str(row.get("BlockReason") or "").lower()
         if reason not in {
             "price", "quantity", "date", "order_price_unit", "quality", "manual", "amount"
         }:
-            reason = "manual"
+            reason = "unknown"
         return InvoiceBlock(
             invoice_id=invoice_id,
             item_no=str(row.get("InvoiceItem") or ""),
@@ -1571,41 +1521,6 @@ class ECCSAPBackend(SAPBackend):
             po_item=str(row.get("PurchaseOrderItem") or ""),
         )
 
-    def get_workflow_status(self, *, object_type: str, object_id: str) -> list[WorkflowStep]:
-        """Onay is akisi durumu (SAP_WAPI_*).
-
-        ECC'de klasik SAP Business Workflow tam erisilebilirdir; yerel onay
-        kaydi ile karistirilmamalidir - bu, SAP'taki gercek is akisidir.
-        """
-        rows = self._read(
-            "workflow",
-            "WorkflowStepSet",
-            filter_expr=_and(
-                f"ObjectType eq '{quote(object_type)}'",
-                f"ObjectId eq '{quote(object_id)}'",
-            ),
-            top=100,
-        )
-        steps: list[WorkflowStep] = []
-        for row in rows:
-            steps.append(
-                WorkflowStep(
-                    workflow_id=str(row.get("WorkflowId") or row.get("WorkItemId") or ""),
-                    step_no=_int(row.get("StepNumber")),
-                    step_name=str(row.get("StepName") or ""),
-                    status=_workflow_status(str(row.get("WorkItemStatus") or "")),
-                    decision=str(row.get("Decision") or ""),
-                    # Kisisel veri ham dondurulur; maskeleme DLP katmaninin isi.
-                    processor_name=str(row.get("ProcessorName") or ""),
-                    processor_role=str(row.get("ProcessorRole") or ""),
-                    started_at=_parse_datetime(row.get("StartedAt")),
-                    completed_at=_parse_datetime(row.get("CompletedAt")),
-                    due_at=_parse_datetime(row.get("DueAt")),
-                    note=str(row.get("Note") or ""),
-                )
-            )
-        steps.sort(key=lambda s: (s.step_no, s.started_at or datetime.min.replace(tzinfo=timezone.utc)))
-        return steps
 
     # --- Belge akisi --------------------------------------------------------
     def get_document_flow(
@@ -1921,48 +1836,6 @@ class ECCSAPBackend(SAPBackend):
                 )
             )
         return out
-
-    # =======================================================================
-    # ProjectFinancePort
-    # =======================================================================
-    def get_project_costs(
-        self, *, wbs_element: str | None = None, fiscal_year: int | None = None
-    ) -> list[ProjectCost]:
-        clauses: list[str] = []
-        if wbs_element:
-            clauses.append(f"startswith(WBSElement,'{quote(wbs_element)}')")
-        if fiscal_year:
-            clauses.append(f"FiscalYear eq '{fiscal_year}'")
-        try:
-            rows = self._read(
-                "project_cost", "ProjectCostSet", filter_expr=_and(*clauses), top=200
-            )
-        except SAPError as exc:
-            raise SAPNotSupported(
-                "project_costs",
-                backend=self.name,
-                hint=(
-                    "ZAGENT_PS_COST_SRV/ProjectCostSet okunamadi. ECC'de proje maliyeti "
-                    "icin standart OData servisi yoktur; PRPS + COSP/COSS + COOI "
-                    "birlesimini dondurun (bkz. docs/ECC_ABAP_REQUIREMENTS.md"
-                    f"#zagent_ps_cost_srv). SAP hatasi: {exc}"
-                ),
-            ) from exc
-
-        return [
-            ProjectCost(
-                wbs_element=str(row.get("WBSElement", "")),
-                description=str(row.get("WBSDescription") or ""),
-                plan_cost=_num(row.get("PlanCost")),
-                actual_cost=_num(row.get("ActualCost")),
-                commitment=_num(row.get("Commitment")),
-                currency=str(row.get("Currency") or self.settings.sap.currency),
-                fiscal_year=_int(row.get("FiscalYear")),
-                completion_pct=_num(row.get("CompletionPercent")),
-            )
-            for row in rows
-        ]
-
 
 # ---------------------------------------------------------------------------
 # Modul duzeyi yardimcilar

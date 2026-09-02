@@ -38,13 +38,11 @@ from robotics_agent.tools.registry import REGISTRY  # noqa: E402
 SCENARIOS: tuple[tuple[str, dict[str, Any]], ...] = (
     ("sap_material_360", {"material_id": "SFT-SCN-270"}),
     ("sap_stock_overview", {"material_ids": ["SFT-SCN-270", "ROB-6AX-20-1800"]}),
-    ("sap_atp_check", {"requests": [{"material_id": "SFT-SCN-270", "quantity": 4}]}),
     ("sap_mrp_shortage_explain", {"material_id": "SFT-SCN-270"}),
     ("sap_compare_vendors", {"material_id": "SFT-SCN-270", "quantity": 4}),
     ("sap_track_purchase_orders", {"only_open": True}),
     ("sap_document_flow", {"document_id": "5105600231"}),
     ("sap_purchase_order_360", {"po_id": "4500019014"}),
-    ("sap_workflow_status", {"object_type": "purchase_requisition", "object_id": "0010004801"}),
     ("sap_supplier_invoice_status", {"only_blocked": True}),
     ("sap_invoice_block_explain", {"invoice_id": "5105600231"}),
 )

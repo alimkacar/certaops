@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="tr" data-theme="auto">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="referrer" content="no-referrer" />
+  <meta name="color-scheme" content="light dark" />
+  <title>CertaOps</title>
+  <link rel="stylesheet" href="/ui/assets/styles.css" />
+</head>
+<body>
+
+<div id="live" class="sr-only" role="status" aria-live="polite"></div>
+
+<!-- ======================================================================
+     GIRIS
+     Kabuk kimlik dogrulamasi olmadan servis edilir. Token yalnizca burada
+     girilir, sessionStorage'ta kalir, sunucuya yalnizca Authorization
+     basliginda gider.
+     ================================================================== -->
+<div id="gate" class="gate" hidden>
+  <form id="gate-form" class="gate-card" autocomplete="off" novalidate>
+    <div class="gate-head">
+      <span class="gate-mark" aria-hidden="true"></span>
+      <span class="gate-name">CERTAOPS</span>
+    </div>
+    <p class="gate-sub" data-i18n="gate.sub"></p>
+
+    <label class="gate-field">
+      <span class="lbl" data-i18n="gate.token"></span>
+      <span class="gate-input">
+        <input id="token" type="password" spellcheck="false" autocomplete="off"
+               data-i18n-attr="placeholder:gate.ph" />
+        <button type="button" id="token-eye" class="ghost-btn"
+                data-i18n-attr="aria-label:gate.eye">••</button>
+      </span>
+    </label>
+
+    <button type="submit" class="btn btn-solid btn-wide" data-i18n="gate.go"></button>
+    <p id="gate-err" class="gate-err" role="alert" hidden></p>
+    <p class="gate-note" data-i18n="gate.note"></p>
+  </form>
+</div>
+
+<!-- ======================================================================
+     KONSOL
+     ================================================================== -->
+<div id="app" class="app" hidden>
+
+  <!-- Mod tuvali boyar: bir rozete guvenilemez. -->
+  <header class="top">
+    <span class="mark" aria-hidden="true"></span>
+    <span class="wordmark">CERTAOPS</span>
+
+    <span id="mode" class="mode mode-unknown">
+      <span class="mode-hatch" aria-hidden="true"></span>
+      <span id="mode-text" data-i18n="mode.wait"></span>
+    </span>
+    <span id="dry" class="mode mode-dry" hidden data-i18n="mode.dry"></span>
+
+    <nav class="nav" id="nav">
+      <button type="button" class="nav-b on" data-view="ledger" data-i18n="nav.ledger"></button>
+      <button type="button" class="nav-b" data-view="tools" data-i18n="nav.tools"></button>
+      <button type="button" class="nav-b" data-view="health" data-i18n="nav.health"></button>
+      <button type="button" class="nav-b" data-view="telemetry" data-i18n="nav.telemetry"></button>
+      <button type="button" class="nav-b" data-view="audit" data-scope="audit" data-i18n="nav.audit"></button>
+      <button type="button" class="nav-b" data-view="logs" data-scope="audit" data-i18n="nav.logs"></button>
+      <button type="button" class="nav-b" data-view="mcp" data-i18n="nav.mcp"></button>
+      <button type="button" class="nav-b" data-view="settings" data-i18n="nav.settings"></button>
+    </nav>
+
+    <div class="top-right">
+      <span id="who" class="who"></span>
+      <div class="seg" role="group" data-i18n-attr="aria-label:ui.lang">
+        <button type="button" class="seg-b" data-lang="tr">TR</button>
+        <button type="button" class="seg-b" data-lang="en">EN</button>
+      </div>
+      <button type="button" id="theme" class="ghost-btn"
+              data-i18n-attr="aria-label:ui.theme" data-i18n-attr2="title:ui.theme">◐</button>
+      <button type="button" id="out" class="ghost-btn"
+              data-i18n-attr="aria-label:ui.out" data-i18n-attr2="title:ui.out">⏻</button>
+    </div>
+  </header>
+
+  <!-- ================= DEFTER ================= -->
+  <section id="v-ledger" class="view view-ledger">
+    <div class="ledger-wrap">
+      <div id="scroll" class="scroll">
+        <div id="rail" class="rail">
+          <div id="intro" class="intro">
+            <h1 class="intro-h" data-i18n="intro.h"></h1>
+            <p class="intro-p" data-i18n="intro.p"></p>
+            <div id="seeds" class="seeds"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="entry-zone">
+        <button type="button" id="to-end" class="to-end" hidden
+                data-i18n-attr="aria-label:ui.toEnd">↓</button>
+        <form id="entry" class="entry">
+          <span class="caret" aria-hidden="true">▸</span>
+          <textarea id="cmd" rows="1" spellcheck="false"
+                    data-i18n-attr="placeholder:entry.ph"></textarea>
+          <button type="submit" id="run" class="run">
+            <span data-i18n="entry.run"></span>
+            <b aria-hidden="true">⏎</b>
+          </button>
+        </form>
+        <div class="entry-foot">
+          <label class="chk">
+            <input id="show-gates" type="checkbox" checked />
+            <span data-i18n="entry.gates"></span>
+          </label>
+          <span id="sess" class="sess" hidden></span>
+          <span class="grow"></span>
+          <span class="hint" data-i18n="entry.hint"></span>
+        </div>
+      </div>
+    </div>
+
+    <aside class="posture" id="posture">
+      <h2 class="posture-h" data-i18n="post.h"></h2>
+      <div id="posture-body"></div>
+    </aside>
+  </section>
+
+  <!-- ================= TOOL'LAR ================= -->
+  <section id="v-tools" class="view view-pane" hidden>
+    <div class="pane">
+      <div class="pane-bar">
+        <label class="find">
+          <input id="tool-q" type="search" data-i18n-attr="placeholder:tools.find" />
+        </label>
+        <div id="tool-chips" class="chips" role="group"></div>
+        <span class="grow"></span>
+        <button type="button" class="btn" data-load="tools" data-i18n="ui.reload"></button>
+      </div>
+      <div id="tools-body" class="pane-body"></div>
+    </div>
+  </section>
+
+  <!-- ================= DURUM ================= -->
+  <section id="v-health" class="view view-pane" hidden>
+    <div class="pane">
+      <div class="pane-bar">
+        <span class="pane-note" data-i18n="health.note"></span>
+        <span class="grow"></span>
+        <button type="button" class="btn" data-load="health" data-i18n="ui.reload"></button>
+      </div>
+      <div id="health-body" class="pane-body"></div>
+    </div>
+  </section>
+
+  <!-- ================= TELEMETRI ================= -->
+  <section id="v-telemetry" class="view view-pane" hidden>
+    <div class="pane">
+      <div class="pane-bar">
+        <span class="pane-note" data-i18n="tel.note"></span>
+        <span class="grow"></span>
+        <button type="button" class="btn" data-load="telemetry" data-i18n="ui.reload"></button>
+      </div>
+      <div id="telemetry-body" class="pane-body"></div>
+    </div>
+  </section>
+
+  <!-- ================= DENETIM ================= -->
+  <section id="v-audit" class="view view-pane" hidden>
+    <div class="pane">
+      <div class="pane-bar">
+        <span class="pane-note" data-i18n="audit.note"></span>
+        <label class="sel">
+          <span data-i18n="audit.count"></span>
+          <select id="audit-limit">
+            <option>25</option><option selected>60</option>
+            <option>150</option><option>400</option>
+          </select>
+        </label>
+        <span class="grow"></span>
+        <button type="button" class="btn" data-load="audit" data-i18n="ui.reload"></button>
+      </div>
+      <div id="audit-body" class="pane-body"></div>
+    </div>
+  </section>
+
+  <!-- ================= MCP ================= -->
+  <section id="v-mcp" class="view view-pane" hidden>
+    <div class="pane">
+      <div class="pane-bar">
+        <span class="pane-note" data-i18n="mcp.note"></span>
+        <span class="grow"></span>
+        <button type="button" id="mcp-test" class="btn" data-i18n="mcp.test"></button>
+        <button type="button" id="mcp-copy" class="btn" data-i18n="mcp.copy"></button>
+        <button type="button" class="btn" data-load="mcp" data-i18n="ui.reload"></button>
+      </div>
+      <div id="mcp-body" class="pane-body"></div>
+    </div>
+  </section>
+
+  <!-- ================= AYARLAR ================= -->
+  <section id="v-settings" class="view view-pane" hidden>
+    <div class="pane">
+      <div class="pane-bar">
+        <span class="pane-t" data-i18n="cfg.title"></span>
+        <span class="grow"></span>
+        <button type="button" class="btn" data-load="settings" data-i18n="ui.reload"></button>
+      </div>
+      <div id="settings-body" class="pane-body"></div>
+    </div>
+  </section>
+
+  <!-- ================= LOG ================= -->
+  <section id="v-logs" class="view view-pane" hidden>
+    <div class="pane">
+      <div class="pane-bar">
+        <label class="sel">
+          <span data-i18n="logs.level"></span>
+          <select id="log-level">
+            <option>DEBUG</option><option selected>INFO</option>
+            <option>WARNING</option><option>ERROR</option>
+          </select>
+        </label>
+        <label class="chk">
+          <input id="log-follow" type="checkbox" />
+          <span data-i18n="logs.follow"></span>
+        </label>
+        <span class="grow"></span>
+        <button type="button" class="btn" data-load="logs" data-i18n="ui.reload"></button>
+      </div>
+      <div id="logs-body" class="pane-body"></div>
+    </div>
+  </section>
+</div>
+
+<!-- Tam kayit paneli -->
+<div id="sheet" class="sheet" hidden role="dialog" aria-modal="true">
+  <div class="sheet-in">
+    <header class="sheet-top">
+      <div>
+        <p class="lbl" id="sheet-kicker"></p>
+        <h2 id="sheet-title" class="sheet-title"></h2>
+      </div>
+      <div class="sheet-acts">
+        <button type="button" id="sheet-copy" class="btn" data-i18n="ui.copy"></button>
+        <button type="button" id="sheet-x" class="ghost-btn" data-i18n-attr="aria-label:ui.close">✕</button>
+      </div>
+    </header>
+    <div id="sheet-body" class="sheet-body"></div>
+  </div>
+</div>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<script src="/ui/assets/app.js"></script>
+</body>
+</html>

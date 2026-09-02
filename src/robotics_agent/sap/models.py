@@ -6,7 +6,7 @@ her modelde SAP karsiligi yorum olarak belirtilmistir.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -41,6 +41,16 @@ class Material(BaseModel):
     )
 
 
+def _normalise_characteristic(name: str) -> str:
+    """Karakteristik adini karsilastirilabilir hale getirir.
+
+    `REACH_MM`, `reach mm` ve `Reach-MM` ayni karakteristiktir; SAP'in
+    yazim kurali ile modelin yazdigi ad arasindaki fark bir filtre
+    hatasina donusmemeli.
+    """
+    return "".join(ch for ch in str(name).lower() if ch.isalnum())
+
+
 class MaterialClassification(BaseModel):
     """Malzeme siniflandirmasi (CLFN: KLAH/CABN/CAWN/AUSP).
 
@@ -61,7 +71,18 @@ class MaterialClassification(BaseModel):
     source: str = Field(default="", description="Verinin geldigi API/CDS")
 
     def numeric(self, name: str) -> float | None:
+        """Karakteristigin sayisal degeri; ad eslesmesi buyuk/kucuk harf duyarsizdir.
+
+        SAP karakteristik adlari (CABN-ATNAM) her zaman BUYUK harf ve
+        genellikle alt cizgilidir: `REACH_MM`, `ANTRIEBSMOMENT_NM`. Model ise
+        kullanicinin yazdigi sekilde `reach_mm` gonderir. Tam eslesme
+        arayan eski hali bu durumda `None` donuyordu ve sonuc **sessiz sifir
+        eslesme** oluyordu: filtre calismadi degil, "hicbir malzeme uymadi"
+        gibi gorunuyordu. Ad normalize edilerek karsilastirilir.
+        """
         value = self.characteristics.get(name)
+        if value is None:
+            value = self._lookup_relaxed(name)
         if isinstance(value, bool) or value is None:
             return None
         try:
@@ -69,13 +90,22 @@ class MaterialClassification(BaseModel):
         except (TypeError, ValueError):
             return None
 
+    def _lookup_relaxed(self, name: str) -> Any:
+        """Buyuk/kucuk harf ve ayrac (`_`, `-`, bosluk) farkini yok sayan arama."""
+        wanted = _normalise_characteristic(name)
+        if not wanted:
+            return None
+        for key, value in self.characteristics.items():
+            if _normalise_characteristic(key) == wanted:
+                return value
+        return None
+
 
 class StockLevel(BaseModel):
     """Stok durumu (MARD / MSKA / EBAN acik miktarlar).
 
     Dikkat: bu model **stok fotografidir**, ATP degildir. `unreserved_qty`
-    "serbest stok eksi rezervasyon"dur; tarih bazli teyit icin `AtpResult`
-    kullanilir.
+    "serbest stok eksi rezervasyon"dur ve tarih bazli bir teyit yerine gecmez.
     """
 
     material_id: str
@@ -102,53 +132,6 @@ class StockLevel(BaseModel):
     @property
     def below_safety_stock(self) -> bool:
         return self.unreserved_qty < self.safety_stock
-
-
-class AtpScheduleLine(BaseModel):
-    """ATP teyit satiri: hangi tarihte ne kadar taahhut edilebilir."""
-
-    confirmed_date: date
-    confirmed_qty: float
-    supply_element: str = Field(default="", description="Teyidi saglayan arz elementi")
-
-
-class AtpResult(BaseModel):
-    """Gercek ATP sonucu (API_PRODUCT_AVAILY_INFO karsiligi).
-
-    `StockLevel`den farki: tarih boyutu vardir. Talep edilen miktarin tamami
-    istenen tarihte karsilanamiyorsa, kismi teyit satirlari ve tam teyit tarihi
-    ayri ayri verilir.
-    """
-
-    material_id: str
-    plant: str
-    requested_qty: float
-    requested_date: date | None = None
-    unit: str = "ST"
-    confirmed_qty: float = Field(default=0.0, description="Istenen tarihte teyit edilen miktar")
-    full_confirmation_date: date | None = Field(
-        default=None, description="Talebin tamaminin karsilanabilecegi en erken tarih"
-    )
-    schedule_lines: list[AtpScheduleLine] = Field(default_factory=list)
-    checked_at: datetime | None = None
-    source_api: str = ""
-    # Fabrika takvimi/tesis tatili dikkate alindi mi?
-    calendar_considered: bool = False
-    messages: list[str] = Field(default_factory=list)
-
-    @property
-    def shortfall_qty(self) -> float:
-        return round(max(0.0, self.requested_qty - self.confirmed_qty), 3)
-
-    @property
-    def fully_confirmed(self) -> bool:
-        return self.shortfall_qty <= 0
-
-    @property
-    def late_by_days(self) -> int:
-        if not (self.requested_date and self.full_confirmation_date):
-            return 0
-        return max(0, (self.full_confirmation_date - self.requested_date).days)
 
 
 class SupplyDemandItem(BaseModel):
@@ -255,28 +238,57 @@ class Vendor(BaseModel):
     country: str = Field(default="", description="LFA1-LAND1")
     city: str = ""
     blocked: bool = Field(default=False, description="LFA1-SPERM")
-    # Tedarikci degerlendirme kriterleri (0-100)
-    on_time_delivery_pct: float = 0.0
-    quality_ppm: int = Field(default=0, description="Milyonda hatali parca")
-    price_competitiveness: float = Field(default=0.0, description="0-100, yuksek = daha rekabetci")
-    responsiveness: float = 0.0
+    # Tedarikci degerlendirme kriterleri (0-100).
+    #
+    # `None` = SAP'ta OLCUM YOK. Sifir degil: sifir "olculdu ve sifir cikti"
+    # demektir ve tam ters karari verdirir - 0 ppm kusursuz kalite, %0 zamaninda
+    # teslim ise tam guvenilmezlik anlamina gelir. Degerlendirme CDS'i kapali
+    # bir sistemde ikisini de sifir yazmak, olculmemis bir tedarikciyi ya
+    # kusursuz ya felaket gostermek demekti.
+    on_time_delivery_pct: float | None = None
+    quality_ppm: int | None = Field(default=None, description="Milyonda hatali parca")
+    price_competitiveness: float | None = Field(
+        default=None, description="0-100, yuksek = daha rekabetci"
+    )
+    responsiveness: float | None = None
     certifications: list[str] = Field(default_factory=list)
     single_source_risk: bool = False
     avg_lead_time_days: int = 0
 
-    def score(self) -> float:
-        """Agirlikli tedarikci skoru (0-100). Agirliklar tipik ME6H sema mantigina yakindir."""
-        quality_score = max(0.0, 100.0 - self.quality_ppm / 50.0)
+    @property
+    def unmeasured_fields(self) -> list[str]:
+        """SAP'ta olcumu bulunmayan degerlendirme alanlari."""
+        eksik = []
+        if self.on_time_delivery_pct is None:
+            eksik.append("on_time_delivery_pct")
+        if self.quality_ppm is None:
+            eksik.append("quality_ppm")
+        if self.price_competitiveness is None:
+            eksik.append("price_competitiveness")
+        if self.responsiveness is None:
+            eksik.append("responsiveness")
+        return eksik
+
+    def score(self) -> float | None:
+        """Agirlikli tedarikci skoru (0-100), olcum yoksa `None`.
+
+        Eksik kriteri sifir sayip skoru yine de uretmek, olculmemis bir
+        tedarikciyi olculmus ve kotu cikmis gibi siralardi. Kismi veriden
+        skor uretilmez; cagiran taraf `unmeasured_fields` ile eksigi bildirir.
+        """
+        if self.blocked:
+            return 0.0
+        if self.unmeasured_fields:
+            return None
+        quality_score = max(0.0, 100.0 - (self.quality_ppm or 0) / 50.0)
         raw = (
-            0.35 * self.on_time_delivery_pct
+            0.35 * (self.on_time_delivery_pct or 0.0)
             + 0.30 * quality_score
-            + 0.20 * self.price_competitiveness
-            + 0.15 * self.responsiveness
+            + 0.20 * (self.price_competitiveness or 0.0)
+            + 0.15 * (self.responsiveness or 0.0)
         )
         if self.single_source_risk:
             raw -= 5.0
-        if self.blocked:
-            raw = 0.0
         return round(max(0.0, min(100.0, raw)), 1)
 
 
@@ -465,44 +477,6 @@ class DocumentFlowNode(BaseModel):
     notes: list[str] = Field(default_factory=list)
 
 
-class WorkflowStep(BaseModel):
-    """Onay is akisi adimi (SAP Workflow / BPA task).
-
-    `processor_*` alanlari kisisel veridir (D2) ve varsayilan cikti seviyesinde
-    maskelenir; onemli olan onayin **kimde bekledigi degil, neden bekledigi**
-    bilgisidir.
-    """
-
-    workflow_id: str
-    step_no: int = 0
-    step_name: str = ""
-    status: Literal["completed", "in_progress", "ready", "waiting", "rejected", "cancelled"] = (
-        "in_progress"
-    )
-    decision: str = ""
-    processor_name: str = Field(default="", description="Islem yapan/bekleyen kisi (D2)")
-    processor_role: str = Field(default="", description="Onay rolu/pozisyonu")
-    started_at: datetime | None = None
-    completed_at: datetime | None = None
-    due_at: datetime | None = None
-    note: str = ""
-
-    @property
-    def is_pending(self) -> bool:
-        return self.status in {"in_progress", "ready", "waiting"}
-
-    def age_days(self, *, now: datetime | None = None) -> int:
-        if self.started_at is None:
-            return 0
-        reference = self.completed_at or now or datetime.now(timezone.utc)
-        started = self.started_at
-        if started.tzinfo is None:
-            started = started.replace(tzinfo=timezone.utc)
-        if reference.tzinfo is None:
-            reference = reference.replace(tzinfo=timezone.utc)
-        return max(0, (reference - started).days)
-
-
 class InvoiceBlock(BaseModel):
     """Fatura blokaj nedeni (RSEG/RBKP tolerans kontrolleri).
 
@@ -512,10 +486,19 @@ class InvoiceBlock(BaseModel):
 
     invoice_id: str
     item_no: str = ""
+    # "unknown" bilerek vardir. Kaynak API blokajin NEDENINI yayinlamiyorsa
+    # bir neden secmek uydurmaktir: "manual" demek, otomatik tolerans blokajini
+    # elle konmus gibi gostererek kullaniciyi YANLIS islemin ustune yollar
+    # (MRBR ile serbest birakma yerine elle blokaj kaldirma).
     block_reason: Literal[
-        "price", "quantity", "date", "order_price_unit", "quality", "manual", "amount"
-    ] = "price"
+        "price", "quantity", "date", "order_price_unit", "quality", "manual", "amount", "unknown"
+    ] = "unknown"
     tolerance_key: str = Field(default="", description="OMR6 tolerans anahtari (PP, DQ, ST...)")
+    # RBKP-ZLSPR odeme blokaj anahtari. OMR6 tolerans anahtari ILE AYNI SEY
+    # DEGILDIR: farkli kod listeleri, farkli anlamlar. Ayni alanda tasimak
+    # 'R' (fatura dogrulama blokaji) degerini bir tolerans anahtari gibi
+    # gosteriyordu.
+    payment_block_key: str = Field(default="", description="RBKP-ZLSPR odeme blokaj anahtari")
     expected_value: float | None = None
     actual_value: float | None = None
     variance_abs: float | None = None
@@ -562,7 +545,10 @@ class SupplierInvoice(BaseModel):
         return self.status == "blocked" or bool(self.payment_block) or bool(self.blocks)
 
     def days_overdue(self, *, today: date | None = None) -> int:
-        if self.due_date is None or self.status == "paid":
+        # Iptal edilmis veya henuz park halinde olan belge odeme acigi
+        # degildir. Bunlari gecikmis saymak, ozellikle Hub sandbox'taki
+        # cancelled ornekleri aktif borc gibi gostermisti.
+        if self.due_date is None or self.status in {"paid", "cancelled", "parked"}:
             return 0
         return max(0, ((today or date.today()) - self.due_date).days)
 
@@ -582,31 +568,29 @@ class GoodsReceipt(BaseModel):
     po_id: str = Field(default="", description="MSEG-EBELN")
     po_item: str = Field(default="", description="MSEG-EBELP")
     batch: str = ""
-    reversed: bool = Field(default=False, description="Iptal edilmis mi (123 hareketi)")
+    #: Bu satir bir TERS KAYIT mi? (102/122/162 veya `ReversedMaterialDocument`
+    #: dolu). Net miktar hesabinda isareti eksi olan satir budur.
+    reversed: bool = Field(default=False, description="Ters kayit hareketi mi")
+    #: Bu satirin kendisi iptal EDILDI mi? SAP iptalde IKI belge birakir:
+    #: asil 101 satiri `GoodsMovementIsCancelled=true` isaretlenir, ayrica
+    #: bir 102 ters kayit belgesi olusur. Ikisini de eksi saymak miktari
+    #: iki kez dusurur; bu alan ayrimi korur.
+    cancelled: bool = Field(default=False, description="Asil hareket iptal edilmis mi")
+    #: Ters kaydin hangi belgeyi iptal ettigi (MSEG-SMBLN).
+    reverses_document: str = Field(default="", description="Ters kaydin hedefi")
 
     @property
     def is_reversal(self) -> bool:
-        return self.movement_type in {"102", "122", "162"}
-
-
-class ProjectCost(BaseModel):
-    """Proje / WBS maliyet ozeti (PRPS + COSP plan-fiili)."""
-
-    wbs_element: str = Field(description="PRPS-POSID")
-    description: str = ""
-    plan_cost: float = 0.0
-    actual_cost: float = 0.0
-    commitment: float = Field(default=0.0, description="Acik siparis taahhutu (COOI)")
-    currency: str = "EUR"
-    fiscal_year: int = 0
-    completion_pct: float = 0.0
+        return self.reversed or self.movement_type in {"102", "122", "162"}
 
     @property
-    def remaining_budget(self) -> float:
-        return round(self.plan_cost - self.actual_cost - self.commitment, 2)
+    def signed_quantity(self) -> float:
+        """Net miktara katkisi. Iptal edilen asil satir +, ters kayit -.
 
-    @property
-    def variance_pct(self) -> float:
-        if self.plan_cost == 0:
-            return 0.0
-        return round(((self.actual_cost + self.commitment) / self.plan_cost - 1) * 100, 1)
+        SAP aritmetigi budur: her malzeme belgesi satiri gercek bir kayittir
+        ve isaretini hareket tipi belirler. Asil 101 (+10) ile onu iptal eden
+        102 (-10) birbirini goturur; net 0. Ikisini birden eksi saymak -20
+        verirdi - kismen teslim edilmis bir siparis "hic teslim edilmedi"
+        gorunurdu.
+        """
+        return -self.quantity if self.is_reversal else self.quantity

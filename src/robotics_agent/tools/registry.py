@@ -67,6 +67,7 @@ from ..privacy import (
 )
 from ..risk import ImpactProfile, MutationKind, Reversibility
 from ..sap import SAPBackend, SAPError, get_backend
+from ..security_at_rest import maybe_cipher
 
 log = logging.getLogger(__name__)
 
@@ -138,6 +139,9 @@ class ToolContext:
                     if self.settings.state.audit_mirror_enabled
                     else None
                 ),
+                cipher=maybe_cipher(
+                    self.settings.privacy.audit_encryption, purpose="audit"
+                ),
             )
         if self.evidence is None:
             # Worker'lar arasi paylasim gerektiginde SQLite; bellek deposu
@@ -149,7 +153,15 @@ class ToolContext:
             self.evidence = (
                 EvidenceStore(**evidence_kwargs)
                 if self.settings.state.session_backend == "memory"
-                else SQLiteEvidenceStore(db, **evidence_kwargs)
+                else SQLiteEvidenceStore(
+                    db,
+                    # Ayar acik ama anahtar/kutuphane yoksa burada YUKSELIR;
+                    # sessizce duz metne dusme yolu yoktur.
+                    cipher=maybe_cipher(
+                        self.settings.privacy.evidence_encryption, purpose="evidence"
+                    ),
+                    **evidence_kwargs,
+                )
             )
         if self.policy is None:
             self.policy = PolicyDecisionPoint(
@@ -160,6 +172,7 @@ class ToolContext:
                 org_defaults=OrgDefaults.from_settings(self.settings),
                 risk_mode=self.settings.risk.scoring_mode,
                 disabled_tools=frozenset(self.settings.security.disabled_tools),
+                read_only=self.settings.sap.read_only,
             )
         if self.dlp is None:
             self.dlp = build_dlp_engine(self.settings)
@@ -221,11 +234,12 @@ class ToolContext:
 
 @dataclass(frozen=True)
 class PerformanceBudget:
-    """Tool'un CI tarafindan dogrulanan olculebilir performans sozlesmesi.
+    """Tool'un runtime ve CI tarafindan uygulanan performans sozlesmesi.
 
-    Bu degerler CI kapisinin olctugu esiklerdir: bir tool bildirdigi SAP cagri
-    sayisini asarsa contract testi kirmizi doner. "Yavas ama calisiyor" bir
-    tool, bildirmedigi surece kabul edilmez.
+    `max_sap_calls` OData/ECC HTTP katmaninda retry ve CSRF dahil gercek
+    gidiş-donuslari sinirlar; CI testleri de temsilci akislari ayni esige
+    karsi olcer. "Yavas ama calisiyor" bir tool, bildirmedigi surece kabul
+    edilmez.
     """
 
     p95_ms: int = 4000
@@ -530,16 +544,25 @@ def function_declarations(names: list[str] | None = None) -> list[Any]:
     return [REGISTRY[n].to_function_declaration() for n in names if n in REGISTRY]
 
 
-def visible_tool_names(domains: frozenset[str], actor: ActorContext) -> list[str]:
+def visible_tool_names(
+    domains: frozenset[str],
+    actor: ActorContext,
+    *,
+    settings: Settings | None = None,
+) -> list[str]:
     """Domain pack'e giren **ve** actor'un yetkili oldugu tool adlari.
 
-    Kullanicinin yetkisi olmayan mutating tool modele hic gosterilmez. Bu hem
-    token maliyetini hem saldiri yuzeyini azaltir.
+    Kullanicinin yetkisi olmayan veya read-only urun profilinde kapali olan
+    mutating tool modele hic gosterilmez. Bu hem token maliyetini hem saldiri
+    yuzeyini azaltir. Policy katmani ayni karari cagri aninda tekrar uygular.
     """
-    disabled = frozenset(get_settings().security.disabled_tools)
+    resolved = settings or get_settings()
+    disabled = frozenset(resolved.security.disabled_tools)
     out: list[str] = []
     for spec in REGISTRY.values():
         if spec.domain not in domains or spec.name in disabled:
+            continue
+        if resolved.sap.read_only and spec.risk_tier.is_mutating:
             continue
         if spec.required_scopes and actor.missing_scopes(spec.required_scopes):
             continue
@@ -635,7 +658,9 @@ def _run_with_timeout(
     """
     timeout = float(spec.timeout_s or 0)
     if timeout <= 0:
-        return spec.handler(ctx=ctx, **arguments)
+        assert spec.performance_budget is not None
+        with ctx.sap.enforce_call_budget(spec.performance_budget.max_sap_calls):
+            return spec.handler(ctx=ctx, **arguments)
 
     # Terk edilmis is birikmisse yeni cagri baslatmak durumu kotulestirir.
     # Sessizce yavaslamak yerine acik hata verilir: operasyon ekibi asili
@@ -652,7 +677,12 @@ def _run_with_timeout(
 
     def _target() -> None:
         try:
-            box["result"] = spec.handler(ctx=ctx, **arguments)
+            assert spec.performance_budget is not None
+            # Butce handler thread'inde acilir: timeout sonrasi arka planda
+            # kalan bir is de kapsami korur. OData/ECC bunu retry ve CSRF dahil
+            # her gercek HTTP denemesinden hemen once uygular.
+            with ctx.sap.enforce_call_budget(spec.performance_budget.max_sap_calls):
+                box["result"] = spec.handler(ctx=ctx, **arguments)
         except BaseException as exc:  # noqa: BLE001 - ana thread'e tasinir
             box["error"] = exc
 
@@ -724,6 +754,20 @@ def execute_tool(
         return payload, True
 
     ctx.decision = decision
+
+    # --- 1b. Detay seviyesi kapisi (handler'dan ONCE) ----------------------
+    #
+    # `detail="full"` iki sey birden acar: alan maskesini gevsetir VE sayfa
+    # boyunu bes katina cikarir (`page_limit`). Alan tarafi DLP'de zaten
+    # kapiliydi, ama HACIM tarafi kapisizdi: tool'lar ham argumani
+    # `resolve_detail()` ile okuyordu ve bu fonksiyon actor'u hic gormez.
+    # Sonuc: kapsami olmayan bir cagiran, yalnizca "detail=full" yazarak bes
+    # kat kayit alabiliyordu.
+    #
+    # `effective_detail` bu kapiyi tam olarak tanimliyordu ama `src/` icinde
+    # HICBIR cagirani yoktu. Merkezi yer burasi: boylece yedi tool'un her biri
+    # ayri ayri hatirlamak zorunda kalmaz ve yeni bir tool da otomatik korunur.
+    arguments, detail_downgrade = _gate_detail_level(arguments, ctx)
 
     # --- 2. Cache (yalniz salt okunur tool'lar) ----------------------------
     cache_key = _cache_key_for(spec, arguments, ctx)
@@ -883,8 +927,40 @@ def execute_tool(
                     name,
                 )
 
-    # --- 4. Alan politikasi ve DLP (modele verilmeden ONCE) -----------------
+    # --- 3b. Organizasyon kapsami: SONUC tarafi ----------------------------
+    # Arguman tarafi belge anahtarli tool'larda hicbir sey yakalamiyor
+    # (`po_id` verildiginde argumanda tesis yok). Bu ikinci kapi SAP'tan
+    # DONEN kayitlara bakar: kayitta gorunen tesis/sirket kodu actor'un
+    # yetki alani disindaysa sonuc kullaniciya da modele de verilmez.
     serialized = strip_empty(_serialize(result))
+    if ctx.actor is not None and ctx.policy is not None:
+        org_ihlalleri = ctx.policy.result_org_violations(serialized, ctx.actor)
+        if org_ihlalleri:
+            payload = json.dumps(
+                {
+                    "error": "Sonuc yetki alaniniz disinda kayit iceriyor.",
+                    "denial_code": "ORG_SCOPE",
+                    "reasons": org_ihlalleri,
+                    "remediation": (
+                        "Belge yetkili oldugunuz tesis/sirket kodu disinda. "
+                        "Yetki genisletme talebi SAP/BTP yoneticisine gider."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+            ctx.audit.append(
+                "tool.result_denied",
+                execution=ctx.execution,
+                tool=name,
+                risk_tier=spec.risk_tier.value,
+                outcome="deny",
+                detail={"denial_code": "ORG_SCOPE", "reasons": org_ihlalleri[:5]},
+            )
+            log.warning("sonuc kapsam disi | %s | %s", name, org_ihlalleri[0])
+            _record_metric(ctx, spec, name, outcome="deny", started=started, result=payload)
+            return payload, True
+
+    # --- 4. Alan politikasi ve DLP (modele verilmeden ONCE) -----------------
     dlp_summary: dict[str, Any] | None = None
     # Sonucta fiilen gorulen en yuksek veri sinifi; cache karari buna bakar.
     observed_class = spec.max_data_class
@@ -929,6 +1005,13 @@ def execute_tool(
         observed_class = dlp_result.observed_max_class
 
     is_error = isinstance(serialized, dict) and "error" in serialized
+
+    # Detay seviyesi dusuruldyse cagiran bunu GORMELI: aksi halde "neden az
+    # kayit geldi" sorusu cevapsiz kalir ve eksik liste tam sanilir.
+    if detail_downgrade and isinstance(serialized, dict) and not is_error:
+        notices = serialized.setdefault("warnings", [])
+        if isinstance(notices, list) and detail_downgrade not in notices:
+            notices.append(detail_downgrade)
 
     # --- 5. Sonuc butcesi ve evidence ---------------------------------------
     evidence_id = None
@@ -1029,6 +1112,35 @@ def _safe_log(ctx: ToolContext, text: str) -> str:
     if ctx.dlp is None or ctx.actor is None:
         return "[gizlendi]"
     return sanitize_for_log(text, actor=ctx.actor, dlp=ctx.dlp)
+
+
+def _gate_detail_level(
+    arguments: dict[str, Any], ctx: ToolContext
+) -> tuple[dict[str, Any], str]:
+    """`detail` argumanini actor'un gercekten hakki olan seviyeye indirir.
+
+    Donus: (kullanilacak argumanlar, dusurme gerekcesi ya da bos metin).
+
+    Sessizce reddetmek yerine **dusururuz**: cagiran sonucu yine alir, ama
+    yetkisinin verdigi hacim ve maskeleme seviyesinde. Gerekce sonuca uyari
+    olarak eklenir, boylece "neden az kayit geldi" sorusu cevapsiz kalmaz.
+
+    Kapi cache anahtarindan ONCE calisir: aksi halde yetkili bir cagiranin
+    doldurdugu `full` girdisi, yetkisiz bir cagirana cache uzerinden servis
+    edilebilirdi.
+    """
+    requested = str(arguments.get("detail", "") or "").strip().lower()
+    if requested != "full" or ctx.actor is None or ctx.dlp is None:
+        return arguments, ""
+
+    policy = getattr(ctx.dlp, "field_policy", None)
+    blocker = getattr(policy, "full_detail_blocker", None)
+    if blocker is None:
+        return arguments, ""
+    reason = blocker(ctx.actor, purpose=ctx.purpose)
+    if not reason:
+        return arguments, ""
+    return {**arguments, "detail": "standard"}, reason
 
 
 def _cache_key_for(spec: ToolSpec, arguments: dict[str, Any], ctx: ToolContext):

@@ -113,13 +113,6 @@ def main(argv: list[str] | None = None) -> int:
                 any(key in str(stock) for key in ("unrestricted", "available", "stock")),
                 "stok sifir olabilir; alanin gercek SAP'tan gelmesi aranir",
             )
-            run(
-                "sap_atp_check",
-                {"requests": [{
-                    "material_id": material, "quantity": 1,
-                    "required_date": required_date,
-                }]},
-            )
             run("sap_mrp_shortage_explain", {"material_id": material})
             comparison = run(
                 "sap_compare_vendors",

@@ -6,29 +6,26 @@ desteklemedigini sessizce bos donmek yerine `SAPNotSupported` ile bildirir.
 
 Portlar:
     ProductPort         malzeme ana verisi ve siniflandirma
-    PlanningPort        stok, gercek ATP, MRP arz/talep
+    PlanningPort        stok ve MRP arz/talep
     ProcurementPort     bilgi kaydi, tedarikci, skor, PR prepare/submit/read, PO
-    ProjectFinancePort  WBS plan/fiili/taahhut
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Sequence
-from datetime import date
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from typing import Any
 
 # SAPError ve SAPNotSupported'in tek tanimi adapter katmanindadir; buradan
 # yeniden ihrac edilir ki mevcut `from .base import SAPError` cagrilari calissin.
 from ..adapters.sap.errors import SAPError, SAPFault, SAPNotSupported
 from .models import (
-    AtpResult,
     DocumentFlowNode,
     GoodsReceipt,
     InfoRecord,
     Material,
     MaterialClassification,
-    ProjectCost,
     PurchaseOrder,
     PurchaseOrderItem,
     PurchaseRequisitionDraft,
@@ -40,7 +37,6 @@ from .models import (
     SupplierScore,
     SupplyDemandItem,
     Vendor,
-    WorkflowStep,
 )
 
 __all__ = [
@@ -48,12 +44,41 @@ __all__ = [
     "ProcureToPayPort",
     "ProcurementPort",
     "ProductPort",
-    "ProjectFinancePort",
     "SAPBackend",
     "SAPError",
     "SAPFault",
     "SAPNotSupported",
+    "WBS_LEVEL_SEPARATORS",
+    "effective_unit_price",
+    "wbs_matches",
 ]
+
+
+#: WBS kodlama maskesinde kullanilan yaygin seviye ayraclari (OPS9).
+WBS_LEVEL_SEPARATORS = ("-", ".", "/")
+
+
+def wbs_matches(query: str, candidate: str) -> bool:
+    """`candidate` WBS elemani, sorgulanan `query` kapsamina giriyor mu?
+
+    WBS **hiyerarsiktir**: `R-2026-021` bir proje, `R-2026-021-1` onun alt
+    elemanidir ve satinalma siparisleri hesap atamasini genellikle YAPRAK
+    elemana yapar. Uc backend de burada esitlik kullaniyordu; sonucu, tool'un
+    kendi sozlesmesinde yazan "WBS elemani **veya on eki**" davranisinin
+    calismamasiydi: kullanici proje kodunu sorup "bu projede acik siparis yok"
+    cevabi aliyordu.
+
+    Duz `startswith` de yanlis olurdu - `R-2026-02` ayri bir proje kodudur,
+    `R-2026-021-1`in atasi degil. Dogru kural: **esit**, ya da sorgudan sonra
+    bir SEVIYE AYRACI gelmeli.
+    """
+    q = (query or "").strip().upper()
+    c = (candidate or "").strip().upper()
+    if not q or not c:
+        return False
+    if c == q:
+        return True
+    return any(c.startswith(q + sep) for sep in WBS_LEVEL_SEPARATORS)
 
 
 def effective_unit_price(
@@ -159,28 +184,13 @@ class ProductPort(ABC):
 
 
 class PlanningPort(ABC):
-    """Stok fotografi, gercek ATP ve MRP arz/talep."""
+    """Stok fotografi ve MRP arz/talep."""
 
     name: str = "abstract"
 
     @abstractmethod
     def get_stock(self, material_ids: list[str], *, plant: str | None = None) -> list[StockLevel]:
         """Stok fotografi. ATP teyidi degildir."""
-
-    def check_atp(
-        self,
-        material_id: str,
-        *,
-        quantity: float,
-        requested_date: date | None = None,
-        plant: str | None = None,
-    ) -> AtpResult:
-        """Tarih bazli gercek ATP teyidi (API_PRODUCT_AVAILY_INFO)."""
-        raise SAPNotSupported(
-            "atp_check",
-            backend=self.name,
-            hint="API_PRODUCT_AVAILY_INFO servisi aktive edilmeli.",
-        )
 
     def get_supply_demand(
         self,
@@ -245,6 +255,18 @@ class ProcurementPort(ABC):
         """
         return self.get_vendor(vendor_id)
 
+    def get_vendor_masters(self, vendor_ids: Sequence[str]) -> dict[str, Vendor]:
+        """Birden cok tedarikcinin yalniz ana verisini getirir.
+
+        Varsayilan adapter tekil metoda duser. S/4 OData adapteri bunu toplu
+        sorguyla ezerek supplier-score tool'undaki N+1 desenini kaldirir.
+        """
+        out: dict[str, Vendor] = {}
+        for vendor_id in dict.fromkeys(vendor_ids):
+            if vendor_id and (vendor := self.get_vendor_master(vendor_id)) is not None:
+                out[vendor_id] = vendor
+        return out
+
     def get_supplier_score(
         self, vendor_id: str, *, purchasing_org: str | None = None
     ) -> SupplierScore | None:
@@ -254,6 +276,20 @@ class ProcurementPort(ABC):
             backend=self.name,
             hint="Supplier evaluation CDS view'i (A_SUPPLIEROPLSCORESAV_CDS) baglanmali.",
         )
+
+    def get_supplier_scores(
+        self, vendor_ids: Sequence[str], *, purchasing_org: str | None = None
+    ) -> dict[str, SupplierScore]:
+        """Birden cok tedarikci skorunu getirir; S/4 adapteri tek sorguya indirir."""
+        out: dict[str, SupplierScore] = {}
+        for vendor_id in dict.fromkeys(vendor_ids):
+            if (
+                vendor_id
+                and (score := self.get_supplier_score(vendor_id, purchasing_org=purchasing_org))
+                is not None
+            ):
+                out[vendor_id] = score
+        return out
 
     # --- PR: prepare / submit / read ---------------------------------------
     @abstractmethod
@@ -307,17 +343,6 @@ class ProcurementPort(ABC):
         only_open: bool = False,
         limit: int = 50,
     ) -> list[PurchaseOrder]: ...
-
-
-class ProjectFinancePort(ABC):
-    """Proje/WBS finansal gorunumu."""
-
-    name: str = "abstract"
-
-    @abstractmethod
-    def get_project_costs(
-        self, *, wbs_element: str | None = None, fiscal_year: int | None = None
-    ) -> list[ProjectCost]: ...
 
 
 class ProcureToPayPort:
@@ -397,23 +422,8 @@ class ProcureToPayPort:
             hint="API_SUPPLIERINVOICE_PROCESS_SRV baglanmali.",
         )
 
-    def get_workflow_status(
-        self, *, object_type: str, object_id: str
-    ) -> list[WorkflowStep]:
-        """Onay is akisinin hangi adimda ve kimde bekledigi."""
-        raise SAPNotSupported(
-            "workflow_status",
-            backend=self.name,
-            hint=(
-                "SAP Workflow (SWI) veya Build Process Automation task API'si "
-                "baglanmali; yerel onay kaydi is akisi durumu degildir."
-            ),
-        )
 
-
-class SAPBackend(
-    ProductPort, PlanningPort, ProcurementPort, ProjectFinancePort, ProcureToPayPort
-):
+class SAPBackend(ProductPort, PlanningPort, ProcurementPort, ProcureToPayPort):
     """S/4HANA is nesnelerine erisim arayuzu (tum portlarin birlesimi)."""
 
     name: str = "abstract"
@@ -447,6 +457,16 @@ class SAPBackend(
         """
         return 0
 
+    @contextmanager
+    def enforce_call_budget(self, max_calls: int) -> Iterator[None]:
+        """Tool bazli HTTP butcesi; agsiz backend'lerde bilincli no-op.
+
+        Mock backend SAP soketine cikmaz. OData/ECC backend'leri bu kapsami
+        gercek HTTP denemelerinden hemen once uygular.
+        """
+        del max_calls
+        yield
+
     def capabilities(self) -> dict[str, Any]:
         """Bu backend'in gercekten destekledigi yetenekler.
 
@@ -459,7 +479,6 @@ class SAPBackend(
             ("material_classification", "get_material_classification"),
             ("valuation", "get_valuation"),
             ("stock", "get_stock"),
-            ("atp_check", "check_atp"),
             ("mrp_supply_demand", "get_supply_demand"),
             ("info_records", "get_info_records"),
             ("supplier_score", "get_supplier_score"),
@@ -467,14 +486,12 @@ class SAPBackend(
             ("pr_submit", "submit_purchase_requisition"),
             ("pr_reference_lookup", "find_purchase_requisition_by_reference"),
             ("purchase_orders", "get_purchase_orders"),
-            ("project_costs", "get_project_costs"),
             # Procure-to-pay gorunurlugu
             ("document_flow", "get_document_flow"),
             ("purchase_order_items", "get_purchase_order_items"),
             ("schedule_lines", "get_schedule_lines"),
             ("goods_receipts", "get_goods_receipts"),
             ("supplier_invoices", "get_supplier_invoices"),
-            ("workflow_status", "get_workflow_status"),
         ):
             own = getattr(type(self), method, None)
             base_impl = None
@@ -482,7 +499,6 @@ class SAPBackend(
                 ProductPort,
                 PlanningPort,
                 ProcurementPort,
-                ProjectFinancePort,
                 ProcureToPayPort,
             ):
                 candidate = getattr(port, method, None)

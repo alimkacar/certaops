@@ -39,6 +39,7 @@ from .output import (
 )
 from .pseudonymization import Pseudonymizer, get_pseudonymizer, reset_pseudonymizer_cache
 from .retention import RETENTION_POLICY, PurgeReport, RetentionRule, RetentionSweeper
+from .streaming import StreamSanitizer
 
 __all__ = [
     "FIELD_CLASS_INVENTORY",
@@ -62,6 +63,7 @@ __all__ = [
     "sanitize_for_log",
     "sanitize_text",
     "RetentionSweeper",
+    "StreamSanitizer",
     "Sink",
     "build_dlp_engine",
     "classify_field",

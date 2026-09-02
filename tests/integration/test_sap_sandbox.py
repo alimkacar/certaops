@@ -10,6 +10,7 @@ tenant'i ve asagidaki ortam degiskenleri gerekir:
     SAP_INTEGRATION_MATERIAL=<test malzemesi>
     SAP_INTEGRATION_VENDOR=<test tedarikcisi>     (opsiyonel)
     SAP_INTEGRATION_ALLOW_WRITE=1                 (yazma testleri icin, AYRICA)
+    SAP_READ_ONLY=false                           (gelecek write paketi icin, AYRICA)
     SAP_DRY_RUN=false                             (yazma testleri icin, AYRICA)
 
 Yazma testleri bilerek ayri bir bayrakla korunur ve calistiginda olusturdugu
@@ -36,6 +37,7 @@ from robotics_agent.sap.models import PurchaseRequisitionItem
 RUN_INTEGRATION = os.getenv("SAP_INTEGRATION_TESTS") == "1"
 ALLOW_WRITE = (
     os.getenv("SAP_INTEGRATION_ALLOW_WRITE") == "1"
+    and os.getenv("SAP_READ_ONLY", "true").strip().lower() in {"0", "false", "no"}
     and os.getenv("SAP_DRY_RUN", "true").strip().lower() in {"0", "false", "no"}
 )
 
@@ -124,20 +126,6 @@ def test_stock_can_be_read(sap, material):
     assert level.unrestricted_qty >= 0
 
 
-def test_atp_returns_dated_confirmation(sap, material):
-    try:
-        result = sap.check_atp(
-            material, quantity=1, requested_date=date.today() + timedelta(days=30)
-        )
-    except SAPNotSupported as exc:
-        pytest.skip(f"ATP servisi aktif degil: {exc}")
-    assert result.source_api
-    assert result.checked_at is not None
-    # Teyit tarihi olmadan ATP anlamsizdir.
-    if result.confirmed_qty > 0:
-        assert result.full_confirmation_date is not None
-
-
 def test_mrp_supply_demand_is_readable(sap, material):
     try:
         items = sap.get_supply_demand(material, horizon_days=90)
@@ -172,9 +160,9 @@ def test_supplier_score_marks_estimates(sap):
 def test_authorization_failure_is_structured(sap):
     """Yetkisiz bir cagri yapilandirilmis hata uretmeli (ham HTML degil)."""
     try:
-        sap.get_project_costs(wbs_element="ZZZ-YETKISIZ-TEST")
+        sap.get_supply_demand("ZZZ-YETKISIZ-TEST")
     except SAPNotSupported:
-        pytest.skip("Proje maliyet servisi bu sistemde yayinlanmamis.")
+        pytest.skip("MRP servisi bu sistemde yayinlanmamis.")
     except SAPError as exc:
         assert exc.code
         if exc.fault is not None:
@@ -185,7 +173,10 @@ def test_authorization_failure_is_structured(sap):
 # --- Yazma (ayrica bayrakli) ------------------------------------------------
 @pytest.mark.skipif(
     not ALLOW_WRITE,
-    reason="Yazma icin SAP_INTEGRATION_ALLOW_WRITE=1 ve SAP_DRY_RUN=false gerekli.",
+    reason=(
+        "Gelecek write paketi icin SAP_INTEGRATION_ALLOW_WRITE=1, "
+        "SAP_READ_ONLY=false ve SAP_DRY_RUN=false gerekli."
+    ),
 )
 def test_prepare_does_not_write(sap, material):
     draft = sap.prepare_purchase_requisition(
@@ -200,7 +191,10 @@ def test_prepare_does_not_write(sap, material):
 
 @pytest.mark.skipif(
     not ALLOW_WRITE,
-    reason="Yazma icin SAP_INTEGRATION_ALLOW_WRITE=1 ve SAP_DRY_RUN=false gerekli.",
+    reason=(
+        "Gelecek write paketi icin SAP_INTEGRATION_ALLOW_WRITE=1, "
+        "SAP_READ_ONLY=false ve SAP_DRY_RUN=false gerekli."
+    ),
 )
 def test_write_then_read_back_and_idempotent_retry(sap, material, capsys):
     """Write -> read-back -> ayni referansla tekrar (duplicate olmamali)."""
@@ -234,7 +228,10 @@ def test_write_then_read_back_and_idempotent_retry(sap, material, capsys):
 
 @pytest.mark.skipif(
     not ALLOW_WRITE,
-    reason="Yazma icin SAP_INTEGRATION_ALLOW_WRITE=1 ve SAP_DRY_RUN=false gerekli.",
+    reason=(
+        "Gelecek write paketi icin SAP_INTEGRATION_ALLOW_WRITE=1, "
+        "SAP_READ_ONLY=false ve SAP_DRY_RUN=false gerekli."
+    ),
 )
 def test_policy_gate_blocks_unauthorized_write(sap):
     """Gercek sistemde de yetkisiz actor handler'a ulasamaz."""

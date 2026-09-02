@@ -123,14 +123,38 @@ def test_valid_token_resolves_actor(client):
     assert "1100" in body["actor"]["org_scope"]["plants"]
 
 
-def test_health_is_public_and_reports_posture(client):
-    body = client.get("/health").json()
+def test_health_is_reachable_without_token_but_says_nothing(client):
+    """Canlilik probe'u token tasiyamaz; ama duruş dokumu de herkese acilamaz.
+
+    Onceki hali kimliksiz cagirana auth modunu, kapatilmis tool listesini, DLP
+    modunu, saklama politikasini ve audit zincir durumunu veriyordu. Bunlarin
+    toplami saldirgana, hicbir sey denemeden once HANGI KONTROLLERIN KAPALI
+    oldugunu soyler.
+    """
+    response = client.get("/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {"status": "ok"}, f"kimliksiz /health fazla bilgi verdi: {body}"
+
+
+def test_health_posture_requires_platform_read(client):
+    """Ayrintili durus raporu `platform.read` kapsami ister."""
+    body = client.get("/health", headers=auth("viewer")).json()
     assert body["auth_mode"] == "static_token"
     assert body["audit_head"]["valid"] is True
     assert body["status"] == "ok"
     assert body["runtime_scope"] == "per_authenticated_session_security_context"
     assert body["runtime_count"] == 1
     assert body["runtime_cache"]["cached"] >= 0
+    assert "disabled_tools" in body
+
+
+def test_health_invalid_token_is_treated_as_anonymous(client):
+    """`/health` bir kimlik dogrulama ucu degildir: gecersiz token 401 degil,
+    kimliksiz yanit alir - ama yine de basarisiz deneme sayacina yazilir."""
+    response = client.get("/health", headers={"Authorization": "Bearer gecersiz"})
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
 
 
 def test_health_declares_simulation_mode(client):
@@ -140,8 +164,9 @@ def test_health_declares_simulation_mode(client):
     ama gercek degildir. `/health` bunu acikca soyler ve `production_ready`
     ile ayrica isaretler; `status` ise servisin su anki sagligidir.
     """
-    body = client.get("/health").json()
+    body = client.get("/health", headers=auth("viewer")).json()
     assert body["mode"] == "simulation"
+    assert body["read_only"] is True
     assert body["production_ready"] is False
     assert any("SAP_BACKEND=mock" in w for w in body["warnings"])
 
@@ -535,7 +560,7 @@ def test_shutdown_closes_providers_then_resets_shared_backend_once(client, monke
 
 # --- Guvenlik durusu --------------------------------------------------------
 def test_health_reports_production_readiness(client):
-    body = client.get("/health").json()
+    body = client.get("/health", headers=auth("viewer")).json()
     assert "production_ready" in body
     assert "audit_checkpoint" in body
     assert body["app_env"] == "development"
@@ -543,6 +568,6 @@ def test_health_reports_production_readiness(client):
 
 def test_health_audit_verification_is_bounded(client):
     """Buyuk defterlerde /health tam tarama yapmamali."""
-    body = client.get("/health").json()
+    body = client.get("/health", headers=auth("viewer")).json()
     assert "scope" in body["audit_head"]
     assert "son" in body["audit_head"]["scope"]

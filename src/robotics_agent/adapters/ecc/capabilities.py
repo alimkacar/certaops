@@ -162,31 +162,6 @@ ECC_CAPABILITY_MANIFEST: dict[str, ServiceCapability] = {
             )
         },
     ),
-    "availability": ServiceCapability(
-        alias="availability",
-        service_path="/sap/opu/odata/sap/ZAGENT_MM_STOCK_SRV",
-        odata_version="v2",
-        purpose="Gercek ATP: BAPI_MATERIAL_AVAILABILITY sarmalayicisi",
-        entity_sets=("AvailabilitySet",),
-        status=STATUS_CUSTOM,
-        doc_url="docs/ECC_ABAP_REQUIREMENTS.md#atp",
-        critical_properties={
-            # Girdi (RequestedQuantity/RequestedDate) filtrede gelir, cikti
-            # ATP agacidir. `CalendarConsidered` servisten okunur, sabitlenmez.
-            "AvailabilitySet": (
-                "Material",
-                "Plant",
-                "RequestedQuantity",
-                "RequestedDate",
-                "CommittedQuantity",
-                "CommittedDate",
-                "SupplyElement",
-                "CheckingRule",
-                "CalendarConsidered",
-                "BaseUnit",
-            )
-        },
-    ),
     "mrp": ServiceCapability(
         alias="mrp",
         service_path="/sap/opu/odata/sap/ZAGENT_MM_STOCK_SRV",
@@ -485,55 +460,7 @@ ECC_CAPABILITY_MANIFEST: dict[str, ServiceCapability] = {
         },
     ),
     # --- Is akisi -----------------------------------------------------------
-    "workflow": ServiceCapability(
-        alias="workflow",
-        service_path="/sap/opu/odata/sap/ZAGENT_WF_STATUS_SRV",
-        odata_version="v2",
-        purpose="SAP Business Workflow durumu (SAP_WAPI_* sarmalayicisi)",
-        entity_sets=("WorkflowStepSet",),
-        status=STATUS_CUSTOM,
-        doc_url="docs/ECC_ABAP_REQUIREMENTS.md#zagent_wf_status_srv",
-        critical_properties={
-            "WorkflowStepSet": (
-                "ObjectType",
-                "ObjectId",
-                "WorkflowId",
-                "WorkItemId",
-                "StepNumber",
-                "StepName",
-                "WorkItemStatus",
-                "Decision",
-                "ProcessorName",
-                "ProcessorRole",
-                "StartedAt",
-                "CompletedAt",
-                "DueAt",
-                "Note",
-            )
-        },
-    ),
     # --- Proje maliyeti -----------------------------------------------------
-    "project_cost": ServiceCapability(
-        alias="project_cost",
-        service_path="/sap/opu/odata/sap/ZAGENT_PS_COST_SRV",
-        odata_version="v2",
-        purpose="WBS plan/fiili/taahhut (PRPS + COSP/COSS + COOI)",
-        entity_sets=("ProjectCostSet",),
-        status=STATUS_CUSTOM,
-        doc_url="docs/ECC_ABAP_REQUIREMENTS.md#zagent_ps_cost_srv",
-        critical_properties={
-            "ProjectCostSet": (
-                "WBSElement",
-                "WBSDescription",
-                "PlanCost",
-                "ActualCost",
-                "Commitment",
-                "Currency",
-                "FiscalYear",
-                "CompletionPercent",
-            )
-        },
-    ),
 }
 
 

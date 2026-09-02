@@ -21,7 +21,7 @@ from datetime import date, timedelta
 import httpx
 import pytest
 
-from robotics_agent.adapters.sap import SAPError, SAPNotSupported
+from robotics_agent.adapters.sap import SAPError
 from robotics_agent.sap.ecc import ECCSAPBackend, reference_token
 from robotics_agent.sap.models import PurchaseRequisitionItem
 
@@ -90,6 +90,7 @@ def build_backend(settings_factory, tmp_path, routes=None, **create) -> tuple[EC
             "sap.purch_group": "R01",
             "sap.company_code": "1000",
             "sap.currency": "EUR",
+            "sap.read_only": False,
             "security.allowed_sap_hosts": ("ecc.test",),
         },
     )
@@ -275,65 +276,6 @@ def test_rezervasyon_okunamazsa_sifira_zorlanmaz(settings_factory, tmp_path):
 
 # ---------------------------------------------------------------------------
 # ATP
-# ---------------------------------------------------------------------------
-def test_atp_filtre_literalleri_odata_v2_spesifikasyonuna_uyar(settings_factory, tmp_path):
-    """Edm.Decimal `m` soneki ve Edm.DateTime literali - yanlissa Gateway 400 doner."""
-    need = date.today() + timedelta(days=30)
-    backend, fake = build_backend(
-        settings_factory,
-        tmp_path,
-        {
-            "AvailabilitySet": [
-                {"CommittedQuantity": "25", "CommittedDate": need.isoformat(),
-                 "SupplyElement": "ATP", "CalendarConsidered": "X", "BaseUnit": "ST",
-                 "CheckingRule": "01"},
-            ]
-        },
-    )
-    backend.check_atp("R-1000", quantity=25, requested_date=need)
-    flt = fake.filter_of("AvailabilitySet")
-    assert "RequestedQuantity eq 25.000m" in flt
-    assert f"RequestedDate eq datetime'{need.isoformat()}T00:00:00'" in flt
-
-
-def test_atp_kismi_teyidi_ve_takvim_uyarisini_dogru_uretir(settings_factory, tmp_path):
-    need = date.today() + timedelta(days=10)
-    gec = need + timedelta(days=20)
-    backend, _ = build_backend(
-        settings_factory,
-        tmp_path,
-        {
-            "AvailabilitySet": [
-                {"CommittedQuantity": "6", "CommittedDate": need.isoformat(),
-                 "SupplyElement": "WB", "CalendarConsidered": "", "BaseUnit": "ST"},
-                {"CommittedQuantity": "4", "CommittedDate": gec.isoformat(),
-                 "SupplyElement": "BE", "CalendarConsidered": "", "BaseUnit": "ST"},
-            ]
-        },
-    )
-    result = backend.check_atp("R-1000", quantity=10, requested_date=need)
-
-    assert result.confirmed_qty == 6.0, "istenen tarihten sonraki satir sayilmamali"
-    assert result.shortfall_qty == 4.0
-    assert result.full_confirmation_date == gec
-    assert result.late_by_days == 20
-    assert len(result.schedule_lines) == 2
-    assert result.calendar_considered is False
-    assert any("is gunu olmayabilir" in m for m in result.messages), (
-        "takvim dikkate alinmadiysa kullanici uyarilmali"
-    )
-
-
-def test_atp_bos_yanitta_sessiz_gecmez(settings_factory, tmp_path):
-    """Servis beklenen alani dondurmezse bos ATP degil, ACIK hata gelmeli."""
-    backend, _ = build_backend(settings_factory, tmp_path, {"AvailabilitySet": []})
-    with pytest.raises(SAPNotSupported) as exc:
-        backend.check_atp("R-1000", quantity=5)
-    assert "ECC_ABAP_REQUIREMENTS" in str(exc.value)
-
-
-# ---------------------------------------------------------------------------
-# Tedarikci skoru
 # ---------------------------------------------------------------------------
 def test_eksik_skor_alanlari_sifir_degil_estimated_isaretlenir(settings_factory, tmp_path):
     """ECC'de standart olmayan alanlar 0 dondurulurse yanlis karar uretir."""
@@ -625,33 +567,6 @@ def test_fatura_blokaji_ve_sapma_hesaplanir(settings_factory, tmp_path):
     assert block.variance_pct == 10.0
 
 
-def test_is_akisi_statusu_eslenir(settings_factory, tmp_path):
-    backend, _ = build_backend(
-        settings_factory,
-        tmp_path,
-        {
-            "WorkflowStepSet": [
-                {"WorkflowId": "WF1", "StepNumber": "2", "StepName": "Yonetici onayi",
-                 "WorkItemStatus": "READY", "ProcessorName": "Ayse Y.",
-                 "StartedAt": "2026-08-01T09:00:00Z"},
-                {"WorkflowId": "WF1", "StepNumber": "1", "StepName": "Kontrol",
-                 "WorkItemStatus": "COMPLETED", "Decision": "onaylandi"},
-            ]
-        },
-    )
-    steps = backend.get_workflow_status(object_type="BUS2105", object_id="0010004711")
-
-    assert [s.step_no for s in steps] == [1, 2], "adimlar siraya girmeli"
-    assert steps[0].status == "completed"
-    assert steps[1].status == "ready"
-    assert steps[1].is_pending
-    # Kisisel veri ham gelir; maskeleme DLP katmaninin isi.
-    assert steps[1].processor_name == "Ayse Y."
-
-
-# ---------------------------------------------------------------------------
-# Guvenlik / kapsam
-# ---------------------------------------------------------------------------
 def test_izinsiz_host_engellenir(settings_factory, tmp_path):
     """SAP_ALLOWED_HOSTS disina cikis engellenmeli (egress korumasi)."""
     from robotics_agent.adapters.sap import HostNotAllowed
@@ -669,6 +584,6 @@ def test_capabilities_ecc_gercegini_raporlar(settings_factory, tmp_path):
     assert caps["backend"] == "ecc"
     assert caps["odata_preference"] == "v2"
     assert all(caps["supported"].values()), "ECC tum portlari uygulamali"
-    assert len(caps["services"]) == 8
+    assert len(caps["services"]) == 6
     assert "V4" in " ".join(caps["notes"])
     assert "V4" in backend.preferred_service_order()

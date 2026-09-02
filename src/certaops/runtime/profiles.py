@@ -85,7 +85,7 @@ DOMAIN_PROFILES: dict[str, DomainProfile] = {
         title="SAP Planlama ve Tedarik Zinciri",
         packs=(BOOTSTRAP_PACK, "procurement_read", "p2p_visibility"),
         mission=(
-            "Stok, ATP, MRP arz/talep, tedarikci performansi, TCO, acik siparis "
+            "Stok, MRP arz/talep, tedarikci performansi, TCO, acik siparis "
             "takibi ve PR-PO-mal kabul-fatura belge zinciri. Salt okunur."
         ),
         iteration_budget=7,
@@ -93,22 +93,21 @@ DOMAIN_PROFILES: dict[str, DomainProfile] = {
     "procurement": DomainProfile(
         key="procurement",
         title="SAP Satinalma",
-        packs=(BOOTSTRAP_PACK, "procurement_write", "procurement_read", "p2p_approval"),
+        packs=(BOOTSTRAP_PACK, "procurement_write", "procurement_read"),
         mission=(
-            "Satinalma talebini hazirla, deterministik diff ve dogrulama uret, onay "
-            "is akisinin nerede bekledigini goster; yalniz policy/onay/idempotency "
-            "protokolu izin verirse SAP'a yaz."
+            "Satinalma talebi taslagi hazirla, deterministik diff ve dogrulama uret. "
+            "Mevcut read-only surum SAP'a yazmaz; gelecekteki write protokolu yalniz "
+            "policy/onay/idempotency kapilariyla acilabilir."
         ),
         iteration_budget=8,
     ),
     "finance": DomainProfile(
         key="finance",
-        title="SAP Proje Finans ve Raporlama",
-        packs=(BOOTSTRAP_PACK, "project_finance", "p2p_finance", "reporting"),
+        title="SAP Finans ve Raporlama",
+        packs=(BOOTSTRAP_PACK, "p2p_finance", "reporting"),
         mission=(
-            "SAP WBS plan/fiili/taahhut verisi, EAC/ETC durumu, tedarikci faturasi "
-            "odeme/blokaj durumu ve SAP kaynakli raporlar. SAP disi BOM veya "
-            "muhendislik tahmini yapma."
+            "Tedarikci faturasi odeme/blokaj durumu ve SAP kaynakli raporlar. "
+            "SAP disi BOM, proje maliyeti veya muhendislik tahmini yapma."
         ),
         iteration_budget=6,
     ),
@@ -122,9 +121,7 @@ PACK_OWNER: dict[str, str] = {
     "procurement_read": "supply_chain",
     "procurement_write": "procurement",
     "p2p_visibility": "supply_chain",
-    "p2p_approval": "procurement",
     "p2p_finance": "finance",
-    "project_finance": "finance",
     "reporting": "finance",
 }
 

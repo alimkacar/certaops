@@ -58,8 +58,16 @@ def agent(monkeypatch, tmp_path):
         "HD-GEAR-CSF25-100 stok durumu",
         "stok: HD-GEAR-CSF25-100",
         "malzeme bilgisi HD-GEAR-CSF25-100",
+        "4500019014 numarali siparisin faturasi kesildi mi?",
         "baglanti durumu",
         "sap yetenekler",
+        "SAP bağlantısı sağlıklı mı?",
+        "SAP sisteminin desteklediği servisleri ve yetenekleri listele.",
+        "HD-GEAR-CSF25-100 numaralı malzemenin detaylarını göster.",
+        "4500019014 numaralı siparişin durumu",
+        "TG ile başlayan malzemeleri ara.",
+        "1. HD-GEAR-CSF25-100 numaralı malzemenin stok durumunu göster.",
+        "5105600118 numaralı tedarikçi faturasının durumunu göster.",
     ],
 )
 def test_kisayol_modeli_hic_cagirmaz(agent, message):
@@ -76,6 +84,78 @@ def test_kisayol_tool_cagrisini_audit_eder(agent):
     assert len(turn.tool_calls) == 1
     assert turn.tool_calls[0].name == "sap_connection_health"
     assert turn.tool_calls[0].is_error is False
+
+
+@pytest.mark.parametrize(
+    ("message", "tool", "arguments"),
+    [
+        ("SAP bağlantısı sağlıklı mı?", "sap_connection_health", {}),
+        (
+            "SAP sisteminin desteklediği servisleri ve yetenekleri listele.",
+            "sap_discover_capabilities",
+            {},
+        ),
+        (
+            "21 numaralı malzemenin detaylarını göster.",
+            "sap_material_360",
+            {"material_id": "21"},
+        ),
+        (
+            "4500000012 numaralı siparişin durumu",
+            "sap_purchase_order_360",
+            {"po_id": "4500000012"},
+        ),
+        (
+            "TG ile başlayan malzemeleri ara.",
+            "sap_search_materials",
+            {"query": "TG"},
+        ),
+        (
+            "1. 21 numaralı malzemenin stok durumunu göster.",
+            "sap_stock_overview",
+            {"material_ids": ["21"]},
+        ),
+        (
+            "5100000001 numaralı tedarikçi faturasının durumunu göster.",
+            "sap_supplier_invoice_status",
+            {"invoice_id": "5100000001"},
+        ),
+    ],
+)
+def test_canli_test_sorulari_modele_dusmeden_eslenir(message, tool, arguments):
+    match = match_shortcut(message)
+
+    assert match is not None
+    assert match.tool == tool
+    assert match.arguments == arguments
+
+
+def test_fatura_kisayolu_dogrudan_evet_hayir_cevabi_verir(agent):
+    turn = agent.chat("4500019014 numaralı siparişin faturası kesildi mi?")
+
+    assert turn.direct_answer is True
+    assert turn.model_calls == 0
+    assert turn.tool_calls[0].name == "sap_supplier_invoice_status"
+    assert "Evet" in turn.text
+
+
+def test_genel_siparis_listesi_model_sentezini_erken_kesmez():
+    payload = {
+        "order_count": 1,
+        "orders": [{"po_id": "4500001", "vendor": "V1"}],
+        "open_value_by_currency": {"EUR": 100},
+    }
+
+    assert (
+        direct_answer_for(
+            "sap_track_purchase_orders", payload, reason="self_contained"
+        )
+        is None
+    )
+    assert (
+        direct_answer_for("sap_track_purchase_orders", payload, reason="shortcut")
+        is not None
+    )
 
 
 def test_kisayol_gecmise_yazilir(agent):
@@ -161,14 +241,46 @@ def test_hatali_sonuc_dogrudan_donmez():
     )
 
 
-def test_eksik_stok_modele_birakilir():
-    """Eksik varsa aksiyon onerisi gerekir; bicimlendirme yetmez."""
+def test_eksik_stok_kesin_kisayolda_yerel_cevaplanir():
+    """Kesin durum sorusu alternatif istemiyorsa model gerekmez."""
     payload = {
-        "materials": [{"material_id": "M1"}],
+        "materials": [
+            {
+                "material_id": "M1",
+                "description": "Test",
+                "plant": "1000",
+                "unrestricted": 0,
+                "reserved": 0,
+                "unreserved": 0,
+            }
+        ],
         "shortage_count": 1,
         "shortages": [{"material_id": "M1", "missing": 5}],
     }
-    assert direct_answer_for("sap_stock_overview", payload, reason="x") is None
+    assert direct_answer_for("sap_stock_overview", payload, reason="shortcut") is not None
+    assert direct_answer_for("sap_stock_overview", payload, reason="self_contained") is None
+
+
+def test_kisayol_tool_hatasi_modele_dusmez(agent, monkeypatch):
+    import certaops.runtime.agent as runtime_agent
+
+    monkeypatch.setattr(
+        runtime_agent,
+        "execute_tool",
+        lambda _name, _arguments, _ctx: (
+            '{"error":"SAP gecici olarak yanit vermedi",'
+            '"denial_code":"SAP_UNAVAILABLE","remediation":"Daha sonra deneyin."}',
+            True,
+        ),
+    )
+
+    turn = agent.chat("SAP baglantisi saglikli mi?")
+
+    assert turn.direct_answer is True
+    assert turn.direct_answer_reason == "shortcut_error"
+    assert turn.model_calls == 0
+    assert turn.tool_calls[0].is_error is True
+    assert "SAP_UNAVAILABLE" in turn.text
 
 
 def test_bos_sonuc_dogrudan_donmez():

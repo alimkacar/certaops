@@ -18,6 +18,7 @@ from robotics_agent.adapters.sap import (
     ODataHttpCore,
     ODataV2Client,
     ODataV4Client,
+    SAPCallBudget,
     SAPError,
     parse_sap_error,
 )
@@ -31,6 +32,10 @@ METADATA_XML = (
 
 
 def build_client(handler, **kwargs) -> ODataV4Client:
+    # Yazma protokolu testleri gelecekteki opt-in paketi sinar; urun
+    # varsayilaninin read-only oldugu asagidaki guvenlik testlerinde ayrica
+    # dogrulanir.
+    kwargs.setdefault("read_only", False)
     core = ODataHttpCore(
         client=httpx.Client(base_url="https://s4.firma.test", transport=httpx.MockTransport(handler)),
         sap_client="100",
@@ -133,10 +138,12 @@ def test_create_fetches_csrf_token_and_posts():
         seen["prefer"] = request.headers.get("prefer", "")
         return httpx.Response(201, json={"PurchaseRequisition": "10000001"})
 
-    created, _ = build_client(handler).create("srv", "PurchaseRequisition", {"a": 1})
+    client = build_client(handler)
+    created, _ = client.create("srv", "PurchaseRequisition", {"a": 1})
     assert created["PurchaseRequisition"] == "10000001"
     assert seen["csrf"] == "TOK"
     assert "representation" in seen["prefer"]
+    assert client.core.call_count == 2  # metadata + POST
 
 
 def test_update_requires_etag():
@@ -189,10 +196,12 @@ def test_expired_csrf_token_is_refreshed_once():
             return httpx.Response(403, text="CSRF token validation failed")
         return httpx.Response(201, json={"PurchaseRequisition": "1"})
 
-    created, _ = build_client(handler).create("srv", "PurchaseRequisition", {"a": 1})
+    client = build_client(handler)
+    created, _ = client.create("srv", "PurchaseRequisition", {"a": 1})
     assert created["PurchaseRequisition"] == "1"
     assert state["metadata_calls"] == 2  # token yenilendi
     assert state["posts"] == 2
+    assert client.core.call_count == 4
 
 
 def test_write_is_not_blindly_retried_on_server_error():
@@ -240,6 +249,30 @@ def test_read_retries_on_429_and_honours_retry_after():
     page = ODataV4Client(core).read_collection("srv", "Items")
     assert page.rows == [{"id": 1}]
     assert delays == [2.0]
+    assert core.call_count == 2
+
+
+def test_call_budget_counts_retries_and_blocks_before_next_http_attempt():
+    state = {"calls": 0}
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        state["calls"] += 1
+        return httpx.Response(429, json={"error": {}})
+
+    core = ODataHttpCore(
+        client=httpx.Client(
+            base_url="https://s4.firma.test", transport=httpx.MockTransport(handler)
+        ),
+        sleep=lambda _: None,
+    )
+    core.call_budget = SAPCallBudget(max_calls=1)
+
+    with pytest.raises(SAPError) as exc:
+        ODataV4Client(core).read_collection("srv", "Items")
+
+    assert exc.value.code == "SAP_CALL_BUDGET_EXCEEDED"
+    assert state["calls"] == 1, "butceyi asan retry sokete ulasmamali"
+    assert core.call_count == 1
 
 
 # --- $batch ----------------------------------------------------------------
@@ -257,7 +290,7 @@ def test_batch_returns_per_request_responses():
             },
         )
 
-    responses = build_client(handler).batch(
+    responses = build_client(handler, read_only=True).batch(
         "srv",
         [
             BatchRequest(id="a", method="GET", url="A_Supplier('1')"),
@@ -266,6 +299,54 @@ def test_batch_returns_per_request_responses():
     )
     assert responses[0].is_success and responses[0].body["SupplierName"] == "RoboDrive"
     assert not responses[1].is_success
+
+
+def test_read_only_blocks_mutation_before_network_or_csrf():
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        calls.append(request.method)
+        return httpx.Response(201, json={})
+
+    core = ODataHttpCore(
+        client=httpx.Client(
+            base_url="https://s4.firma.test", transport=httpx.MockTransport(handler)
+        )
+    )
+    with pytest.raises(SAPError) as exc:
+        core.request("POST", "srv/Items", json_body={"a": 1}, service_root="srv")
+
+    assert exc.value.code == "READ_ONLY_MODE"
+    assert calls == []
+    assert core.call_count == 0
+
+
+def test_read_only_rejects_mutation_hidden_inside_batch():
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        calls.append(request.method)
+        return httpx.Response(200, json={"responses": []})
+
+    core = ODataHttpCore(
+        client=httpx.Client(
+            base_url="https://s4.firma.test", transport=httpx.MockTransport(handler)
+        )
+    )
+    with pytest.raises(SAPError) as exc:
+        core.request(
+            "POST",
+            "srv/$batch",
+            json_body={
+                "requests": [
+                    {"id": "1", "method": "PATCH", "url": "Items('1')", "body": {"x": 1}}
+                ]
+            },
+            service_root="srv",
+        )
+
+    assert exc.value.code == "READ_ONLY_MODE"
+    assert calls == []
 
 
 # --- Guvenlik --------------------------------------------------------------

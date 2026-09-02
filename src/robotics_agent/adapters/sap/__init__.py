@@ -38,7 +38,7 @@ from .errors import (
     explain_authorization_failure,
     parse_sap_error,
 )
-from .http import HostNotAllowed, ODataHttpCore, ODataResponse
+from .http import HostNotAllowed, ODataHttpCore, ODataResponse, SAPCallBudget
 from .odata_v2 import ODataV2Client, expanded_rows, parse_odata_datetime, to_odata_datetime
 from .odata_v4 import BatchRequest, BatchResponse, ODataV4Client, Page, escape_key, quote
 
@@ -65,6 +65,7 @@ __all__ = [
     "Page",
     "ResolvedConnection",
     "SAPError",
+    "SAPCallBudget",
     "SAPFault",
     "SAPNotSupported",
     "ServiceCapability",

@@ -45,7 +45,8 @@ def test_domainler_yalniz_kendi_tool_setini_gorur(purchaser):
 
     assert "sap_material_360" in master
     assert "sap_pr_submit" not in master
-    assert "sap_pr_submit" in procurement
+    assert "sap_pr_submit" not in procurement
+    assert "sap_pr_prepare" in procurement
     assert "sap_generate_report" in finance
     assert "sap_pr_submit" not in finance
 
@@ -130,7 +131,7 @@ def test_cok_domainli_istek_tek_model_cagrisi_yapar(settings, purchaser):
     provider = FakeModelProvider([reply("birlesik ozet")])
     runtime = SAPAgentRuntime(settings, provider=provider, actor=purchaser)
     turn = runtime.chat(
-        "HD-GEAR-CSF25-100 stok durumu ve R-2026-014 proje maliyeti raporla"
+        "HD-GEAR-CSF25-100 stok durumu ve bloke tedarikci faturalarini raporla"
     )
     assert len(turn.active_domains) >= 2
     assert provider.call_count == 1

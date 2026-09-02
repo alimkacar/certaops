@@ -76,7 +76,9 @@ def test_zero_declaration_cannot_zero_out_value():
 
 
 @pytest.fixture(autouse=True)
-def _tools():
+def _tools(settings):
+    # Bu modul gelecek write paketinin fiyat/onay degismezini sinar.
+    object.__setattr__(settings.sap, "read_only", False)
     load_all_tools()
 
 
@@ -104,6 +106,9 @@ def test_underdeclared_price_still_requires_approval(settings, purchaser):
         "APPROVAL_REQUIRED",
         "APPROVAL_SCOPE_EXCEEDED",
         "APPROVAL_INVALID",
+        # SAP fiyatlandirmasi tutari R4'e cikardiginda yukseltme kapisi onay
+        # kapisindan once devreye girer; korunan ozellik ayni: yazma olmaz.
+        "RISK_ESCALATED",
     }
     assert not body.get("business_object_id"), "SAP'a belge yazilmis olmamali"
 

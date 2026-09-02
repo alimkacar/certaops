@@ -64,16 +64,6 @@ def test_purchase_requisition_contract_matches_manifest():
     assert check.missing_properties == {}
 
 
-def test_availability_contract_matches_manifest():
-    contract = parse_metadata(load("API_PRODUCT_AVAILY_INFO_metadata.xml"))
-    check = verify_contract(CAPABILITY_MANIFEST["availability"], contract)
-    assert check.contract_ok, check.to_dict()
-    # ATP icin tarih+miktar alanlari sart: bunlar olmadan teyit uretilemez.
-    props = contract.properties_of_set("ProductAvailabilityInformation")
-    for field in ("ConfirmedQuantity", "ConfirmedDeliveryDate", "RequestedDeliveryDate"):
-        assert field in props
-
-
 def test_product_contract_matches_manifest():
     contract = parse_metadata(load("API_PRODUCT_SRV_metadata.xml"))
     check = verify_contract(CAPABILITY_MANIFEST["product"], contract)
@@ -103,13 +93,6 @@ def test_manifest_marks_v2_fallbacks_as_deprecated():
     assert CAPABILITY_MANIFEST["purchase_requisition_v2"].status == STATUS_DEPRECATED
     assert CAPABILITY_MANIFEST["purchase_requisition_v2"].successor == "purchase_requisition"
     assert CAPABILITY_MANIFEST["purchase_requisition"].status == STATUS_RELEASED
-
-
-def test_project_cost_is_marked_as_custom():
-    """Released servis olmadigi acikca isaretlenmis olmali (Clean Core seffafligi)."""
-    capability = CAPABILITY_MANIFEST["project_cost"]
-    assert capability.status == "custom"
-    assert "released" in capability.purpose.lower() or "custom" in capability.purpose.lower()
 
 
 @pytest.mark.parametrize("alias", sorted(CAPABILITY_MANIFEST))

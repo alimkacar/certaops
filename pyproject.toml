@@ -39,6 +39,7 @@ dependencies = [
     "google-genai>=1.0",
     "pydantic>=2.7",
     "python-dotenv>=1.0",
+    "defusedxml>=0.7.1",
     "httpx>=0.27",
     "tenacity>=8.3",
     "XlsxWriter>=3.2",
@@ -46,12 +47,6 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "rich>=13.7",
 ]
-
-[project.urls]
-Homepage = "https://github.com/alimkacar/certaops-agent-toolkit"
-Repository = "https://github.com/alimkacar/certaops-agent-toolkit.git"
-Issues = "https://github.com/alimkacar/certaops-agent-toolkit/issues"
-Changelog = "https://github.com/alimkacar/certaops-agent-toolkit/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 # AGENT_AUTH_MODE=oidc icin. Kurulu degilse OIDC modu token KABUL ETMEZ.
@@ -78,6 +73,11 @@ certaops-mcp = "certaops.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# Operator arayuzunun statik dosyalari wheel'e girer. Build adimi yoktur:
+# vanilla JS/CSS, Node/npm bagimliligi yok.
+[tool.setuptools.package-data]
+robotics_agent = ["webui/*.html", "webui/assets/*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
@@ -115,5 +115,6 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["SIM117", "B011"]
-# FastAPI'de `Depends()` varsayilan argumanda kullanmak standart idiomdur.
+# FastAPI'de `Depends()` / `Query()` varsayilan argumanda kullanmak standart idiomdur.
 "src/robotics_agent/channels/api.py" = ["B008"]
+"src/robotics_agent/channels/ui.py" = ["B008"]

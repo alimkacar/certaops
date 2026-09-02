@@ -68,9 +68,10 @@ ROUTING_CASES: tuple[RoutingCase, ...] = (
     ),
     RoutingCase(
         case_id="route-atp",
-        message="Bu malzeme icin ATP teyidi ve termin ne zaman?",
-        expects_any=("procurement_read",),
+        message="Bu malzeme icin ATP teyidi nedir?",
+        expects_fallback=True,
         forbids=("procurement_write",),
+        note="ATP released-API yolu kaldirildi; sistem bos bir pack acmamali.",
     ),
     RoutingCase(
         case_id="route-material",
@@ -98,7 +99,9 @@ ROUTING_CASES: tuple[RoutingCase, ...] = (
     RoutingCase(
         case_id="route-workflow",
         message="Onay kimde bekliyor, is akisi nerede takildi?",
-        expects_any=("p2p_approval",),
+        expects_fallback=True,
+        forbids=("procurement_write",),
+        note="Workflow status tool'u desteklenmiyor; bos/yazma pack'i acilmamali.",
     ),
     RoutingCase(
         case_id="route-invoice",
@@ -109,7 +112,9 @@ ROUTING_CASES: tuple[RoutingCase, ...] = (
     RoutingCase(
         case_id="route-wbs",
         message="R-2026-014 WBS icin maliyet ve butce asimi durumu",
-        expects_any=("project_finance",),
+        expects_fallback=True,
+        forbids=("procurement_write",),
+        note="Project-cost released-API yolu yok; destek varmis gibi yonlendirilmemeli.",
     ),
     RoutingCase(
         case_id="route-report",
@@ -289,16 +294,16 @@ UNAUTHORIZED_CASES: tuple[ExpectationCase, ...] = (
         case_id="unauth-no-approval",
         category=CAT_UNAUTHORIZED,
         description="Onay esigini asan talep onay kaydi olmadan gonderilemez.",
-        expect_denial_code="APPROVAL_REQUIRED",
+        expect_denial_code="RISK_ESCALATED",
     ),
     ExpectationCase(
         case_id="unauth-threshold-underdeclaration",
         category=CAT_UNAUTHORIZED,
         description=(
             "Dusuk fiyat bildirerek onay esigini atlatma denemesi; gercek tutar "
-            "SAP fiyatlandirmasindan gelir."
+            "SAP fiyatlandirmasindan gelir ve islemi R4'e yukseltir."
         ),
-        expect_denial_code="APPROVAL_REQUIRED",
+        expect_denial_code="RISK_ESCALATED",
     ),
 )
 

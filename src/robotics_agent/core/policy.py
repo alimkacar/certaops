@@ -9,10 +9,11 @@ Degerlendirme sirasi (fail-fast):
   2. Actor kimligi dogrulanmis mi?
   3. Gerekli kapsamlar (RBAC) var mi?
   4. Argumanlardaki organizasyon alanlari actor'un yetki alaninda mi (ABAC)?
-  5. Risk seviyesi >= R3 icin yazma penceresi acik mi?
-  6. Risk seviyesi >= R3 icin gecerli onay kaniti var mi (payload hash, expiry,
+  5. Read-only profilinde mutasyon kesin olarak kapali mi?
+  6. Risk seviyesi >= R3 icin yazma penceresi acik mi?
+  7. Risk seviyesi >= R3 icin gecerli onay kaniti var mi (payload hash, expiry,
      nonce, SoD, R4'te cift onay)?
-  7. Yukumlulukler (idempotency, read-after-write, diff gosterimi) uretilir.
+  8. Yukumlulukler (idempotency, read-after-write, diff gosterimi) uretilir.
 
 Prompt icerigi bu kararlari degistiremez: karar yalnizca actor, tool sozlesmesi,
 argumanlar ve onay deposundan uretilir.
@@ -91,9 +92,8 @@ class OrgDefaults:
     @classmethod
     def from_settings(cls, settings: Any) -> OrgDefaults:
         cfg = settings.sap
-        return cls(
-            plant=cfg.plant, company_code=cfg.company_code, purchasing_org=cfg.purch_org
-        )
+        return cls(plant=cfg.plant, company_code=cfg.company_code, purchasing_org=cfg.purch_org)
+
 
 # Yukumlulukler
 OBLIGATION_IDEMPOTENCY = "idempotency_key"
@@ -254,6 +254,9 @@ class PolicyDecisionPoint:
     known_tools: frozenset[str] = field(default_factory=frozenset)
     #: Operator tarafindan kapatilmis tool adlari (bkz. AGENT_DISABLED_TOOLS).
     disabled_tools: frozenset[str] = field(default_factory=frozenset)
+    #: Urun-seviyesi mutasyon kilidi. `forced_dry_run` yazmayi simule eder;
+    #: `read_only` ise mutating tool'u handler'a hic ulastirmaz.
+    read_only: bool = False
     # Handler'in arguman yoksa kullanacagi organizasyon degerleri de actor
     # kapsamina karsi denetlenir.
     org_defaults: OrgDefaults = field(default_factory=OrgDefaults)
@@ -335,6 +338,19 @@ class PolicyDecisionPoint:
                 risk_tier=tier,
                 reasons=tuple(org_violations),
                 denial_code="ORG_SCOPE",
+                impact=assessment,
+            )
+
+        # 4a. Urun profili: beyan edilen veya runtime etkisiyle R3/R4'e
+        # yukselen hicbir islem read-only modda handler'a ulasamaz. Kontrol
+        # RBAC'tan sonra yapilir; yetkisiz actor'a tool envanteri sizdirilmaz.
+        if self.read_only and (spec.risk_tier.is_mutating or tier.is_mutating):
+            return PolicyDecision(
+                outcome=PolicyOutcome.DENY,
+                tool=name,
+                risk_tier=tier,
+                reasons=("S/4HANA read-only profili etkin; SAP mutasyonu bu surumde kapali.",),
+                denial_code="READ_ONLY_MODE",
                 impact=assessment,
             )
 
@@ -457,9 +473,7 @@ class PolicyDecisionPoint:
         )
 
     # --- Runtime etki degerlendirmesi ---------------------------------------
-    def assess_impact(
-        self, spec: ToolContract, arguments: Mapping[str, Any]
-    ) -> ImpactAssessment:
+    def assess_impact(self, spec: ToolContract, arguments: Mapping[str, Any]) -> ImpactAssessment:
         """Cagri oncesi etki skoru.
 
         Argumandan okunan tutar `value_verified=False` ile girer: skoru
@@ -506,22 +520,40 @@ class PolicyDecisionPoint:
     ) -> str | None:
         """Yeniden degerlendirme mevcut onayi yetersiz birakiyor mu?
 
-        Dogrulanmis tutarla R4'e cikan bir islem, elindeki tek onayli R3
-        kaydiyla devam edemez; R4 iki ayri ve gecerli onaylayici gerektirir.
+        Sorulan sey "seviye yukseldi mi" degil, **yukselen seviyenin kontrol
+        sartini elindeki onay kaydi karsiliyor mu**. Yukseldigi halde sart
+        zaten karsilanmissa engel yoktur:
+
+        - **R4** iki ayri ve gecerli onaylayici ister. Tek onayli bir R3
+          kaydiyla devam edilemez; iki ayri onaylayan varsa yukseltme kendi
+          basina engel degildir.
+        - **R4 altinda** yukselen seviye tek onay ister. Onay kaydi hic yoksa
+          (`approval_policy="threshold"` tutari cagri aninda bilemedigi icin
+          onay istemeden gecmis olabilir) yeni onay gerekir.
+
+        Bu kapi tutar tavanini denetlemez; `max_value` asimini yazma yolunda
+        `require_approval_for_value` ikinci kapisi yakalar. Yani buradan
+        gecmek "tutar serbest" demek degildir.
         """
         if self.risk_mode != "enforce":
             return None
         if assessment.effective_tier.level <= decision.risk_tier.level:
             return None
+
+        record = decision.approval
+        approvers = len({a.subject for a in record.approvers}) if record else 0
+
         if assessment.effective_tier is RiskTier.R4:
-            record = decision.approval
-            approvers = len({a.subject for a in record.approvers}) if record else 0
-            if approvers < 2:
-                return (
-                    f"Dogrulanmis etki skoru {assessment.score} islemi "
-                    f"{assessment.effective_tier.value} seviyesine yukseltti; "
-                    f"iki ayri onaylayan gerekiyor (mevcut: {approvers})."
-                )
+            if approvers >= 2:
+                return None
+            return (
+                f"Dogrulanmis etki skoru {assessment.score} islemi "
+                f"{assessment.effective_tier.value} seviyesine yukseltti; "
+                f"iki ayri onaylayan gerekiyor (mevcut: {approvers})."
+            )
+
+        if approvers >= 1:
+            return None
         return (
             f"Dogrulanmis etki skoru {assessment.score} islemi "
             f"{decision.risk_tier.value} yerine {assessment.effective_tier.value} "
@@ -563,15 +595,17 @@ class PolicyDecisionPoint:
              bos birakmak kapsam kontrolunu atlatmanin yolu olurdu.
         """
         violations: list[str] = []
-        found: dict[str, set[str]] = {"plant": set(), "company_code": set(), "purchasing_org": set()}
+        found: dict[str, set[str]] = {
+            "plant": set(),
+            "company_code": set(),
+            "purchasing_org": set(),
+        }
         self._collect_org_values(arguments, found, path="", depth=0, violations=violations)
 
         for kind, values in found.items():
             for value in sorted(values):
                 if not actor.permits(kind, value):
-                    violations.append(
-                        f"{_ORG_LABELS[kind]} '{value}' actor yetki alaninda degil."
-                    )
+                    violations.append(f"{_ORG_LABELS[kind]} '{value}' actor yetki alaninda degil.")
 
         # Argumanda hic verilmemis alanlar icin sistem varsayilani devreye girer.
         if spec is not None and getattr(spec, "applies_org_defaults", False):
@@ -605,7 +639,11 @@ class PolicyDecisionPoint:
             return
         if isinstance(node, Mapping):
             for key, value in node.items():
-                kind = ORG_ARGUMENT_KEYS.get(str(key))
+                # Buyuk/kucuk harfe duyarsiz: `PLANT` veya `Plant` yazan bir
+                # arguman kapsam kontrolunu atlatamaz. Onceki surumde tam
+                # eslesme araniyordu ve yalniz handler imzalarinin sikiligi
+                # sayesinde somurulemiyordu.
+                kind = ORG_ARGUMENT_KEYS.get(str(key).strip().lower())
                 child_path = f"{path}.{key}" if path else str(key)
                 if kind is not None:
                     for item in cls._as_values(value):
@@ -619,6 +657,40 @@ class PolicyDecisionPoint:
                 cls._collect_org_values(
                     item, found, path=f"{path}[{index}]", depth=depth + 1, violations=violations
                 )
+
+    @classmethod
+    def result_org_violations(cls, payload: Any, actor: ActorContext) -> list[str]:
+        """SAP'tan DONEN kayitlarin organizasyon kapsamini denetler.
+
+        Arguman tarafi tek basina yetmiyordu: belge anahtarli tool'larda
+        (`po_id`, `invoice_id`, `material_id`) argumanda hicbir organizasyon
+        alani bulunmuyor, bu yuzden kontrol sistem varsayilanini dogruluyor -
+        ki o her actor'un kapsamindadir - ve cagriyi geciriyordu. Actor'un
+        tesis/sirket kodu SAP sorgusuna da gitmedigi ve principal propagation
+        kapali oldugu icin SAP da uygulamiyordu. Sonuc: belge numarasini bilen
+        biri kapsami disindaki tesisin kaydini okuyabiliyordu.
+
+        Bu ikinci kapi sonucu okur. Kayitta gorunen her organizasyon degeri
+        actor'un yetki alaninda olmali; degilse cagri reddedilir. Fail-closed
+        tercih edildi cunku sessizce filtrelemek, kullaniciya eksik bir tabloyu
+        tam sanma riski birakirdi.
+        """
+        found: dict[str, set[str]] = {
+            "plant": set(),
+            "company_code": set(),
+            "purchasing_org": set(),
+        }
+        tarama_hatalari: list[str] = []
+        cls._collect_org_values(payload, found, path="", depth=0, violations=tarama_hatalari)
+        ihlaller: list[str] = []
+        for kind, values in found.items():
+            for value in sorted(values):
+                if not actor.permits(kind, value):
+                    ihlaller.append(
+                        f"{_ORG_LABELS[kind]} '{value}' actor yetki alaninda degil "
+                        "(SAP'tan donen kayitta)."
+                    )
+        return ihlaller + tarama_hatalari
 
     @staticmethod
     def _as_values(value: Any) -> Iterable[str]:

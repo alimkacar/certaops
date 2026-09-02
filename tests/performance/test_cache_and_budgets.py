@@ -297,12 +297,49 @@ def test_every_tool_declares_a_performance_budget():
         assert budget.max_result_tokens >= spec.result_token_budget, spec.name
 
 
+def test_expensive_read_inputs_have_hard_schema_bounds():
+    """Model veya istemci tek cagriyla sinirsiz SAP isi uretemez."""
+    bounded_arrays = {
+        "sap_stock_overview": "material_ids",
+        "sap_supplier_score_360": "vendor_ids",
+        "sap_pr_prepare": "items",
+    }
+    for tool_name, field_name in bounded_arrays.items():
+        field = REGISTRY[tool_name].input_schema["properties"][field_name]
+        assert field.get("minItems", 0) >= 1, tool_name
+        assert 1 <= field.get("maxItems", 0) <= 50, tool_name
+
+
+def test_supplier_score_uses_bulk_reads_and_stays_in_call_budget(
+    settings, purchaser, monkeypatch
+):
+    sap = build_backend(settings)
+    calls: list[str] = []
+    for method in ("get_vendor_masters", "get_supplier_scores", "get_purchase_orders"):
+        original = getattr(sap, method)
+
+        def counted(*args, _m=method, _o=original, **kwargs):
+            calls.append(_m)
+            return _o(*args, **kwargs)
+
+        monkeypatch.setattr(sap, method, counted)
+
+    ctx = ToolContext(settings=settings, sap=sap, actor=purchaser)
+    payload, is_error = execute_tool(
+        "sap_supplier_score_360", {"vendor_ids": ["0010001", "0010002", "0010003"]}, ctx
+    )
+
+    assert not is_error, payload
+    assert calls.count("get_vendor_masters") == 1
+    assert calls.count("get_supplier_scores") == 1
+    assert len(calls) <= REGISTRY["sap_supplier_score_360"].performance_budget.max_sap_calls
+
+
 @pytest.mark.parametrize(
     ("tool_name", "arguments"),
     [
         ("sap_document_flow", {"document_id": "5105600231"}),
         ("sap_purchase_order_360", {"po_id": "4500019014"}),
-        ("sap_workflow_status", {"object_type": "purchase_requisition", "object_id": "0010004801"}),
         ("sap_supplier_invoice_status", {"only_blocked": True}),
         ("sap_invoice_block_explain", {"invoice_id": "5105600231"}),
     ],

@@ -34,6 +34,9 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("AGENT_DIRECT_ANSWERS", "true")
     monkeypatch.setenv("SAP_DRY_RUN", "true")
+    # Bu modul gelecek write paketinin tekrar/timeout degismezlerini de sinar.
+    # Urun varsayilani baska testlerde read-only olarak dogrulanir.
+    monkeypatch.setenv("SAP_READ_ONLY", "false")
     from robotics_agent.config import get_settings
 
     return get_settings(reload=True)
@@ -64,7 +67,7 @@ def test_cok_domainli_istek_tek_runtime_kullanir(env):
     """Eskiden her domain ayri agent + ayri LLM turu demekti."""
     runtime, provider = build(env, [reply("Ozet hazir.")])
     turn = runtime.chat(
-        "HD-GEAR-CSF25-100 icin stok durumu ve R-2026-014 projesinin maliyet durumu"
+        "HD-GEAR-CSF25-100 icin stok durumu ve bloke tedarikci faturalarinin odeme durumu"
     )
     assert len(turn.active_domains) > 1, "birden fazla domain acilmali"
     assert provider.call_count == 1, "cok domain icin tek saglayici cagrisi"
@@ -73,7 +76,7 @@ def test_cok_domainli_istek_tek_runtime_kullanir(env):
 
 def test_domain_ayrimi_prompt_ve_pack_olarak_korunur(env):
     runtime, provider = build(env, [reply("ok")])
-    runtime.chat("stok ve proje maliyeti")
+    runtime.chat("stok ve bloke fatura durumu")
     request = provider.last_request
     assert "SAP domainleri" in request.system
     # Acik domainlerin gorevleri TEK prompt'ta birlesir.
@@ -366,3 +369,36 @@ def test_streaming_desteklemeyen_saglayici_normal_moda_duser(env):
     turn = runtime.chat("stok ve proje maliyeti", on_text=chunks.append)
     assert turn.text == "duz yanit"
     assert chunks == ["duz yanit"]
+
+
+# --- Saglayici hatasi: yanlis "insan incelemesi" alarmi vermemeli -----------
+# Regresyon: `ModelProviderError` yakalandiginda `needs_review` KOSULSUZ
+# yakiliyordu. Ilk model cagrisi rate limit'e takildiginda hicbir tool
+# calismamis oluyor, ama kullaniciya "SAP'ta gerceklesip gerceklesmedigini
+# dogrulamadan tekrarlamayin" deniyordu. Ortada islem yokken verilen uyari
+# gercek uyarilarin degerini dusurur.
+def test_hicbir_tool_calismadan_saglayici_hatasi_inceleme_istemez(env):
+    from certaops.providers import ModelRateLimitError
+
+    class _Patlayan:
+        name = "fake"
+        model = "fake-1"
+
+        def generate(self, request, *, on_text=None):
+            raise ModelRateLimitError("kota", provider="fake")
+
+        def describe(self):
+            return {"provider": "fake"}
+
+    from certaops.runtime import SAPAgentRuntime
+    from robotics_agent.contracts import ActorContext
+
+    actor = ActorContext.local_operator(subject="t", tenant=env.sap.tenant, roles=("AUDITOR",))
+    runtime = SAPAgentRuntime(env, provider=_Patlayan(), actor=actor)
+    turn = runtime.chat("4500000032 siparisinin belge akisini goster")
+
+    assert turn.stop_reason == "provider_error"
+    assert not turn.needs_review, "hicbir tool calismadi; inceleme istenmemeli"
+    assert "dogrulanacak islem yok" in turn.text
+    assert "hemen tekrar denemek ayni sonucu verebilir" in turn.text
+    assert "quota/billing" in turn.text

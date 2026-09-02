@@ -10,7 +10,18 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+# Sira onemli. `load_dotenv()` `.env` degerlerini `os.environ`e yaziyor;
+# ondan SONRA bakildiginda bir anahtarin kabuktan mi yoksa `.env`den mi
+# geldigi anlasilamaz. Ayrim guvenlik acisindan tasiyici: yalniz gercekten
+# dis ortamdan gelen bir anahtar, arayuzden yapilan bir degisikligi yener.
+# Bu yuzden anlik goruntu once alinir.
+from .runtime_config.store import apply_overrides, snapshot_process_env
+
+snapshot_process_env()
 load_dotenv()
+# Arayuzden yapilmis ayar degisiklikleri `.env`in uzerine, dis ortamin
+# altina uygulanir. Izin listesi disindaki hicbir anahtar buradan gecemez.
+apply_overrides()
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -131,6 +142,11 @@ class SAPSettings:
     )
     storage_location: str = field(default_factory=lambda: _env("SAP_STORAGE_LOCATION", "0001"))
 
+    # Ilk urun profili S/4HANA Public Edition read-only'dir. Bu bayrak
+    # SAP_DRY_RUN'dan daha gucludur: mutating tool'lari gorunmez yapar,
+    # policy'de reddeder ve OData HTTP katmaninda POST/PATCH/PUT/DELETE'i
+    # durdurur. Gelecekteki write paketinin testleri bunu acikca false yapar.
+    read_only: bool = field(default_factory=lambda: _env_bool("SAP_READ_ONLY", True))
     dry_run: bool = field(default_factory=lambda: _env_bool("SAP_DRY_RUN", True))
     approval_threshold: float = field(
         default_factory=lambda: _env_float("APPROVAL_THRESHOLD", 25_000.0)
@@ -150,6 +166,12 @@ class SAPSettings:
             )
         if self.odata_version not in {"auto", "v2", "v4"}:
             problems.append(f"SAP_ODATA_VERSION '{self.odata_version}' gecersiz. auto/v2/v4 olmali.")
+        if not 1 <= self.timeout <= 120:
+            problems.append("SAP_TIMEOUT 1-120 saniye araliginda olmali.")
+        if not 1 <= self.page_size <= 500:
+            problems.append("SAP_PAGE_SIZE 1-500 araliginda olmali.")
+        if not 1 <= self.max_pages <= 20:
+            problems.append("SAP_MAX_PAGES 1-20 araliginda olmali.")
         # ECC 6.0 EHP8'de OData V4 yoktur: RAP ABAP 7.53+ ister, EHP8 7.50'dir.
         # Yanlis konfigurasyon calisma zamaninda 404 olarak degil, burada patlar.
         if self.backend == "ecc" and self.odata_version == "v4":
@@ -342,6 +364,9 @@ class PrivacySettings:
     session_encryption: bool = field(
         default_factory=lambda: _env_bool("AGENT_SESSION_ENCRYPTION", False)
     )
+    audit_encryption: bool = field(
+        default_factory=lambda: _env_bool("AGENT_AUDIT_ENCRYPTION", False)
+    )
     artifact_ttl_hours: int = field(default_factory=lambda: _env_int("AGENT_ARTIFACT_TTL_HOURS", 24))
     # Periyodik saklama temizligi. 0 -> job kapali (yalniz gelistirme).
     retention_sweep_seconds: int = field(
@@ -352,7 +377,27 @@ class PrivacySettings:
     def validate(self) -> list[str]:
         if self.dlp_mode not in {"enforce", "report", "off"}:
             return [f"AGENT_DLP_MODE '{self.dlp_mode}' gecersiz. enforce/report/off olmali."]
-        return []
+
+        # Sifreleme ayarlari FAIL-CLOSED dogrulanir. Bu bayraklar uzun sure
+        # hicbir yerde okunmuyordu: `true` yapan operator kanit ve oturum
+        # kayitlarinin diskte sifreli durdugunu saniyordu. Artik acik ama
+        # kurulamiyorsa surec baslamaz - "acik ama calismiyor" durumu yok.
+        problems: list[str] = []
+        if self.evidence_encryption or self.session_encryption or self.audit_encryption:
+            from .security_at_rest import AtRestConfigError, load_key
+
+            try:
+                load_key()
+            except AtRestConfigError as exc:
+                problems.append(str(exc))
+            else:
+                try:
+                    from .security_at_rest import _load_aesgcm
+
+                    _load_aesgcm()
+                except AtRestConfigError as exc:
+                    problems.append(str(exc))
+        return problems
 
 
 @dataclass(frozen=True)
@@ -548,7 +593,7 @@ class AgentSettings:
         default_factory=lambda: _parse_iteration_limits(
             _env(
                 "AGENT_ITERATION_LIMITS",
-                "platform:4,master_data:5,procurement_read:7,procurement_write:8,project_finance:6,reporting:6",
+                "platform:4,master_data:5,procurement_read:7,procurement_write:8,p2p_finance:6,reporting:6",
             )
         )
     )
@@ -573,7 +618,7 @@ class AgentSettings:
         default_factory=lambda: _parse_reasoning_levels(
             _env(
                 "AGENT_REASONING_LEVELS",
-                "procurement_write:medium,p2p_finance:medium,project_finance:medium",
+                "procurement_write:medium,p2p_finance:medium",
             )
         )
     )
@@ -636,6 +681,84 @@ def _parse_iteration_limits(raw: str) -> tuple[tuple[str, int], ...]:
     return tuple(out)
 
 
+@dataclass(frozen=True)
+class LoggingSettings:
+    """Yapilandirilmis loglama.
+
+    Log, `core.audit` defterinin yerine GECMEZ: audit "ne yapildi" sorusunun
+    hukuki cevabidir, log teshis kaydidir. Ama teshis kaydi da hassas veri
+    tasir; `mask` bu yuzden varsayilan olarak aciktir ve uretimde kapatilamaz.
+    """
+
+    # text -> insan okunur konsol satiri; json -> log toplayici icin tek satir
+    log_format: str = field(default_factory=lambda: _env("LOG_FORMAT", "text").lower())
+    # Maskeleme log'a YAZILMADAN once uygulanir. `log.exception` bir SAP yanit
+    # govdesini traceback'e dokebilir; disk ve stdout guvenli bolge degildir.
+    mask: bool = field(default_factory=lambda: _env_bool("LOG_MASK", True))
+    # Arayuzun /logs ucunun okudugu dairesel tampon. 0 -> tampon kurulmaz.
+    buffer_size: int = field(default_factory=lambda: _env_int("LOG_BUFFER_SIZE", 500))
+    # Bos ise dosyaya yazilmaz (container'da stdout/stderr toplanir).
+    file: str = field(default_factory=lambda: _env("LOG_FILE", ""))
+    file_max_bytes: int = field(default_factory=lambda: _env_int("LOG_FILE_MAX_BYTES", 5_242_880))
+    file_backup_count: int = field(default_factory=lambda: _env_int("LOG_FILE_BACKUP_COUNT", 3))
+
+    def validate(self) -> list[str]:
+        problems: list[str] = []
+        if self.log_format not in {"text", "json"}:
+            problems.append(f"LOG_FORMAT '{self.log_format}' gecersiz. text/json olmali.")
+        if self.buffer_size < 0:
+            problems.append("LOG_BUFFER_SIZE negatif olamaz.")
+        if self.file and self.file_max_bytes < 1024:
+            problems.append("LOG_FILE_MAX_BYTES en az 1024 olmali.")
+        if self.file_backup_count < 0:
+            problems.append("LOG_FILE_BACKUP_COUNT negatif olamaz.")
+        return problems
+
+
+@dataclass(frozen=True)
+class UISettings:
+    """Tarayici tabanli operator arayuzu.
+
+    Arayuz API ile **ayni origin**den servis edilir: CORS acilmaz, token
+    baska bir origin'e gonderilmez. Arayuz kendi yetkisi olan bir kanal
+    degildir; her istek ayni `Authorization` kapisindan ve ayni kapsam
+    kontrollerinden gecer.
+
+    Varsayilan olarak uretim disinda aciktir: uretimde arayuzu acmak bilincli
+    bir karar olmalidir.
+    """
+
+    enabled: bool = field(
+        default_factory=lambda: _env_bool(
+            "AGENT_UI_ENABLED", _env("APP_ENV", "development").lower() != "production"
+        )
+    )
+    # Canli log gorunumu. Loglar maskelenmis olsa da operator ekraninda sunucu
+    # ic durumunu gosterir; ayrica kapatilabilir olmasi gerekir.
+    log_stream_enabled: bool = field(
+        default_factory=lambda: _env_bool("AGENT_UI_LOG_STREAM", True)
+    )
+    #: Tek istekte donen azami kayit sayisi (log ve audit icin ortak tavan).
+    max_page_size: int = field(default_factory=lambda: _env_int("AGENT_UI_MAX_PAGE_SIZE", 200))
+    #: `/chat/stream` (SSE) ucu. Toplam sureyi DEGISTIRMEZ; yalniz ilk
+    #: karakterin gorunme suresini kisaltir - uzun yanitlarda algilanan
+    #: gecikme belirgin olcude duser.
+    #:
+    #: Varsayilan KAPALI. Akan metin, tek seferlik yolun `sanitize_for_client`
+    #: kapisindan farkli olarak parca parca temizlenmek zorundadir
+    #: (`privacy.StreamSanitizer` bunu sinir-guvenli yapar). Yeni bir yol
+    #: acmak bilincli bir karar olmali; bayrak bu karari gorunur kilar.
+    stream_enabled: bool = field(
+        default_factory=lambda: _env_bool("AGENT_UI_STREAM", False)
+    )
+
+    def validate(self) -> list[str]:
+        problems: list[str] = []
+        if self.max_page_size < 1:
+            problems.append("AGENT_UI_MAX_PAGE_SIZE en az 1 olmali.")
+        return problems
+
+
 class UnsafeProductionConfig(RuntimeError):
     """Uretim profilinde guvensiz yapilandirma tespit edildi.
 
@@ -663,6 +786,8 @@ class Settings:
     privacy: PrivacySettings = field(default_factory=PrivacySettings)
     cache: CacheSettings = field(default_factory=CacheSettings)
     risk: RiskSettings = field(default_factory=RiskSettings)
+    logging: LoggingSettings = field(default_factory=LoggingSettings)
+    ui: UISettings = field(default_factory=UISettings)
     # development | staging | production
     app_env: str = field(default_factory=lambda: _env("APP_ENV", "development").lower())
     output_dir: Path = field(
@@ -685,6 +810,8 @@ class Settings:
         problems += self.privacy.validate()
         problems += self.cache.validate()
         problems += self.risk.validate()
+        problems += self.logging.validate()
+        problems += self.ui.validate()
         if self.app_env not in {"development", "staging", "production"}:
             problems.append(
                 f"APP_ENV '{self.app_env}' gecersiz. development/staging/production olmali."
@@ -751,6 +878,19 @@ class Settings:
                 "SAP_DRY_RUN=false iken AGENT_APPROVAL_GATEWAY=local olamaz: gercek yazma "
                 "dogrulanmis bir onay gecidi (bpa) gerektirir."
             )
+        # Bu surumun uretim sozlesmesi read-only'dir. Write kodu gelecek paket
+        # icin korunur ve test edilebilir, fakat bugunku build mutasyon acik
+        # sekilde production-ready ilan edilemez.
+        if not self.sap.read_only:
+            blockers.append(
+                "SAP_READ_ONLY=false: bu surum yalniz S/4HANA read-only profilinde "
+                "uretime alinabilir. Write paketi henuz canli tenant kabulunu gecmedi."
+            )
+        if self.sap.read_only and not self.sap.dry_run:
+            blockers.append(
+                "SAP_READ_ONLY=true iken SAP_DRY_RUN=false celiskili: read-only uretim "
+                "profilinde iki kilit de acik olmalidir."
+            )
         # --- Model saglayici kapilari ---------------------------------------
         if self.model.provider == "fake":
             blockers.append(
@@ -792,8 +932,13 @@ class Settings:
             )
         if not self.privacy.kms_key_id:
             blockers.append(
-                "AGENT_KMS_KEY_ID tanimli degil: evidence/session sifreleme anahtari "
+                "AGENT_KMS_KEY_ID tanimli degil: evidence/session/audit sifreleme anahtari "
                 "kaynak kodda veya .env'de tutulamaz."
+            )
+        if not self.privacy.audit_encryption:
+            blockers.append(
+                "AGENT_AUDIT_ENCRYPTION=false: audit govdesi uretimde diske duz metin "
+                "yazilamaz. AES-256-GCM sifrelemesini acin."
             )
         if self.privacy.retention_sweep_seconds <= 0:
             blockers.append(
@@ -805,6 +950,22 @@ class Settings:
             blockers.append(
                 f"AGENT_RISK_SCORING_MODE={self.risk.scoring_mode}: uretimde runtime risk "
                 "skoru yalniz 'enforce' modunda calisabilir."
+            )
+
+        # --- Loglama ve arayuz kapilari -------------------------------------
+        if not self.logging.mask:
+            # Maskesiz log, hassas veriyi audit defterinin disina - dosyaya,
+            # stdout'a ve log toplayiciya - kopyalar. Orada saklama politikasi
+            # ve erisim kontrolu bizim degil, altyapinin elindedir.
+            blockers.append(
+                "LOG_MASK=false: uretimde log kayitlari maskelenmeden yazilamaz."
+            )
+        if self.ui.enabled and self.security.auth_mode == "none":
+            # `AGENT_AUTH_MODE=none` zaten ayri bir blocker; bu kural onun
+            # gevsetilmesi halinde bile arayuzun kimliksiz acilmasini engeller.
+            blockers.append(
+                "AGENT_UI_ENABLED=true iken AGENT_AUTH_MODE=none olamaz: operator "
+                "arayuzu kimlik dogrulamasiz sunulamaz."
             )
         return blockers
 
@@ -826,6 +987,7 @@ class Settings:
             "auth_mode": self.security.auth_mode,
             "sap_backend": self.sap.backend,
             "sap_auth_mode": self.sap.auth_mode,
+            "read_only": self.sap.read_only,
             "dry_run": self.sap.dry_run,
             "approval_gateway": self.security.approval_gateway,
             "session_backend": self.state.session_backend,
@@ -834,6 +996,9 @@ class Settings:
             "risk_scoring_mode": self.risk.scoring_mode,
             "cache_backend": self.cache.backend,
             "strict_unknown_fields": self.privacy.strict_unknown_fields or self.is_production,
+            "log_format": self.logging.log_format,
+            "log_masking": self.logging.mask,
+            "ui_enabled": self.ui.enabled,
             "production_blockers": blockers,
             "production_ready": not blockers,
         }
@@ -851,19 +1016,38 @@ def get_settings(reload: bool = False) -> Settings:
             # yuksek onceliklidir. Aksi halde container/CI secret'lari ve acil
             # guvenlik kapilari reload sirasinda sessizce geri alinabilir.
             load_dotenv(override=False)
+            # Reload'da da override'lar yeniden uygulanir; aksi halde
+            # arayuzden yapilmis bir degisiklik ilk reload'da sessizce
+            # kaybolurdu.
+            apply_overrides()
         _settings = Settings()
         _settings.ensure_dirs()
     return _settings
 
 
-def setup_logging(level: str | None = None) -> logging.Logger:
-    """Tek noktadan logging kurulumu. Gurultulu kutuphaneler susturulur."""
-    resolved = (level or get_settings().log_level).upper()
-    logging.basicConfig(
-        level=getattr(logging, resolved, logging.INFO),
-        format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-        datefmt="%H:%M:%S",
+def setup_logging(
+    level: str | None = None,
+    *,
+    log_format: str | None = None,
+    log_file: str | None = None,
+) -> logging.Logger:
+    """Tek noktadan logging kurulumu.
+
+    Ayarlari okur ve kurulumu `observability.logging.configure_logging`e
+    devreder. Import dairesel olmasin diye modul burada, cagri aninda alinir:
+    `observability` paketi `config`i degil, `config` `observability`yi bilir.
+
+    Acik verilen argumanlar ortam degiskenlerini ezer (CLI bayraklari icin).
+    """
+    settings = get_settings()
+    from .observability.logging import configure_logging
+
+    return configure_logging(
+        level=(level or settings.log_level).upper(),
+        fmt=(log_format or settings.logging.log_format),
+        mask=settings.logging.mask,
+        buffer_size=settings.logging.buffer_size,
+        log_file=(log_file if log_file is not None else settings.logging.file),
+        file_max_bytes=settings.logging.file_max_bytes,
+        file_backup_count=settings.logging.file_backup_count,
     )
-    for noisy in ("httpx", "httpcore", "pdfminer", "anthropic", "urllib3"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
-    return logging.getLogger("robotics_agent")

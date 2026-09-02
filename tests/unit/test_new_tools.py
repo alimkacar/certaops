@@ -18,83 +18,7 @@ def _tools_loaded():
     load_all_tools()
 
 
-# --- Gercek ATP ------------------------------------------------------------
-def test_atp_returns_date_based_confirmation(ctx, run_tool):
-    """ATP bir tarih ve miktar teyidi verir; stok fotografi vermez."""
-    result = run_tool(
-        "sap_atp_check",
-        ctx,
-        requests=[
-            {"material_id": "HD-GEAR-CSF25-100", "quantity": 30, "required_date": "2026-09-30"}
-        ],
-    )
-    row = result["results"][0]
-    assert row["requested_qty"] == 30
-    assert row["confirmed_qty"] > 0
-    assert row["full_confirmation_date"]
-    assert row["schedule_lines"], "Teyit satirlari olmadan ATP anlamsiz"
-    # Teyidi saglayan arz elementi belirtilmis olmali.
-    assert any(line["supply"] for line in row["schedule_lines"])
-
-
-def test_atp_reports_shortfall_and_delay(ctx, run_tool):
-    result = run_tool(
-        "sap_atp_check",
-        ctx,
-        requests=[
-            {"material_id": "HD-GEAR-CSF25-100", "quantity": 30, "required_date": "2026-09-30"}
-        ],
-    )
-    assert result["shortage_count"] == 1
-    shortage = result["shortages"][0]
-    assert shortage["shortfall_qty"] > 0
-    assert shortage["late_by_days"] > 0
-    assert "sap_mrp_shortage_explain" in result["recommendation"]
-
-
-def test_atp_confirms_available_material_fully(ctx, run_tool):
-    """Bol stoklu malzeme istenen tarihte tam teyit edilmeli."""
-    result = run_tool(
-        "sap_atp_check",
-        ctx,
-        requests=[{"material_id": "FRM-ALU-4040", "quantity": 10}],
-    )
-    row = result["results"][0]
-    assert row["fully_confirmed"] is True
-    assert row.get("shortfall_qty") in (None, 0)
-
-
-def test_atp_respects_safety_stock_in_check_rule(ctx, run_tool):
-    """Emniyet stogu talep sayilir; teyit bunu yansitmali."""
-    result = run_tool(
-        "sap_atp_check",
-        ctx,
-        requests=[{"material_id": "HD-GEAR-CSF25-100", "quantity": 5}],
-    )
-    notes = " ".join(result["results"][0].get("notes", []))
-    assert "emniyet stogu" in notes.lower()
-
-
-def test_atp_summary_detail_drops_schedule_lines(ctx, run_tool):
-    result = run_tool(
-        "sap_atp_check",
-        ctx,
-        requests=[{"material_id": "FRM-ALU-4040", "quantity": 10}],
-        detail="summary",
-    )
-    assert "schedule_lines" not in result["results"][0]
-    assert result["_meta"]["detail"] == "summary"
-
-
-def test_atp_carries_evidence(ctx, run_tool):
-    result = run_tool(
-        "sap_atp_check", ctx, requests=[{"material_id": "FRM-ALU-4040", "quantity": 1}]
-    )
-    assert result["evidence"]["source_api"]
-    assert result["evidence"]["source_system"]
-
-
-# --- MRP shortage ----------------------------------------------------------
+# --- MRP arz/talep aciklamasi ----------------------------------------------
 def test_mrp_explains_shortage_source(ctx, run_tool):
     result = run_tool("sap_mrp_shortage_explain", ctx, material_id="HD-GEAR-CSF25-100")
     assert result["has_shortage"] is True
@@ -207,7 +131,7 @@ def test_stock_overview_declares_it_is_not_atp(ctx, run_tool):
     row = result["materials"][0]
     assert "unreserved" in row
     assert "available" not in row
-    assert "sap_atp_check" in result["recommendation"]
+    assert "stoktan karsilanabilir" in result["recommendation"]
 
 
 def test_stock_overview_on_order_excludes_delivered(ctx, run_tool):
@@ -222,9 +146,9 @@ def test_stock_overview_on_order_excludes_delivered(ctx, run_tool):
 def test_discover_capabilities_lists_manifest_and_backend_support(ctx, run_tool):
     result = run_tool("sap_discover_capabilities", ctx)
     assert result["backend"] == "mock"
-    assert result["backend_capabilities"]["atp_check"] is True
+    assert result["backend_capabilities"]["stock"] is True
     aliases = {entry["alias"] for entry in result["service_manifest"]}
-    assert {"product", "availability", "mrp", "purchase_requisition"} <= aliases
+    assert {"product", "stock", "mrp", "purchase_requisition"} <= aliases
     assert "released OData V4" in result["preferred_order"]
 
 
@@ -268,7 +192,7 @@ def test_sap_list_domains_previews_deterministic_routing(ctx, run_tool):
     result = run_tool(
         "sap_list_domains",
         ctx,
-        message="HD-GEAR icin ATP kontrol et ve satinalma talebi olustur",
+        message="HD-GEAR icin stok kontrol et ve satinalma talebi olustur",
     )
     assert result["routing_preview"]["domains"] == ["procurement"]
     assert "procurement_write" in result["routing_preview"]["packs"]
@@ -372,6 +296,8 @@ def test_mutating_tool_timeout_requires_review(settings, purchaser):
     from robotics_agent.sap import build_backend
     from robotics_agent.tools import ToolContext, execute_tool
     from robotics_agent.tools.registry import REGISTRY, ToolSpec
+
+    object.__setattr__(settings.sap, "read_only", False)
 
     def slow_write(ctx, **kwargs):  # noqa: ARG001
         time.sleep(2.0)

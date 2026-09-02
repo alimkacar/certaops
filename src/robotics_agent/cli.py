@@ -18,7 +18,7 @@ from .config import get_settings, setup_logging
 console = Console()
 
 BANNER = """[bold cyan]CertaOps[/bold cyan]
-Ana veri, planlama, tedarik zinciri, satinalma ve proje finans icin izole SAP domain agent'lari.
+    S/4HANA Cloud Public Edition icin read-only satinalma ve P2P gorunurlugu.
 
 [dim]Komutlar:[/dim]
   [yellow]/tools[/yellow]            kayitli toollari risk seviyesiyle listele
@@ -30,9 +30,9 @@ Ana veri, planlama, tedarik zinciri, satinalma ve proje finans icin izole SAP do
 """
 
 EXAMPLES = [
-    "HD-GEAR-CSF25-100 malzemesinin 360 gorunumunu ve ATP durumunu getir.",
+    "HD-GEAR-CSF25-100 malzemesinin 360 gorunumunu ve stok durumunu getir.",
     "HD-GEAR-CSF25-100 icin tedarikcileri TCO bazinda karsilastir, 24 adet, 15 Ekim'e ihtiyacimiz var.",
-    "R-2026-014 projesinde butce durumu ne? Asim riski var mi?",
+    "5105600231 tedarikci faturasi neden bloke, acikla.",
     "SFT-SCN-270 icin satinalma talebi hazirla; yazmadan once diff ve onay durumunu goster.",
 ]
 
@@ -152,9 +152,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-p", "--prompt", help="Tek seferlik soru sor ve cik.")
     parser.add_argument("--no-tool-log", action="store_true", help="Tool cagrilarini gizle.")
     parser.add_argument("--log-level", default=None, help="DEBUG/INFO/WARNING")
+    parser.add_argument(
+        "--log-format",
+        default=None,
+        choices=["text", "json"],
+        help="Log cikti bicimi (varsayilan: LOG_FORMAT, o da yoksa text).",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Log kayitlarini ayrica bu dosyaya JSON olarak yaz (donerek saklanir).",
+    )
     args = parser.parse_args(argv)
 
-    setup_logging(args.log_level or "WARNING")
+    # Terminal oturumunda varsayilan WARNING'dir: konusma ciktisi log
+    # gurultusunun altinda kalmamali. Operator acikca isterse yukseltir.
+    setup_logging(
+        args.log_level or "WARNING",
+        log_format=args.log_format,
+        log_file=args.log_file,
+    )
     settings = get_settings()
 
     try:

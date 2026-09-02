@@ -4,8 +4,7 @@ Backend su veri dogrulugu invariantlarini uygular:
 
   A. Malzeme aramasi artik **aciklamada** da arar ve siniflandirma
      karakteristiklerini gercekten okur (API_CLFN_PRODUCT_SRV).
-  B. `check_atp` gercek ATP servisini kullanir; stok fotografi ATP yerine
-     gecirilmez. MRP arz/talep ayri bir port metodudur.
+  B. Stok fotografi bir ATP teyidi olarak sunulmaz; MRP arz/talep ayri porttur.
   C. PO okumasi V4 uzerinden `$expand` ile yapilir: baslik basina ek GET yok
      (N+1 kalkti), schedule line duzeyinde talep/teyit tarihi miktar-agirlikli
      degerlendirilir.
@@ -22,8 +21,10 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import logging
+import threading
 from collections.abc import Iterable, Sequence
 from datetime import date, datetime, timedelta, timezone
+from functools import partial
 from typing import Any
 
 from ..adapters.sap import (
@@ -31,6 +32,7 @@ from ..adapters.sap import (
     ODataHttpCore,
     ODataV2Client,
     ODataV4Client,
+    SAPCallBudget,
     SAPError,
     SAPNotSupported,
     account_assignment_shape,
@@ -46,18 +48,17 @@ from ..adapters.sap import (
     verify_contract,
     verify_write_shape,
 )
+from ..adapters.sap.concurrency import gather_reads
 from ..core.tenant_profile import DEFAULT_DOCUMENT_TYPE
-from .base import SAPBackend, effective_unit_price
+from . import schema_cache
+from .base import SAPBackend, effective_unit_price, wbs_matches
 from .models import (
-    AtpResult,
-    AtpScheduleLine,
     DocumentFlowNode,
     GoodsReceipt,
     InfoRecord,
     InvoiceBlock,
     Material,
     MaterialClassification,
-    ProjectCost,
     PurchaseOrder,
     PurchaseOrderItem,
     PurchaseRequisitionDraft,
@@ -75,6 +76,54 @@ from .models import (
 log = logging.getLogger(__name__)
 
 _MATERIAL_TYPE_FALLBACK = {"FERT", "HALB", "ROH", "HIBE", "DIEN"}
+
+# Bir filtre sunucuya gecirilemeyip eleme istemciye dustugunde kac kat genis
+# pencere okunacagi. Kirpma riskini dusurur ama sinirsiz okumaya izin vermez:
+# sessizce eksik liste dondurmek ile butun tabloyu cekmek arasindaki denge.
+_CLIENT_FILTER_PAGE_BUDGET = 4
+
+# Karakteristik filtresi icin aday basina bir okuma gerekir. Bu iki sabit o
+# okumayi hem paralellestirir hem tavanlar: aksi halde tek arama cagrisi
+# onlarca ardisik SAP gidis-donusune donusuyor.
+_CLASSIFICATION_FANOUT = 4
+_MAX_CLASSIFICATION_READS = 12
+
+# Belge akisi: bir PR birden cok siparise donusebilir ve her siparis kendi
+# icinde dort bagimsiz okuma ister. Ikisi de sinirlanir - tek tool cagrisi
+# sinirsiz gidis-donuse acilmamali.
+_FLOW_FANOUT = 4
+_MAX_FLOW_PURCHASE_ORDERS = 10
+
+# Sunucunun "bu filtreyi uygulayamam" dedigi durumlar. Yetki (403) ve kayit
+# yok (404) BURAYA GIRMEZ: onlar geri duselerek gizlenmemesi gereken hatalardir.
+_FILTER_REJECTION_CODES = {
+    "400",
+    "SY/530",
+    "CX_SADL_STATIC_QUERY_ERROR",
+    "FILTER_NOT_SUPPORTED",
+    "NOT_FILTERABLE",
+}
+
+
+def _is_filter_rejection(exc: SAPError) -> bool:
+    """Hata, filtrenin desteklenmemesinden mi kaynaklaniyor?
+
+    Ayrimi yapmak zorunludur: yetki hatasini "filtre desteklenmiyor" sayip
+    filtresiz tekrar denemek, kullaniciyi gormemesi gereken satirlara
+    yaklastirmak olurdu. Bu yuzden yalniz acik sekilde filtreye dair olan
+    kodlar/mesajlar geri dusmeyi tetikler.
+    """
+    if exc.is_authorization:
+        return False
+    code = (exc.code or "").upper()
+    if code in _FILTER_REJECTION_CODES:
+        return True
+    text = f"{exc} {exc.detail}".lower()
+    return any(
+        marker in text for marker in ("not filterable", "filter", "$filter", "unsupported property")
+    )
+
+
 # PR basligina yazilan idempotency referansi. Baslik 40 karakter sinirli oldugu
 # icin anahtarin sha256'sinin ilk 16 hanesi kullanilir.
 _REFERENCE_PREFIX = "REF#"
@@ -101,12 +150,8 @@ SELECT_FIELDS: dict[str, str] = {
         "to_Plant/to_PlantMRPArea/PlannedDeliveryDurationInDays,"
         "to_Plant/to_PlantMRPArea/IsPlannedDeliveryTime"
     ),
-    "valuation": (
-        "Product,ValuationArea,MovingAveragePrice,StandardPrice,Currency,PriceUnitQty"
-    ),
-    "stock": (
-        "Material,Plant,StorageLocation,InventoryStockType,MatlWrhsStkQtyInMatlBaseUnit"
-    ),
+    "valuation": ("Product,ValuationArea,MovingAveragePrice,StandardPrice,Currency,PriceUnitQty"),
+    "stock": ("Material,Plant,StorageLocation,InventoryStockType,MatlWrhsStkQtyInMatlBaseUnit"),
     "inforecord": (
         "PurchasingInfoRecord,Material,Supplier,IsDeleted,"
         "to_PurgInfoRecdOrgPlantData/PurchasingOrganization,"
@@ -277,6 +322,9 @@ class ODataSAPBackend(SAPBackend):
         self._acting_subject = ""
         #: Aktif tenant profili. `execute_tool` her tool oncesi doldurur.
         self._profile: Any = None
+        # Tool bazli butce kapsamlari bir backend uzerinde ust uste binmez.
+        # Ic fan-out thread'leri ayni SAPCallBudget nesnesini paylasir.
+        self._call_budget_lock = threading.Lock()
         self.connection = resolve_connection(cfg)
         for warning in self.connection.warnings:
             log.warning("SAP baglanti uyarisi: %s", warning)
@@ -292,6 +340,7 @@ class ODataSAPBackend(SAPBackend):
             sap_client=cfg.client,
             accept_language=cfg.description_language,
             allowed_hosts=allowed,
+            read_only=cfg.read_only,
             token_provider=self.connection.token_provider,
             breaker=self.breaker,
             identity_provider=lambda: self._acting_subject,
@@ -303,6 +352,7 @@ class ODataSAPBackend(SAPBackend):
             sap_client=cfg.client,
             accept_language=cfg.description_language,
             allowed_hosts=allowed,
+            read_only=cfg.read_only,
             token_provider=self.connection.token_provider,
             breaker=self.breaker,
             identity_provider=lambda: self._acting_subject,
@@ -337,14 +387,39 @@ class ODataSAPBackend(SAPBackend):
         self._core_v4.close()
 
     # --- Yetenek kesfi ------------------------------------------------------
+    def _schema_key(self, *parts: str) -> tuple[str, ...]:
+        """Sema onbellegi anahtari: baglanti kimligi + istenen sey.
+
+        Kullanici kimligi BILEREK yok - `$metadata` her kullanici icin aynidir
+        ve onbellegi kullaniciya bolmek tum faydayi yok ederdi. Host ve client
+        ise ayrimin zorunlu oldugu yer: iki ayri sistem birbirinin semasini
+        gormemeli.
+        """
+        return (self.connection.base_url, self.settings.sap.client, *parts)
+
     def metadata_contract(self, alias: str, *, correlation_id: str = ""):
-        """Servisin $metadata sozlesmesini onbellekli okur."""
+        """Servisin $metadata sozlesmesini onbellekli okur.
+
+        Onbellek SUREC GENELINDEDIR. Ornek basina tutuldugunda her yeni
+        oturum semayi bastan indiriyordu: runtime'lar oturum basina
+        onbelleklendigi ve her runtime kendi backend'ini kurdugu icin.
+        `$metadata` sistemin semasidir, kullanicinin verisi degil.
+        """
         if alias in self._metadata_cache:
             return self._metadata_cache[alias]
+
         capability = CAPABILITY_MANIFEST[alias]
-        client = self.v4 if capability.odata_version == "v4" else self.v2
-        raw = client.metadata(capability.service_path, correlation_id=correlation_id)
-        contract = parse_metadata(raw)
+
+        def _fetch():
+            client = self.v4 if capability.odata_version == "v4" else self.v2
+            raw = client.metadata(capability.service_path, correlation_id=correlation_id)
+            return parse_metadata(raw)
+
+        contract = schema_cache.cached(
+            self._schema_key("metadata", capability.service_path), _fetch
+        )
+        # Ornek icindeki sozluk sicak yol olarak kalir: kilit ve demet
+        # olusturma maliyeti bile ayni tur icinde tekrar tekrar odenmemeli.
         self._metadata_cache[alias] = contract
         return contract
 
@@ -359,13 +434,23 @@ class ODataSAPBackend(SAPBackend):
         on-prem S/4HANA'da yok) her PR/PO cagrisi 404 donerdi.
 
         Karar bir kez verilir ve onbelleklenir; `$metadata` sondasi tur basina
-        tekrarlanmaz.
+        tekrarlanmaz. Onbellek SUREC GENELINDEDIR: karar hedef sistemin
+        neyi destekledigine baglidir, hangi kullanicinin sordugu ile ilgisi
+        yoktur. Ornek basina tutuldugunda her yeni oturum ayni sondayi bastan
+        yapiyordu.
         """
         fallback = _V2_FALLBACK.get(primary)
         cached = self._alias_cache.get(primary)
         if cached is not None:
             return cached
 
+        key = self._schema_key("alias", primary, self.settings.sap.odata_version)
+        shared = schema_cache.cached(key, lambda: self._probe_alias(primary, fallback))
+        self._alias_cache[primary] = shared
+        return shared
+
+    def _probe_alias(self, primary: str, fallback: str | None) -> str:
+        """V4/V2 secimini gercekten sonda ile belirler (bkz. `_alias_for`)."""
         preference = self.settings.sap.odata_version
         resolved = primary
         if fallback is None:
@@ -410,7 +495,6 @@ class ODataSAPBackend(SAPBackend):
                 primary,
                 CAPABILITY_MANIFEST[resolved].service_path,
             )
-        self._alias_cache[primary] = resolved
         return resolved
 
     def _alias_path(self, primary: str) -> str:
@@ -437,6 +521,19 @@ class ODataSAPBackend(SAPBackend):
     def sap_call_count(self) -> int:
         return self._core_v4.call_count + self._core_v2.call_count
 
+    @contextlib.contextmanager
+    def enforce_call_budget(self, max_calls: int):
+        """V2/V4 ve paralel retry'lar icin tek gercek HTTP butcesi."""
+        budget = SAPCallBudget(max_calls=max_calls)
+        with self._call_budget_lock:
+            for core in (self._core_v4, self._core_v2):
+                core.call_budget = budget
+            try:
+                yield
+            finally:
+                for core in (self._core_v4, self._core_v2):
+                    core.call_budget = None
+
     def set_acting_subject(self, subject: str) -> None:
         self._acting_subject = str(subject or "")
 
@@ -452,35 +549,48 @@ class ODataSAPBackend(SAPBackend):
         return getattr(self._profile, "document_type", None) or DEFAULT_DOCUMENT_TYPE
 
     def probe_capabilities(self, aliases: Iterable[str] | None = None) -> list[dict[str, Any]]:
-        """Manifestteki servisleri hedef sistemde dogrular."""
-        keys = list(aliases) if aliases else list(CAPABILITY_MANIFEST)
-        out: list[dict[str, Any]] = []
-        for alias in keys:
-            capability = CAPABILITY_MANIFEST.get(alias)
-            if capability is None:
-                continue
+        """Manifestteki servisleri hedef sistemde dogrular.
+
+        Manifestteki 14 servisin `$metadata` belgesi birbirinden bagimsizdir;
+        sirayla okundugunda sandbox'ta ~5 saniye suruyordu. Paralel okuma bu
+        tool'u turun kritik yolundan cikarir. Sonuc listesi girdi sirasinda
+        kalir; sadelik icin `alias` -> sonuc eslemesi bozulmaz.
+        """
+        keys = [
+            a
+            for a in (list(aliases) if aliases else list(CAPABILITY_MANIFEST))
+            if a in CAPABILITY_MANIFEST
+        ]
+        if not keys:
+            return []
+
+        def probe(alias: str) -> dict[str, Any]:
+            capability = CAPABILITY_MANIFEST[alias]
             started = datetime.now(timezone.utc)
             try:
                 contract = self.metadata_contract(alias)
                 check = verify_contract(capability, contract)
             except SAPError as exc:
-                out.append(
-                    {
-                        "alias": alias,
-                        "available": False,
-                        "contract_ok": False,
-                        "status": capability.status,
-                        "expected_odata": capability.odata_version,
-                        "error": str(exc),
-                    }
-                )
-                continue
+                # Tek servisin okunamamasi kesif turunu bitirmez: hangi
+                # servisin neden dusdugu ciktida kalir.
+                return {
+                    "alias": alias,
+                    "available": False,
+                    "contract_ok": False,
+                    "status": capability.status,
+                    "expected_odata": capability.odata_version,
+                    "error": str(exc),
+                }
             payload = check.to_dict()
             payload["latency_ms"] = round(
                 (datetime.now(timezone.utc) - started).total_seconds() * 1000, 1
             )
-            out.append(payload)
-        return out
+            return payload
+
+        return gather_reads(
+            [partial(probe, alias) for alias in keys],
+            max_workers=self.settings.risk.max_parallel_reads,
+        )
 
     def capabilities(self) -> dict[str, Any]:
         payload = super().capabilities()
@@ -548,17 +658,64 @@ class ODataSAPBackend(SAPBackend):
         # Siniflandirma yalniz gerektiginde okunur: her aramada karakteristik
         # cekmek gereksiz cagri ve gecikme uretir.
         if attribute_filters:
-            filtered: list[Material] = []
-            for material in materials:
-                classification = self.get_material_classification(material.material_id)
+            materials = self._filter_by_classification(materials, attribute_filters, limit=limit)
+
+        return materials[:limit]
+
+    def _filter_by_classification(
+        self,
+        materials: list[Material],
+        filters: dict[str, tuple[float, float]],
+        *,
+        limit: int,
+    ) -> list[Material]:
+        """Karakteristik filtresini SINIRLI ve PARALEL uygular.
+
+        Eski hali her aday icin sirayla bir siniflandirma cagrisi yapiyordu.
+        `limit=8` bir arama `limit * 4` adaya kadar cikabildigi icin tek tool
+        cagrisi 30'a yakin ardisik SAP gidis-donusune donusuyordu; olcumde
+        3 cagrilik bildirilen butceye karsi 19 cagri gorulmustu. Uc degisiklik:
+
+          1. **Yeterli eslesme bulununca durulur** - tum adaylar okunmaz.
+          2. Her tur `_CLASSIFICATION_FANOUT` adayi ayni anda okunur; boylece
+             kalan cagrilar da ardisik gecikme uretmez.
+          3. Toplam okuma `_MAX_CLASSIFICATION_READS` ile tavanlanir: eslesmeyen
+             bir filtre butun aday listesini taramaz.
+
+        Sira korunur: paralellik sonuc siralamasini degistirmez.
+        """
+        matched: list[Material] = []
+        budget = min(len(materials), _MAX_CLASSIFICATION_READS)
+
+        for start in range(0, budget, _CLASSIFICATION_FANOUT):
+            batch = materials[start : min(start + _CLASSIFICATION_FANOUT, budget)]
+            classifications = gather_reads(
+                [partial(self._classification_or_none, m.material_id) for m in batch],
+                max_workers=_CLASSIFICATION_FANOUT,
+            )
+            for material, classification in zip(batch, classifications, strict=True):
                 if classification is None:
                     continue
                 material.attributes = dict(classification.characteristics)
-                if self._matches(classification, attribute_filters):
-                    filtered.append(material)
-            materials = filtered
+                if self._matches(classification, filters):
+                    matched.append(material)
+            if len(matched) >= limit:
+                break
 
-        return materials[:limit]
+        if len(matched) < limit and budget < len(materials):
+            log.info(
+                "Karakteristik filtresi %d adayda tavana takildi; %d aday okunmadi.",
+                budget,
+                len(materials) - budget,
+            )
+        return matched
+
+    def _classification_or_none(self, material_id: str) -> MaterialClassification | None:
+        """Tek malzemenin siniflandirmasi; okunamayan aday filtreyi dusurmez."""
+        try:
+            return self.get_material_classification(material_id)
+        except SAPNotSupported:
+            return None
 
     def _search_descriptions(self, tokens: list[str], *, limit: int) -> list[str]:
         service = service_path("product")
@@ -603,7 +760,8 @@ class ODataSAPBackend(SAPBackend):
         # kullanilabilir; aksi halde yalniz tam eslesme kabul edilir.
         plant_row = (
             next((p for p in plants if p.get("Plant") == target_plant), {})
-            if target_plant else (plants[0] if plants else {})
+            if target_plant
+            else (plants[0] if plants else {})
         )
         mrp_areas = expanded_rows(plant_row, "to_PlantMRPArea")
         mrp_row = next(
@@ -713,9 +871,7 @@ class ODataSAPBackend(SAPBackend):
                 capability.service_path,
                 "A_ProductValuation",
                 params={
-                    "$filter": (
-                        f"{id_filter} and ValuationArea eq '{quote(valuation_area)}'"
-                    ),
+                    "$filter": (f"{id_filter} and ValuationArea eq '{quote(valuation_area)}'"),
                     "$select": SELECT_FIELDS["valuation"],
                     "$top": max(len(ids) * 2, 10),
                 },
@@ -753,8 +909,7 @@ class ODataSAPBackend(SAPBackend):
             "A_ProductCharcValue",
             params={
                 "$filter": (
-                    f"Product eq '{quote(material_id)}' and "
-                    f"ClassType eq '{quote(class_type)}'"
+                    f"Product eq '{quote(material_id)}' and ClassType eq '{quote(class_type)}'"
                 ),
                 "$select": SELECT_FIELDS["classification"],
                 "$top": 200,
@@ -831,9 +986,7 @@ class ODataSAPBackend(SAPBackend):
             service,
             "A_MatlStkInAcctMod",
             params={
-                "$filter": (
-                    f"{_in_filter('Material', ids)} and Plant eq '{quote(target_plant)}'"
-                ),
+                "$filter": (f"{_in_filter('Material', ids)} and Plant eq '{quote(target_plant)}'"),
                 "$select": SELECT_FIELDS["stock"],
                 "$top": max(100, len(ids) * 20),
             },
@@ -866,9 +1019,7 @@ class ODataSAPBackend(SAPBackend):
     def _open_po_quantity(self, material_id: str, plant: str) -> float:
         return self._open_po_quantities([material_id], plant).get(material_id, 0.0)
 
-    def _open_po_quantities(
-        self, material_ids: Sequence[str], plant: str
-    ) -> dict[str, float]:
+    def _open_po_quantities(self, material_ids: Sequence[str], plant: str) -> dict[str, float]:
         """Acik siparis miktari: siparis miktari eksi teslim edilen.
 
         Teslim edilmis miktar acik siparis hesabindan mutlaka dusulur.
@@ -935,8 +1086,7 @@ class ODataSAPBackend(SAPBackend):
                 )
             else:
                 delivered = sum(
-                    float(line.get("ScheduleLineDeliveredQuantity") or 0)
-                    for line in schedule
+                    float(line.get("ScheduleLineDeliveredQuantity") or 0) for line in schedule
                 )
                 open_qty = max(0.0, ordered - delivered)
             totals[material_id] += max(0.0, open_qty)
@@ -949,9 +1099,7 @@ class ODataSAPBackend(SAPBackend):
         """MRP arz/talep elementlerinden rezervasyon toplamini cikarir."""
         return self._reservation_quantities([material_id], plant).get(material_id)
 
-    def _reservation_quantities(
-        self, material_ids: Sequence[str], plant: str
-    ) -> dict[str, float]:
+    def _reservation_quantities(self, material_ids: Sequence[str], plant: str) -> dict[str, float]:
         """Rezervasyon toplamlarini tek MRP cagrisinda okur."""
         ids = [m for m in dict.fromkeys(material_ids) if m]
         if not ids:
@@ -962,10 +1110,7 @@ class ODataSAPBackend(SAPBackend):
                 capability.service_path,
                 "SupplyDemandItems",
                 params={
-                    "$filter": (
-                        f"{_in_filter('Material', ids)} and "
-                        f"MRPPlant eq '{quote(plant)}'"
-                    ),
+                    "$filter": (f"{_in_filter('Material', ids)} and MRPPlant eq '{quote(plant)}'"),
                     "$top": max(500, len(ids) * 200),
                 },
             )
@@ -986,78 +1131,6 @@ class ODataSAPBackend(SAPBackend):
             )
             totals[material_id] = totals.get(material_id, 0.0) - quantity
         return {mid: round(totals.get(mid, 0.0), 3) for mid in ids}
-
-    # --- ATP ----------------------------------------------------------------
-    def check_atp(
-        self,
-        material_id: str,
-        *,
-        quantity: float,
-        requested_date: date | None = None,
-        plant: str | None = None,
-    ) -> AtpResult:
-        capability = CAPABILITY_MANIFEST["availability"]
-        target_plant = plant or self.settings.sap.plant
-        need_by = requested_date or date.today()
-
-        # ATP servisi parametreli bir okuma olarak calisir: istenen miktar/tarih
-        # filtrede verilir, servis teyit satirlarini dondurur.
-        filter_expr = (
-            f"Product eq '{quote(material_id)}' and Plant eq '{quote(target_plant)}' "
-            f"and RequestedQuantity eq {_number_literal(quantity)} "
-            f"and RequestedDeliveryDate eq {need_by.isoformat()}"
-        )
-        collection = self.v4.read_collection(
-            capability.service_path,
-            "ProductAvailabilityInformation",
-            filter_expr=filter_expr,
-            top=50,
-        )
-        data_rows = collection.rows
-        if not data_rows:
-            raise SAPNotSupported(
-                "atp_check",
-                backend=self.name,
-                hint=(
-                    f"{capability.service_path} beklenen alanlari dondurmedi. "
-                    "sap_discover_capabilities ile kontrati dogrulayin "
-                    f"(beklenen: {', '.join(capability.critical_properties.get('ProductAvailabilityInformation', ()))})."
-                ),
-            )
-
-        schedule: list[AtpScheduleLine] = []
-        confirmed_total = 0.0
-        for row in data_rows:
-            confirmed_qty = float(row.get("ConfirmedQuantity") or 0)
-            confirmed_date = parse_odata_datetime(row.get("ConfirmedDeliveryDate"))
-            if confirmed_qty <= 0 or confirmed_date is None:
-                continue
-            schedule.append(
-                AtpScheduleLine(
-                    confirmed_date=confirmed_date,
-                    confirmed_qty=round(confirmed_qty, 3),
-                    supply_element=str(row.get("AvailabilityCheckType", "ATP")),
-                )
-            )
-            confirmed_total += confirmed_qty
-
-        schedule.sort(key=lambda line: line.confirmed_date)
-        confirmed_by_need = round(
-            sum(line.confirmed_qty for line in schedule if line.confirmed_date <= need_by), 3
-        )
-        return AtpResult(
-            material_id=material_id,
-            plant=target_plant,
-            requested_qty=float(quantity),
-            requested_date=requested_date,
-            confirmed_qty=confirmed_by_need,
-            full_confirmation_date=schedule[-1].confirmed_date if schedule else None,
-            schedule_lines=schedule,
-            checked_at=datetime.now(timezone.utc),
-            source_api=capability.service_path,
-            calendar_considered=True,
-            messages=["Teyit SAP ATP kontrol kuralina gore uretildi."],
-        )
 
     # --- MRP ----------------------------------------------------------------
     def get_supply_demand(
@@ -1104,7 +1177,9 @@ class ODataSAPBackend(SAPBackend):
                     material_id=material_id,
                     plant=target_plant,
                     mrp_element=str(row.get("MRPElement", "")),
-                    element_id=str(row.get("MRPElementOpenItem") or row.get("MRPElementItem") or ""),
+                    element_id=str(
+                        row.get("MRPElementOpenItem") or row.get("MRPElementItem") or ""
+                    ),
                     availability_date=when,
                     quantity=quantity,
                     unit=str(row.get("MaterialBaseUnit") or "ST"),
@@ -1228,12 +1303,13 @@ class ODataSAPBackend(SAPBackend):
     def get_vendor_master(self, vendor_id: str) -> Vendor | None:
         return self._get_vendors([vendor_id], include_score=False).get(vendor_id)
 
+    def get_vendor_masters(self, vendor_ids: Sequence[str]) -> dict[str, Vendor]:
+        return self._get_vendors(vendor_ids, include_score=False)
+
     def get_vendors(self, vendor_ids: Sequence[str]) -> dict[str, Vendor]:
         return self._get_vendors(vendor_ids, include_score=True)
 
-    def _get_vendors(
-        self, vendor_ids: Sequence[str], *, include_score: bool
-    ) -> dict[str, Vendor]:
+    def _get_vendors(self, vendor_ids: Sequence[str], *, include_score: bool) -> dict[str, Vendor]:
         """Tedarikci ana verisi, adresi ve skorunu sabit sayida cagrida okur."""
         ids = [vendor_id for vendor_id in dict.fromkeys(vendor_ids) if vendor_id]
         if not ids:
@@ -1251,9 +1327,7 @@ class ODataSAPBackend(SAPBackend):
             },
         )
         by_id = {
-            str(row.get("Supplier")): row
-            for row in rows
-            if str(row.get("Supplier") or "") in ids
+            str(row.get("Supplier")): row for row in rows if str(row.get("Supplier") or "") in ids
         }
 
         addresses: dict[str, dict[str, Any]] = {}
@@ -1290,25 +1364,30 @@ class ODataSAPBackend(SAPBackend):
                 name=row.get("SupplierName") or row.get("SupplierFullName", ""),
                 country=address.get("Country", ""),
                 city=address.get("CityName", ""),
-                blocked=bool(
-                    row.get("PurchasingIsBlocked") or row.get("SupplierProcurementBlock")
-                ),
+                blocked=bool(row.get("PurchasingIsBlocked") or row.get("SupplierProcurementBlock")),
             )
             score = scores.get(vendor_id)
             if score is not None:
-                vendor.on_time_delivery_pct = score.on_time_delivery_pct or 0.0
-                vendor.quality_ppm = score.quality_ppm or 0
-                vendor.price_competitiveness = score.price_score or 0.0
-                vendor.responsiveness = score.service_score or 0.0
+                # `or 0.0` KULLANILMAZ: degerlendirme CDS'i alani bos
+                # birakmissa bu "olcum yok" demektir, "sifir cikti" degil.
+                # Sifire cevirmek olculmemis tedarikciyi ya kusursuz
+                # (0 ppm) ya felaket (%0 zamaninda teslim) gosterirdi.
+                vendor.on_time_delivery_pct = score.on_time_delivery_pct
+                vendor.quality_ppm = score.quality_ppm
+                vendor.price_competitiveness = score.price_score
+                vendor.responsiveness = score.service_score
             vendors[vendor_id] = vendor
         return vendors
 
     def get_supplier_score(
         self, vendor_id: str, *, purchasing_org: str | None = None
     ) -> SupplierScore | None:
-        return self._get_supplier_scores(
-            [vendor_id], purchasing_org=purchasing_org
-        ).get(vendor_id)
+        return self._get_supplier_scores([vendor_id], purchasing_org=purchasing_org).get(vendor_id)
+
+    def get_supplier_scores(
+        self, vendor_ids: Sequence[str], *, purchasing_org: str | None = None
+    ) -> dict[str, SupplierScore]:
+        return self._get_supplier_scores(vendor_ids, purchasing_org=purchasing_org)
 
     def _get_supplier_scores(
         self,
@@ -1359,9 +1438,7 @@ class ODataSAPBackend(SAPBackend):
             }
 
         grouped = {
-            vendor_id: [
-                row for row in rows if str(row.get("Supplier") or "") == vendor_id
-            ]
+            vendor_id: [row for row in rows if str(row.get("Supplier") or "") == vendor_id]
             for vendor_id in ids
         }
         return {
@@ -1465,7 +1542,9 @@ class ODataSAPBackend(SAPBackend):
                 if chosen is None:
                     findings.append(
                         ValidationFinding(
-                            severity="warning", field="preferred_vendor", item_no=item_no,
+                            severity="warning",
+                            field="preferred_vendor",
+                            item_no=item_no,
                             message=(
                                 f"Kalem {item_no}: {item.preferred_vendor} icin bilgi kaydi yok."
                             ),
@@ -1474,18 +1553,25 @@ class ODataSAPBackend(SAPBackend):
             if chosen is None and records:
                 chosen = min(records, key=lambda r: r.price_for_qty(item.quantity))
 
-            unit_price, price_warning = effective_unit_price(item.net_price, chosen.price_for_qty(item.quantity) if chosen else master.moving_avg_price)
+            unit_price, price_warning = effective_unit_price(
+                item.net_price,
+                chosen.price_for_qty(item.quantity) if chosen else master.moving_avg_price,
+            )
             if price_warning:
                 findings.append(
                     ValidationFinding(
-                        severity="warning", field="net_price", item_no=item_no,
+                        severity="warning",
+                        field="net_price",
+                        item_no=item_no,
                         message=f"Kalem {item_no}: {price_warning}",
                     )
                 )
             if not unit_price:
                 findings.append(
                     ValidationFinding(
-                        severity="warning", field="net_price", item_no=item_no,
+                        severity="warning",
+                        field="net_price",
+                        item_no=item_no,
                         message=(
                             f"Kalem {item_no}: fiyat bulunamadi (bilgi kaydi ve degerleme bos). "
                             "Tahmini deger sifir; onaya sunmadan once fiyat girilmeli."
@@ -1499,7 +1585,9 @@ class ODataSAPBackend(SAPBackend):
             if item.quantity < moq:
                 findings.append(
                     ValidationFinding(
-                        severity="warning", field="quantity", item_no=item_no,
+                        severity="warning",
+                        field="quantity",
+                        item_no=item_no,
                         message=(
                             f"Kalem {item_no}: miktar {item.quantity:g} < minimum siparis miktari "
                             f"{moq:g}."
@@ -1513,7 +1601,9 @@ class ODataSAPBackend(SAPBackend):
             if item.delivery_date and item.delivery_date < earliest:
                 findings.append(
                     ValidationFinding(
-                        severity="warning", field="delivery_date", item_no=item_no,
+                        severity="warning",
+                        field="delivery_date",
+                        item_no=item_no,
                         message=(
                             f"Kalem {item_no}: istenen teslim {item.delivery_date}, en erken "
                             f"{earliest} ({lead} gun)."
@@ -1523,7 +1613,9 @@ class ODataSAPBackend(SAPBackend):
             if not (item.wbs_element or item.cost_center):
                 findings.append(
                     ValidationFinding(
-                        severity="warning", field="account_assignment", item_no=item_no,
+                        severity="warning",
+                        field="account_assignment",
+                        item_no=item_no,
                         message=f"Kalem {item_no}: hesap atamasi (WBS/masraf merkezi) yok.",
                     )
                 )
@@ -1652,13 +1744,9 @@ class ODataSAPBackend(SAPBackend):
             return payload
 
         if item.wbs_element:
-            category, field_name, value = (
-                ACCT_ASSIGN_PROJECT, "WBSElement", item.wbs_element
-            )
+            category, field_name, value = (ACCT_ASSIGN_PROJECT, "WBSElement", item.wbs_element)
         else:
-            category, field_name, value = (
-                ACCT_ASSIGN_COST_CENTER, "CostCenter", item.cost_center
-            )
+            category, field_name, value = (ACCT_ASSIGN_COST_CENTER, "CostCenter", item.cost_center)
 
         shape, contract = self._account_assignment_shape()
         # Kategori alani sozlesmede YOK oldugu KANITLANMADIKCA gonderilir.
@@ -1674,12 +1762,12 @@ class ODataSAPBackend(SAPBackend):
             payload[field_name] = value
         else:
             # `child` ve `unknown`: released API'de beklenen sekil alt entity.
-            nav = "to_PurchaseReqnAcctAssgmt" if self._alias_version(
-                "purchase_requisition"
-            ) == "v2" else "_PurchaseReqnAcctAssgmt"
-            payload[nav] = [
-                {field_name: value, "PurchaseRequisitionAcctAssgmt": "01"}
-            ]
+            nav = (
+                "to_PurchaseReqnAcctAssgmt"
+                if self._alias_version("purchase_requisition") == "v2"
+                else "_PurchaseReqnAcctAssgmt"
+            )
+            payload[nav] = [{field_name: value, "PurchaseRequisitionAcctAssgmt": "01"}]
         return payload
 
     def _pr_item_entity_set(self) -> str:
@@ -1716,7 +1804,8 @@ class ODataSAPBackend(SAPBackend):
             if shape == "unknown":
                 log.warning(
                     "PR kalem sozlesmesinde hesap atamasi sekli belirlenemedi "
-                    "(%s); alt entity varsayiliyor.", item_set
+                    "(%s); alt entity varsayiliyor.",
+                    item_set,
                 )
             else:
                 log.info("PR hesap atamasi sekli: %s (%s)", shape, item_set)
@@ -1750,6 +1839,11 @@ class ODataSAPBackend(SAPBackend):
         external_reference: str,
         correlation_id: str = "",
     ) -> PurchaseRequisitionResult:
+        if self.settings.sap.read_only:
+            raise SAPError(
+                "S/4HANA read-only profili etkin; satinalma talebi olusturulamaz.",
+                code="READ_ONLY_MODE",
+            )
         if not draft.is_submittable:
             raise SAPError(
                 "Taslakta engelleyici bulgular var; SAP'a gonderilmedi: "
@@ -1796,9 +1890,7 @@ class ODataSAPBackend(SAPBackend):
                 correlation_id=correlation_id,
             )
         pr_id = str(created.get("PurchaseRequisition", "") or "")
-        log.info(
-            "SAP PR olusturuldu: %s (ref %s, %s)", pr_id, token, capability.odata_version
-        )
+        log.info("SAP PR olusturuldu: %s (ref %s, %s)", pr_id, token, capability.odata_version)
         return PurchaseRequisitionResult(
             requisition_id=pr_id or None,
             created=bool(pr_id),
@@ -1838,8 +1930,8 @@ class ODataSAPBackend(SAPBackend):
             items = draft.payload.get("items", [])
         body = {
             "PurchaseRequisitionType": draft.payload.get(
-                    "PurchaseRequisitionType", self.document_type
-                ),
+                "PurchaseRequisitionType", self.document_type
+            ),
             "PurchaseRequisitionHeaderText": draft.header_text[:40],
             items_key: items,
         }
@@ -1908,9 +2000,7 @@ class ODataSAPBackend(SAPBackend):
                 capability.service_path,
                 "A_PurchaseRequisitionHeader",
                 params={
-                    "$filter": (
-                        f"substringof('{quote(token)}',PurchaseRequisitionHeaderText)"
-                    ),
+                    "$filter": (f"substringof('{quote(token)}',PurchaseRequisitionHeaderText)"),
                     "$select": "PurchaseRequisition,PurchaseRequisitionHeaderText",
                     "$top": 5,
                 },
@@ -1950,42 +2040,86 @@ class ODataSAPBackend(SAPBackend):
         if only_open:
             filters.append("IsCompletelyDelivered eq false")
 
+        # WBS hiyerarsiktir: siparisler hesap atamasini genellikle YAPRAK
+        # elemana yapar, kullanici ise proje kodunu sorar. Esitlik kullanmak
+        # tool sozlesmesindeki "eleman veya on eki" vaadini bozuyor ve
+        # "bu projede acik siparis yok" gibi YANLIS bir cevap uretiyordu.
+        # Sunucuya genis `startswith` gonderilir, ata/alt eleman kurali
+        # `wbs_matches` ile istemcide kesinlestirilir; bu yon gecerli satir
+        # dusurmez, yalniz fazlasini eler.
         if capability.odata_version == "v2":
             if wbs_element:
-                filters.append(f"WBSElement eq '{quote(wbs_element)}'")
-            rows = self.v2.read(
-                capability.service_path,
-                "A_PurchaseOrderItem",
-                params={
-                    "$filter": " and ".join(filters) if filters else None,
-                    "$expand": "to_PurchaseOrder,to_ScheduleLine",
-                    "$top": limit,
-                },
+                filters.append(f"startswith(WBSElement,'{quote(wbs_element)}')")
+            # Tedarikci filtresi V2'de de SUNUCUYA gider (asagidaki nota bak).
+            # Gateway nav-yolu filtresini reddederse `_v2_purchase_order_rows`
+            # filtresiz tekrar dener ve sayfa butcesini yukseltir.
+            rows = self._v2_purchase_order_rows(
+                capability.service_path, filters, vendor_id=vendor_id, limit=limit
             )
-            return self._map_v2_purchase_orders(rows, vendor_id=vendor_id)
+            return self._map_v2_purchase_orders(rows, vendor_id=vendor_id, wbs_element=wbs_element)
 
         if wbs_element:
             filters.append(
-                "_PurOrdAccountAssignment/any(a:a/WBSElementExternalID eq "
-                f"'{quote(wbs_element)}')"
+                "_PurOrdAccountAssignment/any(a:startswith(a/WBSElementExternalID,"
+                f"'{quote(wbs_element)}'))"
             )
+
+        # Tedarikci filtresi SUNUCUYA gecirilir.
+        #
+        # Eskiden `$top=limit` kadar satir cekilip eleme Python'da yapiliyordu.
+        # Tedarikci alani kalemde degil baslikta oldugu icin bu "ilk 50 kalemin
+        # icinde bu tedarikciden kac tane var" sorusuna donusuyordu: tedarikcinin
+        # 200 siparisi olsa bile pencereye 2 tanesi dustuyse cevap 2 oluyordu.
+        # Cagiranlar bu listeden `open_order_count` ve `avg_delay_days`
+        # hesapliyor - yani sessiz kirpma dogrudan YANLIS SAYIYA donusuyordu.
+        pushed_vendor = bool(vendor_id)
+        if vendor_id:
+            filters.append(f"_PurchaseOrder/Supplier eq '{quote(vendor_id)}'")
+
+        select = (
+            "PurchaseOrder",
+            "PurchaseOrderItem",
+            "Material",
+            "OrderQuantity",
+            "NetPriceAmount",
+            "DocumentCurrency",
+            "PurchaseOrderItemText",
+            "IsCompletelyDelivered",
+        )
+        expand = ("_PurchaseOrder", "_PurchaseOrderScheduleLineTP", "_PurOrdAccountAssignment")
 
         # Baslik ve hesap atamasi $expand ile geliyor: baslik/kalem basina ek
         # GET yok (N+1 kalkti).
-        page = self.v4.read_collection(
-            capability.service_path,
-            "PurchaseOrderItem",
-            filter_expr=" and ".join(filters),
-            select=(
-                "PurchaseOrder", "PurchaseOrderItem", "Material", "OrderQuantity",
-                "NetPriceAmount", "DocumentCurrency", "PurchaseOrderItemText",
-                "IsCompletelyDelivered",
-            ),
-            expand=(
-                "_PurchaseOrder", "_PurchaseOrderScheduleLineTP", "_PurOrdAccountAssignment",
-            ),
-            top=limit,
-        )
+        try:
+            page = self.v4.read_collection(
+                capability.service_path,
+                "PurchaseOrderItem",
+                filter_expr=" and ".join(filters),
+                select=select,
+                expand=expand,
+                top=limit,
+            )
+        except SAPError as exc:
+            # Bazi tenant'larda to-one nav yolu uzerinde $filter kapali olabilir.
+            # Bu durumda eski davranisa DUSULMEZ; filtre cikarilir ama sayfa
+            # butcesi yukseltilir ki eleme sonrasi liste kirpilmis olmasin.
+            if not pushed_vendor or not _is_filter_rejection(exc):
+                raise
+            log.info(
+                "PO tedarikci filtresi sunucuda desteklenmiyor (%s); "
+                "sayfalayarak istemci tarafinda eleniyor.",
+                exc.code or "400",
+            )
+            pushed_vendor = False
+            page = self.v4.read_collection(
+                capability.service_path,
+                "PurchaseOrderItem",
+                filter_expr=" and ".join(f for f in filters if "Supplier" not in f),
+                select=select,
+                expand=expand,
+                top=limit,
+                max_pages=_CLIENT_FILTER_PAGE_BUDGET,
+            )
 
         out: list[PurchaseOrder] = []
         for row in page.rows:
@@ -2004,6 +2138,10 @@ class ODataSAPBackend(SAPBackend):
                 ),
                 "",
             )
+            # Genis `startswith` filtresinin yanlis pozitifleri elenir:
+            # `R-2026-02` sorgusu `R-2026-021-1`i kapsamaz.
+            if wbs_element and not wbs_matches(wbs_element, assigned_wbs):
+                continue
             ordered = float(row.get("OrderQuantity") or 0)
             if any("OpenPurchaseOrderQuantity" in line for line in schedule):
                 open_qty = sum(
@@ -2015,11 +2153,16 @@ class ODataSAPBackend(SAPBackend):
                     float(s.get("ScheduleLineDeliveredQuantity") or 0) for s in schedule
                 )
             requested = _weighted_date(schedule, "ScheduleLineDeliveryDate")
-            confirmed = (
-                _weighted_date(schedule, "SchedLineStscDeliveryDate")
-                or _weighted_date(schedule, "PurchaseOrderConfirmedDeliveryDate")
-                or requested
-            )
+            # Teyit tarihi UYDURULMAZ. Iki kural:
+            #  1. `SchedLineStscDeliveryDate` bir ISTATISTIK tarihidir; ayni
+            #     dosyadaki `get_schedule_lines` onu teyit sayemayi acikca
+            #     reddediyor. Burada teyit gibi kullanmak celiskiydi.
+            #  2. `or requested` fallback'i, tedarikcinin hic teyit
+            #     yayimlamadigi bir siparise talep tarihini teyit diye
+            #     yaziyordu. Sonucu: gecikme her zaman 0 gorunuyor ve
+            #     "teyitli tarih gecti" uyarisi olmayan bir teyide dayaniyordu.
+            # Teyit yoksa alan None kalir; tuketiciler bunu zaten kaldiriyor.
+            confirmed = _weighted_date(schedule, "PurchaseOrderConfirmedDeliveryDate")
 
             if delivered <= 0:
                 status = "open"
@@ -2046,10 +2189,65 @@ class ODataSAPBackend(SAPBackend):
                     wbs_element=assigned_wbs or None,
                 )
             )
+            # Filtre sunucuda uygulanamadiysa fazladan sayfa cektik; cagiranin
+            # istedigi `limit` yine de asilmaz.
+            if not pushed_vendor and vendor_id and len(out) >= limit:
+                break
         return out
 
+    def _v2_purchase_order_rows(
+        self,
+        service_path: str,
+        filters: list[str],
+        *,
+        vendor_id: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """V2 kalem satirlari; tedarikci filtresi once sunucuda denenir.
+
+        Gateway'in V2 uygulamalarinda to-one nav yolu (`to_PurchaseOrder/Supplier`)
+        uzerinde `$filter` her serviste acik degildir. Bu yuzden once denenir,
+        reddedilirse filtresiz ama **daha genis** bir pencereyle okunur: eleme
+        istemcide yapilacaksa kirpma riski buyudugu icin pencere buyutulur.
+        """
+        if vendor_id:
+            pushed = [*filters, f"to_PurchaseOrder/Supplier eq '{quote(vendor_id)}'"]
+            try:
+                return self.v2.read(
+                    service_path,
+                    "A_PurchaseOrderItem",
+                    params={
+                        "$filter": " and ".join(pushed),
+                        "$expand": "to_PurchaseOrder,to_ScheduleLine",
+                        "$top": limit,
+                    },
+                )
+            except SAPError as exc:
+                if not _is_filter_rejection(exc):
+                    raise
+                log.info(
+                    "V2 PO tedarikci filtresi reddedildi (%s); genis pencereyle "
+                    "istemci tarafinda eleniyor.",
+                    exc.code or "400",
+                )
+
+        top = limit * _CLIENT_FILTER_PAGE_BUDGET if vendor_id else limit
+        return self.v2.read(
+            service_path,
+            "A_PurchaseOrderItem",
+            params={
+                "$filter": " and ".join(filters) if filters else None,
+                "$expand": "to_PurchaseOrder,to_ScheduleLine",
+                "$top": top,
+            },
+        )
+
     def _map_v2_purchase_orders(
-        self, rows: list[dict[str, Any]], *, vendor_id: str | None
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        vendor_id: str | None,
+        wbs_element: str | None = None,
     ) -> list[PurchaseOrder]:
         """V2 (`API_PURCHASEORDER_PROCESS_SRV`) satirlarini domain modeline cevirir."""
         out: list[PurchaseOrder] = []
@@ -2058,13 +2256,15 @@ class ODataSAPBackend(SAPBackend):
             supplier = header.get("Supplier", "")
             if vendor_id and supplier != vendor_id:
                 continue
+            # Genis `startswith` filtresinin yanlis pozitifleri elenir.
+            if wbs_element and not wbs_matches(wbs_element, str(row.get("WBSElement") or "")):
+                continue
             schedule = expanded_rows(row, "to_ScheduleLine")
             ordered = float(row.get("OrderQuantity") or 0)
-            delivered = sum(
-                float(s.get("ScheduleLineDeliveredQty") or 0) for s in schedule
-            )
+            delivered = sum(float(s.get("ScheduleLineDeliveredQty") or 0) for s in schedule)
             requested = _weighted_date(schedule, "ScheduleLineDeliveryDate")
-            confirmed = _weighted_date(schedule, "PurchaseOrderConfirmedDelivDate") or requested
+            # `or requested` KALDIRILDI: teyit yoksa None kalir. Bkz. V4 yolu.
+            confirmed = _weighted_date(schedule, "PurchaseOrderConfirmedDelivDate")
             if delivered <= 0:
                 status = "open"
             elif delivered < ordered:
@@ -2140,9 +2340,7 @@ class ODataSAPBackend(SAPBackend):
                     goods_receipt_required=_sap_bool(
                         row.get("GoodsReceiptIsExpected"), default=True
                     ),
-                    invoice_receipt_required=_sap_bool(
-                        row.get("InvoiceIsExpected"), default=True
-                    ),
+                    invoice_receipt_required=_sap_bool(row.get("InvoiceIsExpected"), default=True),
                     deletion_indicator=bool(
                         str(row.get("PurchasingDocumentDeletionCode") or "").strip()
                     ),
@@ -2208,7 +2406,14 @@ class ODataSAPBackend(SAPBackend):
         for row in rows:
             header = (expanded_rows(row, "to_MaterialDocumentHeader") or [{}])[0]
             movement = str(row.get("GoodsMovementType") or "")
+            # SAP bir iptalde IKI satir birakir: asil 101
+            # (`GoodsMovementIsCancelled=true`) ve onu iptal eden 102 ters
+            # kaydi (`ReversedMaterialDocument` asil belgeyi gosterir).
+            # Ikisini de "ters kayit" sayip eksi yazmak miktari IKI KEZ
+            # dusururdu; asil satir arti, ters kayit eksi olmali.
             cancelled = _sap_bool(row.get("GoodsMovementIsCancelled"))
+            reverses = str(row.get("ReversedMaterialDocument") or "")
+            is_reversal = bool(reverses) or movement in {"102", "122", "162"}
             out.append(
                 GoodsReceipt(
                     material_document=str(row.get("MaterialDocument") or ""),
@@ -2225,7 +2430,9 @@ class ODataSAPBackend(SAPBackend):
                     po_id=str(row.get("PurchaseOrder") or ""),
                     po_item=str(row.get("PurchaseOrderItem") or ""),
                     batch=str(row.get("Batch") or ""),
-                    reversed=cancelled or movement in {"102", "122", "162"},
+                    reversed=is_reversal,
+                    cancelled=cancelled,
+                    reverses_document=reverses,
                 )
             )
         return out
@@ -2245,6 +2452,9 @@ class ODataSAPBackend(SAPBackend):
         Bu nedenle `po_id` verildiginde once ilgili kalem anahtarlari, sonra tum
         basliklar tek OR filtresiyle okunur; kalem basina N+1 yapilmaz.
         """
+        invoice_id = invoice_id.strip()
+        po_id = po_id.strip()
+        vendor_id = vendor_id.strip()
         service = service_path("supplier_invoice")
         preselected_items: list[dict[str, Any]] = []
         header_keys: list[tuple[str, str]] = []
@@ -2262,6 +2472,17 @@ class ODataSAPBackend(SAPBackend):
                     "$top": min(max(20, limit * 10), 500),
                 },
             )
+            # API Business Hub sandbox'i (ve bazi hatali Gateway
+            # yapilandirmalari) HTTP 200 dondururken `$filter` ifadesini yok
+            # sayabiliyor. Sunucu filtresi bir performans optimizasyonudur;
+            # dogruluk siniri degildir. Istemci tarafinda yeniden eslemezsek
+            # baska siparislerin faturalarini sorulan PO'ya aitmis gibi
+            # gosterebiliriz.
+            preselected_items = [
+                row
+                for row in preselected_items
+                if str(row.get("PurchaseOrder") or "").strip() == po_id
+            ]
             header_keys = list(
                 dict.fromkeys(
                     (
@@ -2278,11 +2499,7 @@ class ODataSAPBackend(SAPBackend):
         filters: list[str] = []
         if header_keys:
             key_filter = " or ".join(
-                "(SupplierInvoice eq '"
-                + quote(inv)
-                + "' and FiscalYear eq '"
-                + quote(year)
-                + "')"
+                "(SupplierInvoice eq '" + quote(inv) + "' and FiscalYear eq '" + quote(year) + "')"
                 for inv, year in header_keys
             )
             filters.append(f"({key_filter})")
@@ -2303,6 +2520,39 @@ class ODataSAPBackend(SAPBackend):
                 "$top": min(max(1, limit), 200),
             },
         )
+
+        # Baslik sorgusunu da fail-closed dogrula. Ilk kalem filtresini
+        # dogrulamak tek basina yetmez: sandbox ikinci `$filter`i de yok
+        # sayarsa ilgisiz basliklar yeniden sonuca karisabilir.
+        allowed_headers = set(header_keys)
+        if allowed_headers:
+            rows = [
+                row
+                for row in rows
+                if (
+                    str(row.get("SupplierInvoice") or "").strip(),
+                    str(row.get("FiscalYear") or "").strip(),
+                )
+                in allowed_headers
+            ]
+        if invoice_id:
+            rows = [
+                row
+                for row in rows
+                if str(row.get("SupplierInvoice") or "").strip() == invoice_id
+            ]
+        if vendor_id:
+            rows = [
+                row
+                for row in rows
+                if str(row.get("InvoicingParty") or "").strip() == vendor_id
+            ]
+        if only_blocked:
+            rows = [
+                row
+                for row in rows
+                if str(row.get("PaymentBlockingReason") or "").strip()
+            ]
 
         item_by_header: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for item in preselected_items:
@@ -2342,15 +2592,23 @@ class ODataSAPBackend(SAPBackend):
             due_date = due_base + timedelta(days=net_days) if due_base else None
             blocks = []
             if payment_block:
+                # Blokaj NEDENI bu API'dan okunamaz; yalniz ZLSPR anahtari gelir.
+                # Anahtari `tolerance_key`e yazip nedeni "manual" demek iki ayri
+                # hataydi: (1) ZLSPR anahtari OMR6 tolerans anahtari degildir,
+                # (2) 'R' otomatik fatura dogrulama blokajidir, elle konmus
+                # degildir - "manual" etiketi kullaniciyi yanlis islemin
+                # ustune yolluyordu.
                 blocks.append(
                     InvoiceBlock(
                         invoice_id=inv_id,
-                        block_reason="manual",
-                        tolerance_key=payment_block,
+                        block_reason="unknown",
+                        payment_block_key=payment_block,
                         currency=str(row.get("DocumentCurrency") or ""),
                         description=(
-                            "Released Supplier Invoice API yalniz blokaj anahtarini yayinlar; "
-                            "OMR6 tolerans degerleri bu kaynaktan okunamadi."
+                            f"Odeme blokaj anahtari '{payment_block}' (RBKP-ZLSPR). "
+                            "Released Supplier Invoice API blokaj nedenini ve OMR6 "
+                            "tolerans degerlerini yayinlamiyor; neden bu kaynaktan "
+                            "belirlenemez."
                         ),
                     )
                 )
@@ -2439,25 +2697,27 @@ class ODataSAPBackend(SAPBackend):
             return []
 
         nodes: list[DocumentFlowNode] = []
-        for po_id in sorted(po_ids):
-            items = known_items.get(po_id) or self.get_purchase_order_items(po_id)
-            receipts = self.get_goods_receipts(po_id=po_id, limit=200)
-            invoices = self.get_supplier_invoices(po_id=po_id, limit=200)
-            requisitions = sorted(
-                {
-                    (str(item.get("PurchaseRequisition")), str(item.get("PurchaseRequisitionItem") or ""))
-                    for item in self.v2.read(
-                        service_path("purchase_order_v2"),
-                        "A_PurchaseOrderItem",
-                        params={
-                            "$filter": f"PurchaseOrder eq '{quote(po_id)}'",
-                            "$select": "PurchaseOrderItem,PurchaseRequisition,PurchaseRequisitionItem",
-                            "$top": 500,
-                        },
-                    )
-                    if item.get("PurchaseRequisition")
-                }
+        # Bir PR birden cok siparise donusebilir. Eskiden her siparis icin dort
+        # okuma SIRAYLA yapiliyordu: 8 siparislik bir zincir 32 ardisik SAP
+        # gidis-donusu demekti ve tur suresi neredeyse tamamen bu bekleme idi.
+        # Siparisler birbirinden bagimsiz oldugu icin okumalar paralellestirilir;
+        # sira `sorted(po_ids)` ile korunur, yani cikti degismez.
+        ordered_po_ids = sorted(po_ids)[:_MAX_FLOW_PURCHASE_ORDERS]
+        if len(po_ids) > _MAX_FLOW_PURCHASE_ORDERS:
+            log.info(
+                "Belge akisi %d siparise dagiliyor; ilk %d tanesi izlendi.",
+                len(po_ids),
+                _MAX_FLOW_PURCHASE_ORDERS,
             )
+
+        per_po = gather_reads(
+            [partial(self._flow_reads_for, po_id, known_items) for po_id in ordered_po_ids],
+            max_workers=_FLOW_FANOUT,
+        )
+
+        for po_id, (items, receipts, invoices, requisitions) in zip(
+            ordered_po_ids, per_po, strict=True
+        ):
             for pr_id, pr_item in requisitions:
                 nodes.append(
                     DocumentFlowNode(
@@ -2517,75 +2777,50 @@ class ODataSAPBackend(SAPBackend):
                 )
         return nodes
 
-    # --- Kontrolling --------------------------------------------------------
-    def get_project_costs(
-        self, *, wbs_element: str | None = None, fiscal_year: int | None = None
-    ) -> list[ProjectCost]:
-        capability = CAPABILITY_MANIFEST["project_cost"]
-        filters: list[str] = []
-        if wbs_element:
-            filters.append(f"startswith(WBSElement,'{quote(wbs_element)}')")
-        if fiscal_year:
-            filters.append(f"FiscalYear eq '{_number_literal(fiscal_year)}'")
-        try:
-            rows = self.v2.read(
-                capability.service_path,
-                "ProjectCostSet",
-                params={"$filter": " and ".join(filters) if filters else None, "$top": 200},
-            )
-        except SAPError as exc:
-            raise SAPNotSupported(
-                "project_costs",
-                backend=self.name,
-                hint=(
-                    "S/4HANA'da released bir proje maliyet OData servisi yoktur. Clean Core "
-                    "uyumlu bir released CDS/RAP Tier 2 API yayinlanmali (beklenen yol: "
-                    f"{capability.service_path}/ProjectCostSet). SAP hatasi: {exc}"
-                ),
-            ) from exc
+    def _flow_reads_for(
+        self, po_id: str, known_items: dict[str, list[PurchaseOrderItem]]
+    ) -> tuple[
+        list[PurchaseOrderItem], list[GoodsReceipt], list[SupplierInvoice], list[tuple[str, str]]
+    ]:
+        """Tek siparisin akis okumalari; kendi icinde de paralel.
 
-        if not rows:
-            # `ODataV2Client.read` 404'u yutup bos liste dondurur. Bu, VAR OLAN
-            # bir servisin bos sonucu icin dogru davranistir; ama servis hic
-            # yayinlanmamissa ayni bos liste "bu projenin maliyeti yok" gibi
-            # okunur. Ikisi ayni sey degildir: biri veri yoklugu, digeri
-            # yetenek yoklugudur. Ayirmak icin sozlesme dogrulanir.
-            try:
-                contract = self.metadata_contract("project_cost")
-            except SAPError as exc:
-                raise SAPNotSupported(
-                    "project_costs",
-                    backend=self.name,
-                    hint=(
-                        f"{capability.service_path} okunamadi; servis SICF'te aktif "
-                        "olmayabilir. S/4HANA'da released bir proje maliyet OData "
-                        "servisi yoktur; Clean Core uyumlu bir Tier 2 API yayinlanmali. "
-                        f"SAP hatasi: {exc}"
-                    ),
-                ) from exc
-            if not contract.has_set("ProjectCostSet"):
-                raise SAPNotSupported(
-                    "project_costs",
-                    backend=self.name,
-                    hint=(
-                        f"{capability.service_path} yayinda ama ProjectCostSet entity "
-                        "set'i yok. Kontrati sap_discover_capabilities ile dogrulayin."
-                    ),
+        Dort okuma birbirinden bagimsizdir: kalemler, mal kabuller, faturalar ve
+        PR bagi. Disaridaki siparis dagitimiyla birlikte iki kademeli bir
+        yayilim olusur, ama toplam is parcaci sayisi her iki kademede de
+        sinirlidir (`_FLOW_FANOUT`).
+        """
+        cached = known_items.get(po_id)
+        results = gather_reads(
+            [
+                (lambda: cached) if cached else partial(self.get_purchase_order_items, po_id),
+                partial(self.get_goods_receipts, po_id=po_id, limit=200),
+                partial(self.get_supplier_invoices, po_id=po_id, limit=200),
+                partial(self._flow_requisition_links, po_id),
+            ],
+            max_workers=_FLOW_FANOUT,
+        )
+        return results[0], results[1], results[2], results[3]
+
+    def _flow_requisition_links(self, po_id: str) -> list[tuple[str, str]]:
+        """Siparisin geldigi PR kalemleri (EKPO-BANFN/BNFPO)."""
+        return sorted(
+            {
+                (
+                    str(item.get("PurchaseRequisition")),
+                    str(item.get("PurchaseRequisitionItem") or ""),
                 )
-
-        return [
-            ProjectCost(
-                wbs_element=r.get("WBSElement", ""),
-                description=r.get("WBSElementDescription", ""),
-                plan_cost=float(r.get("PlanCost") or 0),
-                actual_cost=float(r.get("ActualCost") or 0),
-                commitment=float(r.get("Commitment") or 0),
-                currency=r.get("Currency") or self.settings.sap.currency,
-                fiscal_year=int(r.get("FiscalYear") or 0),
-                completion_pct=float(r.get("CompletionPercent") or 0),
-            )
-            for r in rows
-        ]
+                for item in self.v2.read(
+                    service_path("purchase_order_v2"),
+                    "A_PurchaseOrderItem",
+                    params={
+                        "$filter": f"PurchaseOrder eq '{quote(po_id)}'",
+                        "$select": "PurchaseOrderItem,PurchaseRequisition,PurchaseRequisitionItem",
+                        "$top": 500,
+                    },
+                )
+                if item.get("PurchaseRequisition")
+            }
+        )
 
     def ping(self) -> dict[str, str]:
         try:
@@ -2683,9 +2918,7 @@ def _sap_bool(value: Any, *, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "x", "yes", "evet"}
 
 
-def _supplier_invoice_status(
-    row: dict[str, Any], payment_block: str
-) -> str:
+def _supplier_invoice_status(row: dict[str, Any], payment_block: str) -> str:
     """Released API durum alanlarini muhafazakar domain durumuna cevirir.
 
     Kod degerleri surume gore degisebildigi icin bilinmeyen tek harf/rakamlar

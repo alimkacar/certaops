@@ -84,6 +84,9 @@ def build(settings_factory, tmp_path, routes=None, create=None, metadata_sets=No
         "sap.username": "svc", "sap.password": "pw", "sap.plant": "1100",
         "sap.purch_org": "1000", "sap.purch_group": "R01",
         "sap.company_code": "1000", "sap.currency": "EUR",
+        # Bu modul OData write protokolu regresyonlarini da sinar; urun
+        # varsayilani olan read-only ayri guvenlik testlerindedir.
+        "sap.read_only": False,
         "security.allowed_sap_hosts": ("s4.test",),
     }
     base.update(overrides)
@@ -338,21 +341,6 @@ def test_allowlist_varsa_base_url_muaf_degildir():
 
 
 # --- 7. Sayisal filtre enjeksiyonu -----------------------------------------
-def test_sayisal_filtre_enjeksiyonu_reddedilir(settings_factory, tmp_path):
-    backend, _ = build(settings_factory, tmp_path, routes=BASE_ROUTES)
-    with pytest.raises(SAPError, match="INVALID_FILTER_VALUE|gecersiz"):
-        backend.check_atp("MAT-1", quantity="1 or 1 eq 1")  # type: ignore[arg-type]
-
-
-# --- 8. Yazma sekli okumadan turetilir --------------------------------------
-_PR_META_CHILD = (
-    "PurchaseRequisition:PurchaseRequisition,PurchaseRequisitionType|"
-    "PurchaseRequisitionItem:PurchaseRequisition,PurchaseRequisitionItem,Material,"
-    "Plant,RequestedQuantity,DeliveryDate,PurchaseRequisitionPrice,"
-    "AccountAssignmentCategory"
-)
-
-
 def _edmx(spec: str, navigations: dict[str, list[tuple[str, str]]] | None = None) -> str:
     """`Set:alan,alan|Set:alan` bicimini EDMX'e cevirir."""
     navigations = navigations or {}
@@ -395,6 +383,7 @@ def _build_with_metadata(settings_factory, tmp_path, edmx):
             "sap.username": "svc", "sap.password": "pw", "sap.plant": "1100",
             "sap.purch_org": "1000", "sap.purch_group": "R01",
             "sap.company_code": "1000", "sap.currency": "EUR",
+            "sap.read_only": False,
             "security.allowed_sap_hosts": ("s4.test",),
         },
     )
@@ -408,6 +397,15 @@ def _build_with_metadata(settings_factory, tmp_path, edmx):
     finally:
         mod.build_http_client = original
     return backend, fake
+
+
+# --- 8. Yazma sekli okumadan turetilir --------------------------------------
+_PR_META_CHILD = (
+    "PurchaseRequisition:PurchaseRequisition,PurchaseRequisitionType|"
+    "PurchaseRequisitionItem:PurchaseRequisition,PurchaseRequisitionItem,Material,"
+    "Plant,RequestedQuantity,DeliveryDate,PurchaseRequisitionPrice,"
+    "AccountAssignmentCategory"
+)
 
 
 def test_sozlesme_alt_entity_diyorsa_alt_entity_gonderilir(settings_factory, tmp_path):

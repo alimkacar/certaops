@@ -1,0 +1,226 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Ephemeral, no-ingress EC2 host for SAP ABAP Cloud Developer Trial 2025.
+  The instance terminates itself after a bounded test window and deletes its root disk.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+  InstanceType:
+    Type: String
+    Default: r6i.xlarge
+    AllowedValues:
+      - r6i.xlarge
+      - r6i.2xlarge
+  RootVolumeGiB:
+    Type: Number
+    Default: 200
+    MinValue: 180
+    MaxValue: 250
+  AutoTerminateHours:
+    Type: Number
+    Default: 6
+    MinValue: 2
+    MaxValue: 8
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+  TrialSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Outbound-only security group for ABAP Trial; access is through SSM
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: certaops-abap-trial
+        - Key: Project
+          Value: CertaOps
+        - Key: Environment
+          Value: ephemeral-test
+
+  TrialRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub certaops-abap-trial-ec2-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Project
+          Value: CertaOps
+        - Key: Environment
+          Value: ephemeral-test
+
+  TrialInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub certaops-abap-trial-ec2-${AWS::Region}
+      Roles:
+        - !Ref TrialRole
+
+  TrialInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref TrialInstanceProfile
+      InstanceInitiatedShutdownBehavior: terminate
+      Monitoring: false
+      PropagateTagsToVolumeOnCreation: true
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeleteOnTermination: true
+          DeviceIndex: "0"
+          GroupSet:
+            - !Ref TrialSecurityGroup
+          SubnetId: !Ref SubnetId
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            Iops: 3000
+            Throughput: 125
+            VolumeSize: !Ref RootVolumeGiB
+            VolumeType: gp3
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 1
+        HttpTokens: required
+      Tags:
+        - Key: Name
+          Value: certaops-abap-trial
+        - Key: Project
+          Value: CertaOps
+        - Key: Environment
+          Value: ephemeral-test
+        - Key: CostGuard
+          Value: !Sub terminate-after-${AutoTerminateHours}h
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+
+            AUTO_TERMINATE_HOURS=${AutoTerminateHours}
+
+            dnf install -y docker
+            systemctl enable --now docker
+            systemctl enable --now amazon-ssm-agent
+            usermod -aG docker ec2-user
+
+            install -d -m 0755 /opt/certaops
+            cat > /opt/certaops/start-abap-trial.sh <<'SCRIPT'
+            #!/bin/bash
+            set -euo pipefail
+
+            IMAGE="sapse/abap-cloud-developer-trial:2025"
+            SAP_DEVELOPER_LICENSE_ACCEPTED="$(printenv SAP_DEVELOPER_LICENSE_ACCEPTED || true)"
+            SAP_SKIP_LIMITS_CHECK="$(printenv SAP_SKIP_LIMITS_CHECK || true)"
+
+            if [ "$SAP_DEVELOPER_LICENSE_ACCEPTED" != "YES" ]; then
+              echo "Refusing to start: set SAP_DEVELOPER_LICENSE_ACCEPTED=YES after reading the SAP Developer License."
+              exit 2
+            fi
+            if docker container inspect a4h >/dev/null 2>&1; then
+              echo "Container a4h already exists; refusing to replace persistent SAP data."
+              exit 3
+            fi
+            if [ ! -f /root/.docker/config.json ]; then
+              echo "Docker Hub login is required first: sudo docker login"
+              exit 4
+            fi
+
+            docker pull "$IMAGE"
+
+            EXTRA_IMAGE_ARG=""
+            if [ "$SAP_SKIP_LIMITS_CHECK" = "YES" ]; then
+              EXTRA_IMAGE_ARG="-skip-limits-check"
+            fi
+
+            docker run -d \
+              --name a4h \
+              --hostname vhcala4hci \
+              --stop-timeout 3600 \
+              --cpus 4 \
+              --memory 28g \
+              --shm-size 24g \
+              --ulimit nofile=1048576:1048576 \
+              --sysctl kernel.shmmax=21474836480 \
+              --sysctl kernel.shmmni=32768 \
+              --sysctl kernel.shmall=5242880 \
+              --sysctl kernel.msgmni=1024 \
+              --sysctl 'kernel.sem=1250 256000 100 8192' \
+              -p 127.0.0.1:50000:50000 \
+              -p 127.0.0.1:50001:50001 \
+              "$IMAGE" -agree-to-sap-license $EXTRA_IMAGE_ARG
+
+            echo "ABAP Trial started. Follow startup with: sudo docker logs -f a4h"
+            SCRIPT
+            chmod 0750 /opt/certaops/start-abap-trial.sh
+
+            cat > /etc/systemd/system/certaops-abap-graceful-stop.service <<'UNIT'
+            [Unit]
+            Description=Gracefully stop SAP HANA before EC2 shutdown
+            Requires=docker.service
+            After=docker.service
+
+            [Service]
+            Type=oneshot
+            RemainAfterExit=yes
+            ExecStart=/usr/bin/true
+            ExecStop=/bin/bash -c '/usr/bin/docker container inspect a4h >/dev/null 2>&1 && /usr/bin/docker stop -t 3600 a4h || true'
+            TimeoutStopSec=3700
+
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+            systemctl daemon-reload
+            systemctl enable --now certaops-abap-graceful-stop.service
+
+            systemd-run \
+              --unit=certaops-auto-terminate \
+              --description="Terminate ephemeral ABAP Trial EC2 host" \
+              --on-active="$AUTO_TERMINATE_HOURS hours" \
+              /usr/bin/systemctl poweroff
+
+            cat > /opt/certaops/README.txt <<EOF
+            CertaOps ABAP Trial host is ready.
+            Auto-termination window: $AUTO_TERMINATE_HOURS hours from first boot.
+            No inbound ports are open. Use AWS Systems Manager Session Manager.
+            1) sudo docker login
+            2) Read the SAP Developer License.
+            3) sudo env SAP_DEVELOPER_LICENSE_ACCEPTED=YES /opt/certaops/start-abap-trial.sh
+            EOF
+
+Outputs:
+  InstanceId:
+    Description: EC2 instance used as the SSM target
+    Value: !Ref TrialInstance
+  PublicIp:
+    Description: Public IP used only for outbound Internet access; no inbound rules exist
+    Value: !GetAtt TrialInstance.PublicIp
+  AutoTermination:
+    Description: Instance-initiated shutdown terminates the instance and deletes its root volume
+    Value: !Sub "${AutoTerminateHours} hours"
+  ODataTunnelCommand:
+    Description: Start this locally after the ABAP container is healthy
+    Value: !Sub >-
+      aws ssm start-session --region ${AWS::Region} --target ${TrialInstance}
+      --document-name AWS-StartPortForwardingSession
+      --parameters portNumber=50001,localPortNumber=50001

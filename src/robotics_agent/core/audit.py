@@ -15,6 +15,10 @@ Zincir basi SQLite'ta tutulur ve `BEGIN IMMEDIATE` altinda guncellenir; boylece
 birden fazla worker/process ayni anda yazsa da sira ve `prev_hash` tutarli kalir.
 `threading.Lock` bu garantiyi veremezdi.
 
+`AGENT_AUDIT_ENCRYPTION=true` iken SQLite `body_json` ve JSONL mirror kaydinin
+tamami AES-256-GCM ile diske yazilmadan once sifrelenir. Uretim profili bu
+bayragi zorunlu tutar; eski duz metin satirlar geriye donuk okunabilir.
+
 Loglara prompt veya ham SAP payload'i yazilmaz; hassas alanlar redakte edilir,
 buyuk govdeler hash + boyut olarak saklanir.
 """
@@ -32,6 +36,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from ..contracts import ActorContext, ExecutionContext
+from ..security_at_rest import decrypt_if_needed
 from .store import StateDatabase, get_state_db
 
 log = logging.getLogger(__name__)
@@ -149,7 +154,8 @@ class AuditLedger:
     """SQLite destekli, process-safe hash zinciri.
 
     `mirror_path` verilirse kayitlar ayrica JSONL olarak da yazilir (dis log
-    toplayicilar icin). Zincirin dogruluk kaynagi veritabanidir.
+    toplayicilar icin). Cipher etkinse mirror satirinin tamami sifrelenir.
+    Zincirin dogruluk kaynagi veritabanidir.
 
     `checkpoint_exporter` verilirse zincir basinin ozeti duzenli araliklarla
     harici bir append-only hedefe yazilir (bkz. `FileCheckpointExporter`).
@@ -160,10 +166,15 @@ class AuditLedger:
         db: StateDatabase,
         *,
         mirror_path: Path | str | None = None,
+        cipher: Any = None,
         checkpoint_exporter: CheckpointExporter | None = None,
         checkpoint_every: int = 0,
     ) -> None:
         self._db = db
+        # AES-GCM zarfi body_json'i ve mirror satirinin tamamini diske
+        # yazilmadan once korur. `None` gelistirme uyumlulugudur; uretim
+        # kapisi audit sifrelemesini zorunlu tutar.
+        self._cipher = cipher
         self.mirror_path = Path(mirror_path) if mirror_path else None
         if self.mirror_path is not None:
             self.mirror_path.parent.mkdir(parents=True, exist_ok=True)
@@ -254,6 +265,9 @@ class AuditLedger:
                 **body,
             }
             entry_hash = hashlib.sha256(canonical_json(skeleton).encode("utf-8")).hexdigest()
+            body_json = json.dumps(body, ensure_ascii=False, default=str)
+            if self._cipher is not None:
+                body_json = self._cipher.encrypt(body_json)
             conn.execute(
                 """
                 INSERT INTO audit_entries (seq, entry_hash, prev_hash, recorded_at, event,
@@ -263,7 +277,7 @@ class AuditLedger:
                 (
                     seq, entry_hash, prev_hash, recorded_at, event, execution_id,
                     correlation_id, tenant, tool, outcome,
-                    json.dumps(body, ensure_ascii=False, default=str),
+                    body_json,
                 ),
             )
 
@@ -285,14 +299,18 @@ class AuditLedger:
 
     def _mirror(self, row: dict[str, Any]) -> None:
         try:
+            stored: Any = row
+            if self._cipher is not None:
+                plaintext = json.dumps(row, ensure_ascii=False, default=str)
+                stored = {"encrypted_record": self._cipher.encrypt(plaintext)}
             with self.mirror_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+                handle.write(json.dumps(stored, ensure_ascii=False, default=str) + "\n")
         except OSError as exc:  # pragma: no cover - dosya sistemi hatasi
             log.warning("Audit mirror yazilamadi: %s", exc)
 
     # --- Okuma / dogrulama --------------------------------------------------
-    @staticmethod
-    def _row_to_dict(row: Any) -> dict[str, Any]:
+    def _row_to_dict(self, row: Any) -> dict[str, Any]:
+        body_json = decrypt_if_needed(self._cipher, row["body_json"] or "{}")
         return {
             "seq": int(row["seq"]),
             "entry_hash": row["entry_hash"],
@@ -301,7 +319,7 @@ class AuditLedger:
             "event": row["event"],
             "execution_id": row["execution_id"],
             "correlation_id": row["correlation_id"],
-            **json.loads(row["body_json"] or "{}"),
+            **json.loads(body_json),
         }
 
     def chain(self, execution_id: str) -> list[dict[str, Any]]:
@@ -484,11 +502,15 @@ def get_audit_ledger(
     db_path: Path | str,
     *,
     mirror_path: Path | str | None = None,
+    cipher: Any = None,
     checkpoint_path: Path | str | None = None,
     checkpoint_every: int = 0,
 ) -> AuditLedger:
     """Ayni durum veritabani icin tek defter ornegi."""
-    key = str(db_path)
+    # Ayni DB bir surecte sifreli ve sifresiz iki farkli ledger nesnesiyle
+    # acilmamali. Bayragi cache anahtarina katmak, yapilandirma reload'unda
+    # eski sifresiz nesnenin sessizce yeniden kullanilmasini engeller.
+    key = f"{db_path}|encrypted={cipher is not None}"
     with _LEDGER_LOCK:
         ledger = _LEDGER_CACHE.get(key)
         if ledger is None:
@@ -496,6 +518,7 @@ def get_audit_ledger(
             ledger = AuditLedger(
                 get_state_db(db_path),
                 mirror_path=mirror_path,
+                cipher=cipher,
                 checkpoint_exporter=exporter,
                 checkpoint_every=checkpoint_every,
             )

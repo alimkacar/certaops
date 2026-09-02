@@ -45,11 +45,32 @@ from robotics_agent.core import approval_payload_for  # noqa: E402
 
 
 def make_settings(tmp_path: Path) -> Settings:
-    """Izole durum dizini: eval gercek `state/` dizinine dokunmaz."""
+    """Tam izole read-only eval profili.
+
+    Gelistiricinin ``.env`` dosyasindaki canli backend, organizasyon veya
+    kill-switch degerleri deterministik eval sonucunu degistiremez. Gelecek
+    write protokolu ayrica ``make_write_settings`` ile acilir.
+    """
     settings = Settings()
+    object.__setattr__(settings.sap, "backend", "mock")
+    object.__setattr__(settings.sap, "read_only", True)
+    object.__setattr__(settings.sap, "dry_run", True)
+    object.__setattr__(settings.sap, "company_code", "1000")
+    object.__setattr__(settings.sap, "plant", "1100")
+    object.__setattr__(settings.sap, "purch_org", "1000")
+    object.__setattr__(settings.security, "allowed_sap_hosts", ())
+    object.__setattr__(settings.security, "disabled_tools", ())
     object.__setattr__(settings, "output_dir", tmp_path / "out")
     object.__setattr__(settings.state, "dir", tmp_path / "state")
     settings.ensure_dirs()
+    return settings
+
+
+def make_write_settings(tmp_path: Path) -> Settings:
+    """Yalniz gelecekteki write protokolunun regresyon eval'i icin profil."""
+    settings = make_settings(tmp_path)
+    object.__setattr__(settings.sap, "read_only", False)
+    object.__setattr__(settings.sap, "dry_run", False)
     return settings
 
 
@@ -95,8 +116,8 @@ def build_report(tmp_path: Path) -> EvalReport:
     run_unauthorized(report, make_settings(tmp_path / "unauth"))
     run_tenant_boundary(report, make_settings(tmp_path / "tenant"))
     run_missing_parameter(report, make_settings(tmp_path / "param"))
-    run_write_flow(report, make_settings(tmp_path / "write"), grant_approval)
-    run_duplicate_write(report, make_settings(tmp_path / "dup"), grant_approval)
+    run_write_flow(report, make_write_settings(tmp_path / "write"), grant_approval)
+    run_duplicate_write(report, make_write_settings(tmp_path / "dup"), grant_approval)
     run_result_reduction(
         report, lambda base, **kw: _sized_settings(base, **kw), tmp_path / "reduction"
     )

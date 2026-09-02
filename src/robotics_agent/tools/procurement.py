@@ -16,6 +16,8 @@ from typing import Any
 
 from ..adapters.bpa import ApprovalRequest
 from ..adapters.sap import SAPNotSupported
+from ..adapters.sap.concurrency import gather_named
+from ..cache import CachePolicy
 from ..contracts import (
     DETAIL_SCHEMA,
     SCOPE_PR_APPROVE,
@@ -28,12 +30,44 @@ from ..contracts import (
     resolve_detail,
 )
 from ..core import Verification, approval_payload_for, payload_hash
+from ..privacy import DataClass
 from ..sap.models import PurchaseRequisitionItem, ValidationFinding
-from .registry import PerformanceBudget, ToolContext, tool
+from .registry import REGISTRY, PerformanceBudget, ToolContext, tool
+
+#: `SAPNotSupported` bir thread icinde yakalanip disariya TASINIR; None
+#: donmek "servis var ama veri yok" ile karisirdi.
+_NOT_SUPPORTED = object()
+
+#: Ana veri (malzeme karti, siniflandirma, degerleme) saatler icinde degisir;
+#: ayni turda tekrar sorulan malzeme SAP'yi 10 kez daha yormaz.
+_MASTER_DATA_CACHE = CachePolicy(
+    ttl_seconds=300,
+    vary_by=("tenant", "subject", "company_code", "plant"),
+    max_class=DataClass.D2,
+    subject_bound=True,
+    invalidated_by=("material_id",),
+)
+
+#: Stok ve acik siparis dakikalar icinde degisir. TTL bilerek kisa: amac
+#: ayni tur icindeki tekrar cagrilari onlemek, veriyi bayatlatmak degil.
+_OPERATIONAL_CACHE = CachePolicy(
+    ttl_seconds=30,
+    vary_by=("tenant", "subject", "company_code", "plant", "purchasing_org"),
+    max_class=DataClass.D2,
+    subject_bound=True,
+    invalidated_by=("material_id", "po_id"),
+)
 
 # Incoterm bazli tahmini ek lojistik/gumruk yuku (net fiyat uzerine oran)
-INCOTERM_LANDED_ADDER = {"EXW": 0.11, "FOB": 0.08, "FCA": 0.08, "CIF": 0.04, "CIP": 0.04,
-                         "DAP": 0.0, "DDP": 0.0}
+INCOTERM_LANDED_ADDER = {
+    "EXW": 0.11,
+    "FOB": 0.08,
+    "FCA": 0.08,
+    "CIF": 0.04,
+    "CIP": 0.04,
+    "DAP": 0.0,
+    "DDP": 0.0,
+}
 # Hatali parcanin yeniden isleme/hurda carpani (parca fiyatinin kati)
 DEFECT_COST_MULTIPLIER = 3.0
 # Yillik sermaye maliyeti - odeme vadesi avantaji hesabinda kullanilir
@@ -59,6 +93,13 @@ def _payment_days(terms: str) -> int:
     return int(digits) if digits else 0
 
 
+# SAP round-trip, sonuc boyutu ve tenant yukunu deterministik tutan sinirlar.
+_MAX_SEARCH_RESULTS = 50
+_MAX_STOCK_MATERIALS = 50
+_MAX_SCORE_VENDORS = 3
+_MAX_PR_ITEMS = 20
+
+
 # ---------------------------------------------------------------------------
 @tool(
     name="sap_search_materials",
@@ -66,6 +107,12 @@ def _payment_days(terms: str) -> int:
     domain="master_data",
     risk_tier=RiskTier.R0,
     required_scopes=(SCOPE_SAP_READ,),
+    # Butce GERCEK tavani bildirir, iyimser bir tahmini degil:
+    #   3 taban okuma (aciklama + malzeme no + urun) + karakteristik filtresi
+    #   verildiginde en fazla `_MAX_CLASSIFICATION_READS` siniflandirma okumasi.
+    # Onceki bildirim varsayilan 3'te kalmisti ve olcumde 19 cagri goruldu;
+    # bildirilmeyen maliyet CI kapisini de anlamsiz kiliyordu.
+    performance_budget=PerformanceBudget(p95_ms=8000, max_sap_calls=15, max_records=200),
     description=(
         "SAP malzeme ana verisinde (MARA/MAKT/MARC) arama yapar. Serbest metin, malzeme grubu "
         "ve siniflandirma karakteristik araliklari ile "
@@ -75,7 +122,10 @@ def _payment_days(terms: str) -> int:
     input_schema={
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "SAP malzeme ana verisinde serbest metin arama."},
+            "query": {
+                "type": "string",
+                "description": "SAP malzeme ana verisinde serbest metin arama.",
+            },
             "material_group": {
                 "type": "string",
                 "description": "SAP malzeme grubu kodu.",
@@ -85,11 +135,21 @@ def _payment_days(terms: str) -> int:
                 "description": "SAP siniflandirma karakteristikleri icin sayisal min/max araliklari.",
                 "additionalProperties": {"type": "array", "items": {"type": "number"}},
             },
-            "plant": {"type": "string", "description": "Uretim yeri kodu. Bos birakilirsa varsayilan tesis."},
-            "limit": {"type": "integer", "description": "Varsayilan 8. Genis tarama gerekiyorsa artirin.", "default": 8},
+            "plant": {
+                "type": "string",
+                "description": "Uretim yeri kodu. Bos birakilirsa varsayilan tesis.",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": _MAX_SEARCH_RESULTS,
+                "description": "Varsayilan 8; tek cagrida en fazla 50.",
+                "default": 8,
+            },
         },
         "required": [],
     },
+    cache_policy=_MASTER_DATA_CACHE,
 )
 def sap_search_materials(
     ctx: ToolContext,
@@ -99,6 +159,15 @@ def sap_search_materials(
     plant: str | None = None,
     limit: int = 8,
 ) -> dict[str, Any]:
+    try:
+        resolved_limit = int(limit)
+    except (TypeError, ValueError):
+        resolved_limit = 0
+    if not 1 <= resolved_limit <= _MAX_SEARCH_RESULTS:
+        return {
+            "error": f"limit 1-{_MAX_SEARCH_RESULTS} araliginda olmali.",
+            "denial_code": "INPUT_LIMIT_EXCEEDED",
+        }
     parsed_filters: dict[str, tuple[float, float]] | None = None
     if attribute_filters:
         parsed_filters = {}
@@ -112,7 +181,7 @@ def sap_search_materials(
         material_group=material_group,
         plant=plant,
         attribute_filters=parsed_filters,
-        limit=limit,
+        limit=resolved_limit,
     )
 
     return {
@@ -145,12 +214,17 @@ def sap_search_materials(
     domain="planning",
     risk_tier=RiskTier.R0,
     required_scopes=(SCOPE_SAP_READ,),
-    performance_budget=PerformanceBudget(p95_ms=6000, max_sap_calls=6, max_records=200),
+    # Canli API Hub yolunda en kotu normal akis 7 HTTP istegidir:
+    # stok + acik PO + MRP + urun + degerleme + bilgi kaydi + tedarikci adi.
+    # Sekizinci hak, tek bir guvenli okuma retry'i icin ayrilir. Onceki 6
+    # siniri, tedarikci kaydi bulunan malzemelerde normal 7. istegi daha
+    # sokete cikmadan SAP_CALL_BUDGET_EXCEEDED ile kesiyordu.
+    performance_budget=PerformanceBudget(p95_ms=6000, max_sap_calls=8, max_records=200),
     description=(
         "Malzemelerin STOK FOTOGRAFINI dondurur (MARD serbest stok, rezervasyon, acik siparis, "
         "emniyet stogu) ve tedarik suresine gore kaba bir en erken tarih tahmini yapar. "
-        "Bu bir ATP teyidi DEGILDIR: tarih bazli taahhut icin sap_atp_check, eksigin hangi "
-        "arz/talep elementinden dogdugu icin sap_mrp_shortage_explain kullanilmalidir. "
+        "Bu bir ATP teyidi DEGILDIR: eksigin hangi arz/talep elementinden dogdugu icin "
+        "sap_mrp_shortage_explain kullanilmalidir. "
         "Malzeme kritikligini (emniyet stogu alti, tek kaynak, uzun tedarik suresi) isaretler."
     ),
     input_schema={
@@ -158,12 +232,14 @@ def sap_search_materials(
         "properties": {
             "material_ids": {
                 "type": "array",
+                "minItems": 1,
+                "maxItems": _MAX_STOCK_MATERIALS,
                 "items": {"type": "string"},
                 "description": "Kontrol edilecek malzeme numaralari.",
             },
             "required_quantities": {
                 "type": "object",
-                "description": "Malzeme basina gerekli miktar. Ornek: {\"ROB-6AX-20-1800\": 3}",
+                "description": 'Malzeme basina gerekli miktar. Ornek: {"ROB-6AX-20-1800": 3}',
                 "additionalProperties": {"type": "number"},
             },
             "required_date": {
@@ -174,6 +250,7 @@ def sap_search_materials(
         },
         "required": ["material_ids"],
     },
+    cache_policy=_OPERATIONAL_CACHE,
 )
 def sap_stock_overview(
     ctx: ToolContext,
@@ -182,11 +259,25 @@ def sap_stock_overview(
     required_date: str | None = None,
     plant: str | None = None,
 ) -> dict[str, Any]:
+    if len(material_ids) > _MAX_STOCK_MATERIALS:
+        return {
+            "error": f"Tek cagrida en fazla {_MAX_STOCK_MATERIALS} malzeme okunabilir.",
+            "denial_code": "INPUT_LIMIT_EXCEEDED",
+        }
     required_quantities = required_quantities or {}
     need_by = _parse_date(required_date)
     today = date.today()
 
-    requested = [m for m in dict.fromkeys(material_ids) if m]
+    requested = [m for m in dict.fromkeys(material_ids) if m and str(m).strip()]
+    if not requested:
+        # Bos liste ile devam etmek, asagida "tum kalemler stoktan karsilanabilir"
+        # cevabini uretiyordu: HIC KONTROL EDILMEMIS bir kapsam icin olumlu
+        # teminat. Sifir veri, olumlu cevap degildir.
+        return {
+            "error": "Kontrol edilecek malzeme verilmedi.",
+            "denial_code": "INPUT_EMPTY",
+            "remediation": "material_ids en az bir malzeme numarasi icermeli.",
+        }
     levels = ctx.sap.get_stock(requested, plant=plant)
     masters = ctx.sap.get_materials(requested, plant=plant)
     records_by_material = ctx.sap.get_info_records_bulk(requested, plant=plant)
@@ -253,28 +344,48 @@ def sap_stock_overview(
                     "material_id": level.material_id,
                     "shortfall": shortfall,
                     "earliest_available": earliest.isoformat(),
-                    "late_by_days": (earliest - need_by).days if need_by and earliest > need_by else 0,
+                    "late_by_days": (earliest - need_by).days
+                    if need_by and earliest > need_by
+                    else 0,
                 }
             )
 
     critical_path = max(shortages, key=lambda s: s["late_by_days"], default=None)
+
+    # Olumlu teminat yalniz GERCEKTEN OKUNMUS kalemler icin verilir. Hicbir
+    # kalem okunamadiysa (hepsi ana veride yok, ya da stok servisi bos dondu)
+    # "stoktan karsilanabilir" demek, veri yoklugunu iyi habere cevirmek olurdu.
+    if not rows:
+        recommendation = (
+            "Hicbir malzeme okunamadi; stok durumu hakkinda cikarim yapilamaz. "
+            "Malzeme numaralarini ve tesisi dogrulayin."
+        )
+    elif shortages:
+        recommendation = (
+            "Eksigin kaynagi icin sap_mrp_shortage_explain calistirin; sonra "
+            "sap_compare_vendors ve sap_pr_prepare ile talep hazirlayin."
+        )
+    elif not_found:
+        recommendation = (
+            f"Okunan {len(rows)} kalem mevcut stoktan karsilanabilir gorunuyor. "
+            f"{len(not_found)} malzeme ana veride bulunamadi ve bu degerlendirmenin "
+            "DISINDA kaldi."
+        )
+    else:
+        recommendation = "Tum kalemler mevcut stoktan karsilanabilir gorunuyor."
 
     return {
         "checked_on": today.isoformat(),
         "required_date": required_date,
         "basis": "stok fotografi + tedarik suresi tahmini (ATP teyidi degil)",
         "materials": rows,
+        "requested_count": len(requested),
+        "evaluated_count": len(rows),
         "not_found": not_found,
         "shortage_count": len(shortages),
         "shortages": shortages,
         "critical_path_item": critical_path,
-        "recommendation": (
-            "Termin taahhudu vermeden once sap_atp_check ile tarih bazli teyit alin, "
-            "eksigin kaynagi icin sap_mrp_shortage_explain calistirin; sonra "
-            "sap_compare_vendors ve sap_pr_prepare ile talep hazirlayin."
-            if shortages
-            else "Tum kalemler mevcut stoktan karsilanabilir gorunuyor; taahhut icin sap_atp_check."
-        ),
+        "recommendation": recommendation,
     }
 
 
@@ -299,8 +410,15 @@ def sap_stock_overview(
         "type": "object",
         "properties": {
             "material_id": {"type": "string", "description": "Karsilastirilacak malzeme numarasi."},
-            "quantity": {"type": "number", "description": "Siparis miktari. Kademeli fiyat bunun uzerinden secilir.", "default": 1},
-            "required_date": {"type": "string", "description": "Ihtiyac tarihi (YYYY-MM-DD). Tedarik suresi yetisen tedarikciler isaretlenir."},
+            "quantity": {
+                "type": "number",
+                "description": "Siparis miktari. Kademeli fiyat bunun uzerinden secilir.",
+                "default": 1,
+            },
+            "required_date": {
+                "type": "string",
+                "description": "Ihtiyac tarihi (YYYY-MM-DD). Tedarik suresi yetisen tedarikciler isaretlenir.",
+            },
             "delay_cost_per_day": {
                 "type": "number",
                 "description": "Gecikmenin gunluk maliyeti (proje cezasi/durus). Gec teslim risk maliyetinde kullanilir. Varsayilan 0.",
@@ -338,13 +456,30 @@ def sap_compare_vendors(
         landed_adder = INCOTERM_LANDED_ADDER.get(record.incoterms.upper(), 0.05)
         logistics_cost = round(base * landed_adder, 2)
 
-        ppm = vendor.quality_ppm if vendor else 500
-        quality_cost = round(base * (ppm / 1_000_000) * DEFECT_COST_MULTIPLIER, 2)
+        # Kalite ve gecikme maliyeti YALNIZ gercek olcum varsa hesaplanir.
+        # Onceki surumde olcum yoksa ppm=500 / otd=%90 sabitleri devreye
+        # giriyordu ve bu uydurma degerler sonuca `quality_ppm` /
+        # `on_time_delivery_pct` diye gercekmis gibi yaziliyordu; TCO
+        # siralamasi da onlara gore degisiyordu. Simdi eksik olcum bileseni
+        # sifirlar ve `unmeasured` ile acikca bildirilir.
+        eksik: list[str] = []
 
-        otd = vendor.on_time_delivery_pct if vendor else 90.0
-        # Gecikme olasiligi x beklenen gecikme suresi (gecmis performanstan tahmin)
-        expected_delay_days = (1 - otd / 100) * max(7.0, record.planned_delivery_days * 0.15)
-        delay_cost = round(expected_delay_days * delay_cost_per_day, 2)
+        ppm = vendor.quality_ppm if vendor else None
+        if ppm is None:
+            eksik.append("quality_ppm")
+            quality_cost = 0.0
+        else:
+            quality_cost = round(base * (ppm / 1_000_000) * DEFECT_COST_MULTIPLIER, 2)
+
+        otd = vendor.on_time_delivery_pct if vendor else None
+        if otd is None:
+            eksik.append("on_time_delivery_pct")
+            expected_delay_days = None
+            delay_cost = 0.0
+        else:
+            # Gecikme olasiligi x beklenen gecikme suresi (gecmis performanstan)
+            expected_delay_days = (1 - otd / 100) * max(7.0, record.planned_delivery_days * 0.15)
+            delay_cost = round(expected_delay_days * delay_cost_per_day, 2)
 
         pay_days = _payment_days(record.payment_terms)
         financing_benefit = round(base * COST_OF_CAPITAL * pay_days / 365, 2)
@@ -358,7 +493,9 @@ def sap_compare_vendors(
                 f"Miktar {quantity:g} < minimum siparis miktari {record.min_order_qty:g}"
             )
         if need_by and eta > need_by:
-            warnings.append(f"Termin yetismiyor: en erken {eta.isoformat()}, ihtiyac {need_by.isoformat()}")
+            warnings.append(
+                f"Termin yetismiyor: en erken {eta.isoformat()}, ihtiyac {need_by.isoformat()}"
+            )
         if vendor and vendor.blocked:
             warnings.append("Tedarikci satinalmaya kapali (LFA1-SPERM)")
         if vendor and vendor.single_source_risk:
@@ -387,6 +524,9 @@ def sap_compare_vendors(
                 "on_time_delivery_pct": otd,
                 "quality_ppm": ppm,
                 "certifications": vendor.certifications if vendor else [],
+                # Hangi bilesenin olculmedigi kalemde kalir: TCO'yu okuyan
+                # taraf hangi maliyetin HESAPLANMADIGINI gorebilmeli.
+                "unmeasured": eksik,
                 "warnings": warnings,
                 "feasible": not warnings or all("minimum siparis" in w for w in warnings),
             }
@@ -395,9 +535,24 @@ def sap_compare_vendors(
     candidates.sort(key=lambda c: c["total_cost_of_ownership"])
     cheapest_price = min(candidates, key=lambda c: c["base_cost"])
     best_tco = candidates[0]
-    best_score = max(candidates, key=lambda c: c["vendor_score"] or 0)
+
+    # Skoru olculmemis tedarikci "en iyi skor" yarisina GIRMEZ. `or 0` ile
+    # sifir saymak, olculmemis olani en kotu gostermek demekti.
+    scored = [c for c in candidates if c["vendor_score"] is not None]
+    best_score = max(scored, key=lambda c: c["vendor_score"]) if scored else None
 
     insight = []
+    # TCO siralamasi ancak butun adaylarda ayni bilesenler hesaplandiysa
+    # karsilastirilabilir. Bir adayin kalite/gecikme maliyeti olcum
+    # yoklugundan sifirsa, o aday haksiz yere one gecer - bu acikca soylenir.
+    eksik_olan = sorted({alan for c in candidates for alan in c["unmeasured"]})
+    if eksik_olan:
+        insight.append(
+            "TCO siralamasi eksik olcumle uretildi: "
+            + ", ".join(eksik_olan)
+            + " en az bir tedarikcide SAP'ta yok. Bu tedarikcilerde ilgili maliyet "
+            "bileseni sifir alindi; siralama tam karsilastirilabilir degildir."
+        )
     if cheapest_price["vendor_id"] != best_tco["vendor_id"]:
         delta = cheapest_price["total_cost_of_ownership"] - best_tco["total_cost_of_ownership"]
         insight.append(
@@ -405,10 +560,14 @@ def sap_compare_vendors(
             f"{best_tco['vendor_name']} {delta:,.0f} {best_tco['currency']} daha avantajli "
             "(lojistik + kalite + gecikme riski dahil)."
         )
-    if best_score["vendor_id"] != best_tco["vendor_id"]:
+    if best_score is not None and best_score["vendor_id"] != best_tco["vendor_id"]:
         insight.append(
             f"En yuksek performans skoru {best_score['vendor_name']} ({best_score['vendor_score']}). "
             "Kritik/A sinifi malzemede maliyet yerine skor onceliklendirilebilir."
+        )
+    elif best_score is None:
+        insight.append(
+            "Hicbir tedarikcide degerlendirme skoru yok; secim yalniz maliyete dayaniyor."
         )
 
     return {
@@ -425,10 +584,13 @@ def sap_compare_vendors(
                 candidates[-1]["total_cost_of_ownership"] - best_tco["total_cost_of_ownership"], 2
             ),
         },
+        # Cikti duzeyinde tek bakista gorulen dogruluk bayragi. `estimated`
+        # bu projede "gercek veri gibi sunma" anlamina gelir; siralama eksik
+        # olcumle uretildiyse burada goruntu birakir.
+        "estimated": bool(eksik_olan),
+        "data_gaps": [f"SAP'ta olcum yok: {alan}" for alan in eksik_olan],
         "insights": insight,
     }
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +611,10 @@ def sap_compare_vendors(
         "properties": {
             "material_id": {"type": "string"},
             "vendor_id": {"type": "string"},
-            "wbs_element": {"type": "string", "description": "Proje WBS elemani veya on eki (or. R-2026-021)."},
+            "wbs_element": {
+                "type": "string",
+                "description": "Proje WBS elemani veya on eki (or. R-2026-021).",
+            },
             "only_open": {"type": "boolean", "default": True},
             "horizon_days": {
                 "type": "integer",
@@ -459,6 +624,7 @@ def sap_compare_vendors(
         },
         "required": [],
     },
+    cache_policy=_OPERATIONAL_CACHE,
 )
 def sap_track_purchase_orders(
     ctx: ToolContext,
@@ -478,9 +644,15 @@ def sap_track_purchase_orders(
     horizon = today + timedelta(days=horizon_days)
 
     rows: list[dict[str, Any]] = []
-    delayed_value = 0.0
-    open_value = 0.0
-    by_project: dict[str, dict[str, float]] = {}
+    # Tutarlar PARA BIRIMI BASINA toplanir. Onceki surum EUR, USD ve JPY
+    # satirlarini tek sayida toplayip sonuca sistem varsayilani para birimini
+    # etiket olarak basiyordu: kur donusumu olmadan uretilmis, yanlis oldugu
+    # etiketinden anlasilamayan bir rakam. Bu proje veri uydurmadigi icin
+    # burada da kur UYDURULMAZ; toplamlar ayrilir.
+    open_by_currency: dict[str, float] = {}
+    delayed_by_currency: dict[str, float] = {}
+    by_project: dict[str, dict[str, Any]] = {}
+    fallback_currency = ctx.settings.sap.currency
 
     for po in orders:
         delay_days = 0
@@ -501,17 +673,27 @@ def sap_track_purchase_orders(
         else:
             risk = "dusuk"
 
-        open_line_value = round(po.net_value * (po.open_qty / po.quantity), 2) if po.quantity else 0.0
-        open_value += open_line_value
-        if delay_days > 0 or overdue_days > 0:
-            delayed_value += open_line_value
+        open_line_value = (
+            round(po.net_value * (po.open_qty / po.quantity), 2) if po.quantity else 0.0
+        )
+        currency = po.currency or fallback_currency
+        is_late = delay_days > 0 or overdue_days > 0
+        open_by_currency[currency] = open_by_currency.get(currency, 0.0) + open_line_value
+        if is_late:
+            delayed_by_currency[currency] = delayed_by_currency.get(currency, 0.0) + open_line_value
 
         if po.wbs_element:
-            bucket = by_project.setdefault(po.wbs_element, {"open_value": 0.0, "delayed_value": 0.0, "po_count": 0})
-            bucket["open_value"] += open_line_value
+            bucket = by_project.setdefault(
+                po.wbs_element, {"open_value": {}, "delayed_value": {}, "po_count": 0}
+            )
+            bucket["open_value"][currency] = (
+                bucket["open_value"].get(currency, 0.0) + open_line_value
+            )
             bucket["po_count"] += 1
-            if delay_days > 0 or overdue_days > 0:
-                bucket["delayed_value"] += open_line_value
+            if is_late:
+                bucket["delayed_value"][currency] = (
+                    bucket["delayed_value"].get(currency, 0.0) + open_line_value
+                )
 
         rows.append(
             {
@@ -523,8 +705,12 @@ def sap_track_purchase_orders(
                 "delivered": po.delivered_qty,
                 "open_qty": po.open_qty,
                 "status": po.status,
-                "requested_delivery": po.requested_delivery_date.isoformat() if po.requested_delivery_date else None,
-                "confirmed_delivery": po.confirmed_delivery_date.isoformat() if po.confirmed_delivery_date else None,
+                "requested_delivery": po.requested_delivery_date.isoformat()
+                if po.requested_delivery_date
+                else None,
+                "confirmed_delivery": po.confirmed_delivery_date.isoformat()
+                if po.confirmed_delivery_date
+                else None,
                 "delay_days": delay_days,
                 "overdue_days": overdue_days,
                 "open_value": open_line_value,
@@ -538,20 +724,57 @@ def sap_track_purchase_orders(
     # Kritik siparislerin tam kaydi zaten 'orders' icinde; burada yalnizca isaret veriyoruz
     critical = [r["po_id"] for r in rows if r["risk"].startswith(("kritik", "yuksek"))]
 
-    return {
+    open_by_currency = {c: round(v, 2) for c, v in sorted(open_by_currency.items())}
+    delayed_by_currency = {c: round(v, 2) for c, v in sorted(delayed_by_currency.items())}
+    # Gecikme orani da ancak para birimi icinde anlamlidir; iki para biriminin
+    # oranini tek yuzdeye indirmek yine kur uydurmak olurdu.
+    delayed_share_by_currency = {
+        c: round(delayed_by_currency.get(c, 0.0) / total * 100, 1)
+        for c, total in open_by_currency.items()
+        if total
+    }
+
+    payload: dict[str, Any] = {
         "as_of": today.isoformat(),
         "order_count": len(rows),
-        "total_open_value": round(open_value, 2),
-        "delayed_open_value": round(delayed_value, 2),
-        "delayed_share_pct": round(delayed_value / open_value * 100, 1) if open_value else 0.0,
-        "currency": ctx.settings.sap.currency,
+        "open_value_by_currency": open_by_currency,
+        "delayed_open_value_by_currency": delayed_by_currency,
+        "delayed_share_pct_by_currency": delayed_share_by_currency,
         "orders": rows,
         "critical_order_ids": critical,
         "by_project": {
-            k: {kk: round(vv, 2) if isinstance(vv, float) else vv for kk, vv in v.items()}
-            for k, v in by_project.items()
+            k: {
+                "open_value": {c: round(v, 2) for c, v in sorted(bucket["open_value"].items())},
+                "delayed_value": {
+                    c: round(v, 2) for c, v in sorted(bucket["delayed_value"].items())
+                },
+                "po_count": bucket["po_count"],
+            }
+            for k, bucket in by_project.items()
         },
     }
+
+    if len(open_by_currency) == 1:
+        # Tek para birimi: duz alanlar geriye donuk uyumluluk icin korunur ve
+        # etiket ARTIK GERCEK para birimidir, sistem varsayilani degil.
+        only = next(iter(open_by_currency))
+        payload["currency"] = only
+        payload["total_open_value"] = open_by_currency[only]
+        payload["delayed_open_value"] = delayed_by_currency.get(only, 0.0)
+        payload["delayed_share_pct"] = delayed_share_by_currency.get(only, 0.0)
+    elif len(open_by_currency) > 1:
+        # Duz `currency`/`total_open_value` alanlari BILEREK yayinlanmaz.
+        # Bos ya da None bir deger basmak, tuketicinin "toplam sifir" ya da
+        # "para birimi bilinmiyor ama toplam gecerli" diye okumasina acik
+        # kapi birakirdi; alanin hic olmamasi tek dogru isarettir.
+        payload["mixed_currency"] = True
+        payload["note"] = (
+            "Siparisler birden fazla para biriminde ("
+            + ", ".join(open_by_currency)
+            + "). Kur donusumu YAPILMADI; tek toplam verilmedi. Toplamlar "
+            "open_value_by_currency altinda para birimi basina ayrilmistir."
+        )
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -581,6 +804,7 @@ def sap_track_purchase_orders(
         },
         "required": ["material_id"],
     },
+    cache_policy=_MASTER_DATA_CACHE,
 )
 def sap_material_360(
     ctx: ToolContext,
@@ -599,11 +823,40 @@ def sap_material_360(
     data_gaps: list[str] = []
     estimated_fields: list[str] = []
 
+    # Degerleme, siniflandirma, stok, tedarik kaynagi ve acik siparis
+    # birbirinden BAGIMSIZ okumalardir; malzeme kimligi disinda hicbiri
+    # otekinin ciktisina bagli degildir. Sirayla beklendiginde bes ayri ag
+    # gidis-donusu ust uste biniyordu. `SAPNotSupported` her okumanin kendi
+    # icinde yakalanir ki bir servisin kapali olmasi otekileri dusurmesin.
+    mid = material.material_id
+
+    def _valuation() -> Any:
+        try:
+            return ctx.sap.get_valuation(mid, plant=plant)
+        except SAPNotSupported:
+            return _NOT_SUPPORTED
+
+    def _classification() -> Any:
+        try:
+            return ctx.sap.get_material_classification(mid)
+        except SAPNotSupported:
+            return _NOT_SUPPORTED
+
+    reads = gather_named(
+        {
+            "valuation": _valuation,
+            "classification": _classification,
+            "stock": lambda: ctx.sap.get_stock([mid], plant=plant),
+            "records": lambda: ctx.sap.get_info_records(mid, plant=plant),
+            "open_orders": lambda: ctx.sap.get_purchase_orders(material_id=mid, only_open=True),
+        },
+        max_workers=ctx.settings.risk.max_parallel_reads,
+    )
+
     # --- Degerleme
-    valuation: dict[str, Any] | None = None
-    try:
-        valuation = ctx.sap.get_valuation(material.material_id, plant=plant)
-    except SAPNotSupported:
+    valuation = reads["valuation"]
+    if valuation is _NOT_SUPPORTED:
+        valuation = None
         data_gaps.append("degerleme servisi yok (fiyat okunamadi)")
     if valuation:
         price = float(valuation.get("moving_avg_price") or 0.0)
@@ -613,18 +866,17 @@ def sap_material_360(
             data_gaps.append("hareketli ortalama fiyat bulunamadi")
 
     # --- Siniflandirma
-    classification = None
-    try:
-        classification = ctx.sap.get_material_classification(material.material_id)
-    except SAPNotSupported:
+    classification = reads["classification"]
+    if classification is _NOT_SUPPORTED:
+        classification = None
         data_gaps.append("siniflandirma servisi yok (teknik karakteristikler okunamadi)")
 
     # --- Stok
-    levels = ctx.sap.get_stock([material.material_id], plant=plant)
+    levels = reads["stock"]
     level_row = levels[0] if levels else None
 
     # --- Tedarik kaynaklari
-    records = ctx.sap.get_info_records(material.material_id, plant=plant)
+    records = reads["records"]
     sources = [
         {
             "vendor_id": r.vendor_id,
@@ -639,7 +891,7 @@ def sap_material_360(
     ]
 
     # --- Nerede kullaniliyor (acik siparisler)
-    open_orders = ctx.sap.get_purchase_orders(material_id=material.material_id, only_open=True)
+    open_orders = reads["open_orders"]
     used_in = sorted({po.wbs_element for po in open_orders if po.wbs_element})
 
     data: dict[str, Any] = {
@@ -651,7 +903,8 @@ def sap_material_360(
         "plant": material.plant,
         "price": round(price, 2),
         "currency": material.currency,
-        "price_source": (valuation or {}).get("source_api") or ("bulunamadi" if not price else "master"),
+        "price_source": (valuation or {}).get("source_api")
+        or ("bulunamadi" if not price else "master"),
         "procurement_type": material.procurement_type,
         "lead_time_days": material.planned_delivery_days,
         "min_order_qty": material.min_order_qty,
@@ -674,7 +927,7 @@ def sap_material_360(
             "on_order": level_row.on_order_qty,
             "safety_stock": level_row.safety_stock,
             "below_safety_stock": level_row.below_safety_stock,
-            "note": "Stok fotografi; taahhut icin sap_atp_check.",
+            "note": "Stok fotografi; ATP teyidi degildir.",
         }
 
     if classification is not None:
@@ -737,7 +990,8 @@ def sap_material_360(
     description=(
         "Tedarikcinin fiyat, teslim, miktar, kalite ve servis skorlarini SAP operasyonel "
         "degerlendirmesinden (A_SUPPLIEROPLSCORESAV_CDS) toplar ve acik siparislerdeki gercek "
-        "termin sapmasi ile karsilastirir. SAP'ta gerceklesen veri yoksa ilgili alanlar "
+        "termin sapmasi ile karsilastirir. Tek cagrida en fazla uc tedarikciyi inceler. "
+        "SAP'ta gerceklesen veri yoksa ilgili alanlar "
         "estimated=true olarak isaretlenir; tahmin gercek veri gibi sunulmaz."
     ),
     input_schema={
@@ -745,6 +999,8 @@ def sap_material_360(
         "properties": {
             "vendor_ids": {
                 "type": "array",
+                "minItems": 1,
+                "maxItems": _MAX_SCORE_VENDORS,
                 "items": {"type": "string"},
                 "description": "Degerlendirilecek tedarikci numaralari.",
             },
@@ -752,6 +1008,7 @@ def sap_material_360(
         },
         "required": ["vendor_ids"],
     },
+    cache_policy=_OPERATIONAL_CACHE,
 )
 def sap_supplier_score_360(
     ctx: ToolContext,
@@ -760,24 +1017,37 @@ def sap_supplier_score_360(
 ) -> ToolResult | dict[str, Any]:
     if not vendor_ids:
         return {"error": "En az bir tedarikci numarasi gerekli."}
+    vendor_ids = [v for v in dict.fromkeys(vendor_ids) if v]
+    if len(vendor_ids) > _MAX_SCORE_VENDORS:
+        return {
+            "error": f"Tek cagrida en fazla {_MAX_SCORE_VENDORS} tedarikci analiz edilebilir.",
+            "denial_code": "INPUT_LIMIT_EXCEEDED",
+        }
 
     rows: list[dict[str, Any]] = []
     all_estimated: set[str] = set()
 
+    # Ana veri iki, skorlar bir toplu OData sorgusuyla gelir. Acik siparis
+    # sorgusu tedarikci basina bir kezdir; uc tedarikci siniriyla toplam SAP
+    # cagrisi bildirilen altı cagri butcesini asmaz.
+    vendors = ctx.sap.get_vendor_masters(vendor_ids)
+    try:
+        scores = ctx.sap.get_supplier_scores(vendor_ids, purchasing_org=purchasing_org)
+    except SAPNotSupported as exc:
+        scores = {}
+        score_unsupported_reason = str(exc)
+        all_estimated.add("overall_score")
+    else:
+        score_unsupported_reason = ""
+
     for vendor_id in vendor_ids:
-        vendor = ctx.sap.get_vendor_master(vendor_id)
+        vendor = vendors.get(vendor_id)
         if vendor is None:
             rows.append({"vendor_id": vendor_id, "error": "Tedarikci bulunamadi."})
             continue
 
-        try:
-            score = ctx.sap.get_supplier_score(vendor_id, purchasing_org=purchasing_org)
-        except SAPNotSupported as exc:
-            score = None
-            all_estimated.add("overall_score")
-            unsupported_reason = str(exc)
-        else:
-            unsupported_reason = ""
+        score = scores.get(vendor_id)
+        unsupported_reason = score_unsupported_reason
 
         row: dict[str, Any] = {
             "vendor_id": vendor.vendor_id,
@@ -899,14 +1169,20 @@ _PR_ITEM_SCHEMA = {
     description=(
         "Satinalma talebi TASLAGI hazirlar. SAP'a HICBIR SEY YAZMAZ. Fiyatlandirir, minimum "
         "siparis miktari / tedarik suresi / termin / hesap atamasi dogrulamasi yapar, kalem "
-        "bazli diff uretir ve onay gerekip gerekmedigini soyler. Onay gerekiyorsa onay task'i "
-        "acar ve payload hash'ini dondurur. Yazmak icin ayni argumanlarla sap_pr_submit "
-        "cagrilir; argumanlar degisirse onay gecersiz olur."
+        "bazli diff ve payload hash'i uretir. Read-only profilde onay task'i acmaz ve submit "
+        "onermez; taslak inceleme veya raporlama icin kullanilir. Gelecekte write paketi "
+        "acilirsa ayni taslak onay akisi icin temel olur."
     ),
     input_schema={
         "type": "object",
         "properties": {
-            "items": {"type": "array", "description": "Talep kalemleri.", "items": _PR_ITEM_SCHEMA},
+            "items": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": _MAX_PR_ITEMS,
+                "description": "Talep kalemleri; tek taslakta en fazla 20.",
+                "items": _PR_ITEM_SCHEMA,
+            },
             "header_text": {"type": "string", "description": "Talep basligi / gerekce."},
             "purchase_group": {"type": "string", "description": "Satinalma grubu."},
         },
@@ -921,6 +1197,11 @@ def sap_pr_prepare(
 ) -> dict[str, Any]:
     if not items:
         return {"error": "En az bir kalem gerekli."}
+    if len(items) > _MAX_PR_ITEMS:
+        return {
+            "error": f"Tek taslakta en fazla {_MAX_PR_ITEMS} kalem hazirlanabilir.",
+            "denial_code": "INPUT_LIMIT_EXCEEDED",
+        }
 
     pr_items = build_pr_items(ctx, items)
     draft = ctx.sap.prepare_purchase_requisition(
@@ -972,8 +1253,25 @@ def sap_pr_prepare(
 
     threshold = ctx.settings.sap.approval_threshold
     needs_approval = draft.total_value > threshold
-    payload["requires_human_approval"] = needs_approval
     payload["approval_threshold"] = threshold
+
+    if ctx.settings.sap.read_only:
+        payload.update(
+            {
+                "submission_enabled": False,
+                "requires_human_approval": False,
+                "approval_required_if_write_enabled": needs_approval,
+                "approval_instruction": (
+                    "Read-only urun profili etkin: onay task'i acilmadi ve SAP'a yazma "
+                    "yapilamaz. Taslagi inceleyin veya rapora aktarın."
+                ),
+                "next_step": "Taslagi inceleyin; gerekirse sap_generate_report ile yerel rapor olusturun.",
+            }
+        )
+        return payload
+
+    payload["submission_enabled"] = True
+    payload["requires_human_approval"] = needs_approval
 
     if needs_approval and ctx.approval_gateway is not None and ctx.actor is not None:
         request = ApprovalRequest(
@@ -982,8 +1280,7 @@ def sap_pr_prepare(
             tenant=ctx.actor.tenant,
             requested_by=ctx.actor.subject,
             subject_line=(
-                f"PR onayi: {len(draft.items)} kalem, "
-                f"{draft.total_value:,.2f} {draft.currency}"
+                f"PR onayi: {len(draft.items)} kalem, {draft.total_value:,.2f} {draft.currency}"
             ),
             diff=draft.diff,
             total_value=draft.total_value,
@@ -1007,8 +1304,7 @@ def sap_pr_prepare(
 
     payload["next_step"] = (
         "sap_pr_submit(items=..., header_text=..., purchase_group=..., "
-        "idempotency_key='proje:senaryo:pr:v1'"
-        + (", approval_id=...)" if needs_approval else ")")
+        "idempotency_key='proje:senaryo:pr:v1'" + (", approval_id=...)" if needs_approval else ")")
     )
     return payload
 
@@ -1028,7 +1324,9 @@ def sap_pr_prepare(
     timeout_s=120.0,
     result_token_budget=1000,
     description=(
-        "Onaylanmis satinalma talebini SAP'ta OLUSTURUR. Zorunlu protokol: taslak yeniden "
+        "GELECEK WRITE PAKETI: onaylanmis satinalma talebini SAP'ta OLUSTURUR. Varsayilan "
+        "read-only profilde modele gosterilmez ve policy tarafindan reddedilir. Acik oldugunda "
+        "zorunlu protokol: taslak yeniden "
         "hesaplanir, tutar onay kapsamina karsi dogrulanir, idempotency_key ile tek kez "
         "yazilir, sonra SAP'tan geri okunup postcondition dogrulanir. Ayni idempotency_key "
         "ikinci kez cagrildiginda yeni belge OLUSMAZ. Timeout durumunda tekrar cagirmayin; "
@@ -1037,7 +1335,13 @@ def sap_pr_prepare(
     input_schema={
         "type": "object",
         "properties": {
-            "items": {"type": "array", "description": "sap_pr_prepare ile ayni kalemler.", "items": _PR_ITEM_SCHEMA},
+            "items": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": _MAX_PR_ITEMS,
+                "description": "sap_pr_prepare ile ayni kalemler; en fazla 20.",
+                "items": _PR_ITEM_SCHEMA,
+            },
             "header_text": {"type": "string"},
             "purchase_group": {"type": "string"},
             "idempotency_key": {
@@ -1060,12 +1364,29 @@ def sap_pr_submit(
     purchase_group: str | None = None,
     approval_id: str = "",
 ) -> dict[str, Any]:
+    # Policy bu handler'dan once ayni kilidi uygular. Dogrudan handler cagrisina
+    # karsi ikinci savunma: gelecekte refactor policy yolunu atlarsa bile yazmaz.
+    if ctx.settings.sap.read_only:
+        return {
+            "error": "S/4HANA read-only profili etkin; SAP'a yazma kapali.",
+            "denial_code": "READ_ONLY_MODE",
+            "written_to_sap": False,
+        }
     if not items:
         return {"error": "En az bir kalem gerekli."}
+    if len(items) > _MAX_PR_ITEMS:
+        return {
+            "error": f"Tek istekte en fazla {_MAX_PR_ITEMS} kalem gonderilebilir.",
+            "denial_code": "INPUT_LIMIT_EXCEEDED",
+            "written_to_sap": False,
+        }
     decision = ctx.decision
     if decision is None:
         # Policy gate atlanmis olamaz; savunma amacli fail-closed.
-        return {"error": "Policy karari yok; yazma reddedildi.", "denial_code": "NO_POLICY_DECISION"}
+        return {
+            "error": "Policy karari yok; yazma reddedildi.",
+            "denial_code": "NO_POLICY_DECISION",
+        }
 
     # 1-3. Resolve + Read + Validate: taslak yeniden hesaplanir (model bildirimine guvenilmez).
     pr_items = build_pr_items(ctx, items)
@@ -1081,6 +1402,51 @@ def sap_pr_submit(
 
     # 4-5. Diff + Approve: dogrulanmis tutar onay kapsamina karsi kontrol edilir.
     assert ctx.policy
+
+    # 4a. Calisma zamani risk yukseltmesi. SAP fiyatlandirmasi tutari
+    # buyuttuyse islem beyan edilen R3'un uzerine, R4'e cikabilir - ve R4
+    # IKI ayri onaylayan ister. Bu kapi tanimliydi ama HIC CAGRILMIYORDU:
+    # `require_approval_for_value` onay kaydinda `max_value` yoksa None
+    # dondugu icin, max_value'suz tek bir R3 onayiyla milyonluk bir yazma
+    # gecebiliyordu. README'nin esik anlatisi tam olarak buna dayaniyor.
+    assessment = ctx.policy.reassess(
+        REGISTRY["sap_pr_submit"],
+        decision,
+        total_value=draft.total_value,
+        currency=draft.currency,
+        record_count=len(draft.items),
+        external_commitment=True,
+    )
+    escalation = ctx.policy.escalation_blocker(decision, assessment)
+    if escalation:
+        ctx.audit.append(
+            "policy.escalation_blocked",
+            execution=ctx.execution,
+            tool="sap_pr_submit",
+            outcome="deny",
+            detail={
+                "declared_tier": decision.risk_tier.value,
+                "effective_tier": assessment.effective_tier.value,
+                "impact_score": assessment.score,
+                "total_value": draft.total_value,
+                "currency": draft.currency,
+            },
+        )
+        return {
+            "error": escalation,
+            "denial_code": "RISK_ESCALATED",
+            "declared_tier": decision.risk_tier.value,
+            "effective_tier": assessment.effective_tier.value,
+            "impact_score": assessment.score,
+            "total_value": draft.total_value,
+            "currency": draft.currency,
+            "written_to_sap": False,
+            "remediation": (
+                "Dogrulanmis tutar islemi R4'e yukseltti. Iki ayri onaylayandan "
+                "onay alip approval_id ile tekrar cagirin."
+            ),
+        }
+
     violation = ctx.policy.require_approval_for_value(
         decision, value=draft.total_value, currency=draft.currency
     )
@@ -1127,7 +1493,9 @@ def sap_pr_submit(
     def verify(object_id: str) -> Verification:
         record = ctx.sap.read_purchase_requisition(object_id)
         return Verification.compare(
-            {"item_count": len(draft.items), "total_value": draft.total_value}, record, tolerance=0.5
+            {"item_count": len(draft.items), "total_value": draft.total_value},
+            record,
+            tolerance=0.5,
         )
 
     def reconcile() -> tuple[str, dict[str, Any]] | None:

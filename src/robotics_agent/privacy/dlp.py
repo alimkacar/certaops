@@ -47,7 +47,8 @@ _PHONE = re.compile(r"(?<!\d)(\+?\d[\d\s()-]{8,}\d)(?!\d)")
 # Unicode obfuscation: sifir genislikli ve yon degistirici karakterler prompt
 # injection ve veri sizdirmada kullanilir. Metin analizinden once
 # temizlenir ki "I​B​A​N" gibi yazimlar dedektoru atlatmasin.
-_INVISIBLE = re.compile(r"[​-‏‪-‮⁠-⁤﻿]")
+# B613 istisnasi kasitlidir: desen tam olarak riskli karakterleri siler.
+_INVISIBLE = re.compile(r"[​-‏‪-‮⁠-⁤﻿]")  # nosec B613
 
 
 def _luhn_valid(match: re.Match[str], _text: str, _field: str) -> bool:

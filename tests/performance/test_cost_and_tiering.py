@@ -209,9 +209,9 @@ def test_highest_pack_wins_in_multi_pack_turn():
     agent = AgentSettings()
     object.__setattr__(agent, "gemini_thinking_level", "low")
     object.__setattr__(
-        agent, "reasoning_levels", (("procurement_read", "medium"), ("project_finance", "high"))
+        agent, "reasoning_levels", (("procurement_read", "medium"), ("p2p_finance", "high"))
     )
-    level = agent.reasoning_level(("bootstrap", "procurement_read", "project_finance"))
+    level = agent.reasoning_level(("bootstrap", "procurement_read", "p2p_finance"))
     assert level == "high"
 
 

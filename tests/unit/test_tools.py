@@ -34,19 +34,16 @@ def test_registry_contains_only_sap_operations():
         "sap_search_materials",
         "sap_material_360",
         "sap_stock_overview",
-        "sap_atp_check",
         "sap_mrp_shortage_explain",
         "sap_compare_vendors",
         "sap_supplier_score_360",
         "sap_pr_prepare",
         "sap_pr_submit",
         "sap_track_purchase_orders",
-        "sap_project_cost_status",
         "sap_generate_report",
         # Salt-okunur procure-to-pay belge ve onay gorunurlugu.
         "sap_document_flow",
         "sap_purchase_order_360",
-        "sap_workflow_status",
         "sap_supplier_invoice_status",
         "sap_invoice_block_explain",
         "sap_list_domains",
@@ -141,14 +138,6 @@ def test_purchase_order_tracking_flags_delay(ctx):
     assert result["delayed_open_value"] > 0
     gear = next(row for row in result["orders"] if row["po_id"] == "4500018821")
     assert gear["delay_days"] == 43
-
-
-def test_project_cost_status_uses_sap_wbs(ctx):
-    result = run("sap_project_cost_status", ctx, wbs_element="R-2026-014")
-    assert result["source_system"] == ctx.settings.sap.system_alias
-    assert result["wbs_count"] == 3
-    assert result["portfolio_summary"]["total_plan"] == pytest.approx(545000)
-    assert all(row["eac"] >= row["actual"] for row in result["wbs_elements"])
 
 
 def test_sap_report_creates_provenance_files(ctx):

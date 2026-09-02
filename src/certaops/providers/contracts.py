@@ -29,8 +29,9 @@ dusmesini engeller.
 
 from __future__ import annotations
 
+import base64
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol, runtime_checkable
 
@@ -166,6 +167,34 @@ class FunctionDeclaration:
         }
 
 
+#: `provider_state` opak bir saglayici degeridir; Gemini'de `bytes` gelir.
+#: JSON bytes tasiyamadigi icin base64'e sarilir ve geri yuklenirken acilir.
+#: Sarmalayici bir isaretci sozluktur; boylece "base64 gibi gorunen bir string"
+#: ile gercek bytes birbirine karismaz.
+_BYTES_TAG = "__b64__"
+
+
+def _state_to_json(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return {_BYTES_TAG: base64.b64encode(value).decode("ascii")}
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    # Taninmayan bir tip sessizce string'e cevrilmez: geri yuklendiginde
+    # saglayiciya bozuk bir devam bilgisi gitmesindense hic gitmemesi iyidir.
+    return None
+
+
+def _state_from_json(value: Any) -> Any:
+    if isinstance(value, Mapping) and _BYTES_TAG in value:
+        try:
+            return base64.b64decode(str(value[_BYTES_TAG]).encode("ascii"))
+        except (ValueError, TypeError):
+            return None
+    return value
+
+
 @dataclass(frozen=True)
 class FunctionCall:
     """Modelin ONERDIGI tool cagrisi.
@@ -189,6 +218,30 @@ class FunctionCall:
         """Denetim defterine yazilabilir hal: provider_state HARIC."""
         return {"call_id": self.id, "name": self.name}
 
+    def to_dict(self) -> dict[str, Any]:
+        """Oturum kaydi icin JSON'a yazilabilir hal.
+
+        `to_audit_dict`ten farki: bu hal turu SURDURMEK icindir, denetim
+        icin degil. `provider_state` (thought signature) korunur, cunku
+        Gemini cok adimli function calling'de onu geri bekler. Deger opaktir
+        ve yalniz ayni oturumun saglayici cagrisina geri doner.
+        """
+        return {
+            "id": self.id,
+            "name": self.name,
+            "arguments": dict(self.arguments),
+            "provider_state": _state_to_json(self.provider_state),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> FunctionCall:
+        return cls(
+            id=str(data.get("id", "") or ""),
+            name=str(data.get("name", "") or ""),
+            arguments=dict(data.get("arguments") or {}),
+            provider_state=_state_from_json(data.get("provider_state")),
+        )
+
 
 @dataclass(frozen=True)
 class FunctionResult:
@@ -206,6 +259,23 @@ class FunctionResult:
         except (TypeError, ValueError):
             return {"result": self.content}
         return parsed if isinstance(parsed, dict) else {"result": parsed}
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "call_id": self.call_id,
+            "name": self.name,
+            "content": self.content,
+            "is_error": self.is_error,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> FunctionResult:
+        return cls(
+            call_id=str(data.get("call_id", "") or ""),
+            name=str(data.get("name", "") or ""),
+            content=str(data.get("content", "") or ""),
+            is_error=bool(data.get("is_error", False)),
+        )
 
 
 @dataclass(frozen=True)
@@ -227,6 +297,72 @@ class ModelMessage:
 
     def with_text(self, text: str) -> ModelMessage:
         return replace(self, text=text)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Oturum kaydina yazilabilir hal.
+
+        Bu metot OLMADAN `json.dumps(..., default=str)` dataclass'i
+        `__repr__` string'ine cevirir; geri yuklendiginde gecmis duz
+        string listesi olur ve saglayici siniri `message.role` uzerinde
+        AttributeError verir.
+        """
+        return {
+            "role": self.role,
+            "text": self.text,
+            "function_calls": [c.to_dict() for c in self.function_calls],
+            "function_results": [r.to_dict() for r in self.function_results],
+            "provider_state": _state_to_json(self.provider_state),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ModelMessage:
+        role = str(data.get("role", "") or "")
+        if role not in ("user", "assistant", "tool"):
+            raise ValueError(f"gecersiz mesaj rolu: {role!r}")
+        return cls(
+            role=role,  # type: ignore[arg-type]
+            text=str(data.get("text", "") or ""),
+            function_calls=tuple(
+                FunctionCall.from_dict(c) for c in (data.get("function_calls") or [])
+            ),
+            function_results=tuple(
+                FunctionResult.from_dict(r) for r in (data.get("function_results") or [])
+            ),
+            provider_state=_state_from_json(data.get("provider_state")),
+        )
+
+
+
+def messages_to_dicts(messages: Iterable[Any]) -> list[dict[str, Any]]:
+    """Oturum kaydina yazilacak hal. `ModelMessage` olmayanlar atlanir."""
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        if isinstance(message, ModelMessage):
+            out.append(message.to_dict())
+        elif isinstance(message, Mapping) and "role" in message:
+            out.append(dict(message))
+    return out
+
+
+def messages_from_dicts(rows: Iterable[Any]) -> list[ModelMessage]:
+    """Oturum kaydindan geri yukleme.
+
+    Bozuk veya eski bicimdeki kayitlar **atlanir**, hata firlatilmaz. Eski
+    surumler gecmisi `__repr__` string'i olarak yazmisti; o kayitlarla bir
+    turu bastan bozmaktansa gecmisi kisaltmak dogru davranistir.
+    """
+    out: list[ModelMessage] = []
+    for row in rows:
+        if isinstance(row, ModelMessage):
+            out.append(row)
+            continue
+        if not isinstance(row, Mapping):
+            continue
+        try:
+            out.append(ModelMessage.from_dict(row))
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return out
 
 
 @dataclass(frozen=True)
