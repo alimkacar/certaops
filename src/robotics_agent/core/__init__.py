@@ -74,8 +74,11 @@ from .router import (
     domains_for_packs,
     normalize_pack_keys,
     pack_catalogue,
+    requires_sap_grounding,
     route,
+    route_from_packs,
     schema_token_report,
+    should_model_route,
     summarize_intent,
 )
 from .sessions import (
@@ -165,7 +168,10 @@ __all__ = [
     "reset_audit_cache",
     "reset_state_db_cache",
     "route",
+    "route_from_packs",
+    "requires_sap_grounding",
     "schema_token_report",
+    "should_model_route",
     "sha256_of",
     "summarize_intent",
     "direct_answer_for",

@@ -336,22 +336,43 @@ class RateLimiter:
     bir uygulama ile degistirilebilir, arayuz aynidir.
     """
 
+    #: Bir pencerede izlenecek en fazla anahtar. Kimlik dogrulama BASARISIZ
+    #: olan istekler de sayilir ve o anahtar istemciden gelir (IP/proxy
+    #: basligi); yani anahtar kumesi saldirgan tarafindan belirlenir. Ust
+    #: sinir olmadan sozluk yalniz bellek tuketmek icin buyutulebilir.
+    MAX_BUCKETS = 10_000
+
     def __init__(self, per_minute: int) -> None:
         self.limit = max(1, per_minute)
-        self._buckets: dict[str, tuple[int, float]] = {}
+        self._buckets: dict[str, int] = {}
+        self._window = -1
         self._lock = threading.Lock()
 
     def check(self, key: str) -> tuple[bool, int]:
-        """(izin_var, kalan). Limit asilirsa (False, 0)."""
-        now = time.time()
-        window = int(now // 60)
+        """(izin_var, kalan). Limit asilirsa (False, 0).
+
+        Pencere degistiginde tablo bosaltilir. Onceki uygulama girdileri
+        SILMIYORDU: eski pencereye ait bir kayit zaten 0 sayiliyordu ama
+        sozlukte kaliyordu, dolayisiyla gorulen her anahtar surec omru boyunca
+        bellekte duruyordu. Sayim anlami degismedi, yalnizca olu kayitlar
+        birikmiyor.
+        """
+        window = int(time.time() // 60)
         with self._lock:
-            count, stored_window = self._buckets.get(key, (0, window))
-            if stored_window != window:
-                count, stored_window = 0, window
+            if window != self._window:
+                self._buckets.clear()
+                self._window = window
+            count = self._buckets.get(key)
+            if count is None:
+                if len(self._buckets) >= self.MAX_BUCKETS:
+                    # Tablo doldu: yeni anahtar kabul edilmez. Fail-closed
+                    # secildi cunku bu sinira ancak anahtar uretilerek
+                    # ulasilir ve alternatif sinirsiz bellek buyumesidir.
+                    return False, 0
+                count = 0
             if count >= self.limit:
                 return False, 0
-            self._buckets[key] = (count + 1, stored_window)
+            self._buckets[key] = count + 1
             return True, self.limit - count - 1
 
     def retry_after(self) -> int:

@@ -173,6 +173,12 @@ def sap_connection_health(ctx: ToolContext) -> dict[str, Any]:
             "currency": ctx.settings.sap.currency,
             "write_window": security.write_window or "sinirsiz",
             "egress_allowlist": list(security.allowed_sap_hosts) or ["tanimlanmadi"],
+            # Bunlar iki AYRI kimlik kapisidir. Eski tek `api_auth_mode`
+            # alani AGENT_AUTH_MODE'u SAP kimlik dogrulamasi gibi etiketliyor,
+            # 401'in kullanici rolunden kaynaklandigi izlenimini veriyordu.
+            "agent_auth_mode": security.auth_mode,
+            "sap_auth_mode": ctx.settings.sap.auth_mode,
+            # Eski istemciler icin korunur; yeni arayuz bu alani kullanmaz.
             "api_auth_mode": security.auth_mode,
         },
         "actor": ctx.actor.to_dict(include_scopes=True) if ctx.actor else None,
@@ -552,5 +558,4 @@ def sap_list_domains(ctx: ToolContext, message: str = "") -> dict[str, Any]:
             "reason": preview["reason"],
         }
     return payload
-
 

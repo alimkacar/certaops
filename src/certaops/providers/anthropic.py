@@ -95,6 +95,8 @@ class AnthropicProvider:
 
     # --- Donusum ------------------------------------------------------------
     def _tools(self, request: ModelRequest) -> list[dict[str, Any]]:
+        if request.tool_choice == "none":
+            return []
         tools = [
             {"name": f.name, "description": f.description, "input_schema": dict(f.parameters)}
             for f in request.functions
@@ -156,6 +158,10 @@ class AnthropicProvider:
         tools = self._tools(request)
         if tools:
             kwargs["tools"] = tools
+            if request.tool_choice == "required":
+                # Model en az bir declaration secmek zorundadir. SDK yine
+                # hicbir handler calistirmaz; yurutme runtime/policy kapisinda.
+                kwargs["tool_choice"] = {"type": "any"}
 
         last: ModelProviderError | None = None
         for attempt in range(1, self.max_retries + 1):

@@ -13,6 +13,8 @@ saglayiciya ozgu ve kritik olan seyler:
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 pytest.importorskip("google.genai")
@@ -97,6 +99,17 @@ def test_otomatik_fonksiyon_yurutme_her_zaman_kapali():
     config = client.models.calls[0]["config"]
     assert config.automatic_function_calling.disable is True
     assert config.automatic_function_calling.maximum_remote_calls == 0
+
+
+def test_required_tool_choice_modeli_declaration_secmeye_zorlar():
+    from google.genai import types
+
+    provider, client = _provider([_response([types.Part(text="tamam")])])
+    provider.generate(replace(REQUEST, tool_choice="required"))
+    config = client.models.calls[0]["config"]
+    assert str(config.tool_config.function_calling_config.mode).upper().endswith("ANY")
+    # Required secim, SDK'nin handler yurutme kilidini acmaz.
+    assert config.automatic_function_calling.disable is True
 
 
 def test_sdk_ye_cagrilabilir_nesne_gonderilmez():

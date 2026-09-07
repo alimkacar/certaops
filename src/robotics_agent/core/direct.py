@@ -129,7 +129,16 @@ def _meta_note(payload: dict[str, Any]) -> str:
 def _render_stock(payload: dict[str, Any]) -> str:
     rows = payload.get("materials") or []
     if not rows:
-        return ""
+        missing = payload.get("not_found") or []
+        out = ["**Stok durumu dogrulanamadi.**"]
+        if missing:
+            out.append(f"- Ana veride bulunamayan malzeme: {', '.join(missing)}")
+        recommendation = payload.get("recommendation")
+        if recommendation:
+            out.append(f"- {recommendation}")
+        if payload.get("basis"):
+            out.append(f"\n{payload['basis']}")
+        return _lines(*out) + _meta_note(payload)
     out = [f"**Stok durumu** ({payload.get('checked_on', '')})"]
     for row in rows:
         flags = row.get("risk_flags") or []
@@ -251,7 +260,9 @@ def _render_health(payload: dict[str, Any]) -> str:
         f"- Yazma modu: {'simulasyon (dry-run)' if guard.get('dry_run') else 'GERCEK YAZMA'}"
         f" | onay esigi: {_num(guard.get('approval_threshold'), 2)} {guard.get('currency', '')}",
         f"- Egress allowlist: {', '.join(guard.get('egress_allowlist') or ['tanimlanmadi'])}",
-        f"- API kimlik dogrulama: {guard.get('api_auth_mode', '?')}",
+        f"- Uygulama oturumu kimlik dogrulama: "
+        f"{guard.get('agent_auth_mode', guard.get('api_auth_mode', '?'))}",
+        f"- SAP baglantisi kimlik dogrulama: {guard.get('sap_auth_mode', '?')}",
         f"- Kullanici: {actor.get('subject', '?')} ({', '.join(actor.get('roles') or [])})",
     ) + _meta_note(payload)
 
@@ -573,11 +584,13 @@ SHORTCUTS: tuple[IntentShortcut, ...] = (
         tool="sap_stock_overview",
         pattern=_rx(
             rf"(?:stok|stock)\s*(?:durumu|seviyesi|level)?\s*[:\-]?\s*(?P<code>{_CODE})\s*\??"
-            rf"|(?P<code2>{_CODE})\s*(?:icin|için|of)?\s*(?:stok|stock)"
-            r"\s*(?:durumu|seviyesi|level|nedir|ne kadar)?\s*\??"
+            rf"|(?P<code2>{_CODE})\s*(?:icin|için|of)?\s*"
+            r"(?:stok(?:u|un|unun|ta|taki)?|stoğu|stoğunun|stock|soku)"
+            r"\s*(?:durumu|seviyesi|level|nedir|ne\s+durumda|ne kadar)?\s*\??"
             rf"|(?P<code3>{_CODE})\s*(?:numarali|numaralı|nolu|no'lu)?\s*"
             r"(?:malzemenin|malzeme|materialin|material)\s*"
-            r"(?:stok|stock)\s*(?:durumu|durumunu|seviyesi|seviyesini)?\s*"
+            r"(?:stok(?:u|un|unun|ta|taki)?|stoğu|stoğunun|stock|soku)\s*"
+            r"(?:durumu|durumunu|seviyesi|seviyesini|ne\s+durumda)?\s*"
             r"(?:goster|göster|getir|nedir|ne kadar)?\s*\??"
         ),
         build=lambda m: {"material_ids": [_code(m, "code", "code2", "code3")]},

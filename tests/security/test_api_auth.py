@@ -352,6 +352,43 @@ def test_rate_limiter_blocks_after_limit():
     assert limiter.check("b")[0]
 
 
+def test_rate_limiter_eski_pencereyi_bellekte_tutmaz(monkeypatch):
+    """Kova tablosu pencere degisince bosalir.
+
+    Anahtar istemciden gelir (IP / proxy basligi), yani kumeyi saldirgan
+    belirler. Onceki uygulama olu pencere kayitlarini silmiyordu: gorulen her
+    anahtar surec omru boyunca bellekte kaliyor ve bellek yalnizca istek
+    gondererek buyutulebiliyordu.
+    """
+    from robotics_agent.channels import auth as auth_mod
+
+    saat = [1_000.0]
+    monkeypatch.setattr(auth_mod.time, "time", lambda: saat[0])
+    limiter = RateLimiter(per_minute=5)
+
+    for i in range(200):
+        limiter.check(f"authfail:10.0.0.{i}")
+    assert len(limiter._buckets) == 200
+
+    saat[0] += 60  # sonraki pencere
+    assert limiter.check("authfail:10.0.0.1")[0]
+    assert len(limiter._buckets) == 1, "olu pencere kayitlari birikiyor"
+
+
+def test_rate_limiter_kova_tablosu_ustten_sinirli(monkeypatch):
+    """Tablo dolunca yeni anahtar kabul edilmez (fail-closed)."""
+    from robotics_agent.channels import auth as auth_mod
+
+    monkeypatch.setattr(auth_mod.time, "time", lambda: 1_000.0)
+    limiter = RateLimiter(per_minute=5)
+    monkeypatch.setattr(limiter, "MAX_BUCKETS", 3, raising=False)
+
+    assert limiter.check("a")[0] and limiter.check("b")[0] and limiter.check("c")[0]
+    assert not limiter.check("d")[0], "tablo dolu iken yeni anahtar acilmamali"
+    # Zaten bilinen anahtar calismaya devam eder.
+    assert limiter.check("a")[0]
+
+
 # --- Maskeleme -------------------------------------------------------------
 def test_secrets_are_masked_in_payloads():
     masked = mask_payload({"password": "s3cret", "SAP_TOKEN": "abc", "material_id": "ROB-1"})

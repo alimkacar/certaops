@@ -230,6 +230,15 @@ class SecuritySettings:
 
     rate_limit_per_minute: int = field(default_factory=lambda: _env_int("AGENT_RATE_LIMIT", 30))
     max_request_bytes: int = field(default_factory=lambda: _env_int("AGENT_MAX_REQUEST_BYTES", 65_536))
+    # `X-Forwarded-For` yalnizca ONUNDE guvenilir bir ters proxy varsa
+    # dikkate alinir. Baslik istemci tarafindan serbestce yazilabilir; kosulsuz
+    # guvenildiginde basarisiz kimlik dogrulama sayaci her istekte farkli bir
+    # deger gonderilerek atlatilabilir (her istek kendi kovasina duser) ve
+    # kova tablosu saldirganin belirledigi anahtarlarla dolar. Varsayilan
+    # kapali: proxy yoksa dogru kaynak zaten soket adresidir.
+    trust_forwarded_for: bool = field(
+        default_factory=lambda: _env_bool("AGENT_TRUST_FORWARDED_FOR", False)
+    )
 
     # Giden trafik allowlist'i: SSRF ve yanlis sisteme yazma riskini keser.
     allowed_sap_hosts: tuple[str, ...] = field(
@@ -607,6 +616,18 @@ class AgentSettings:
     # Kapatildiginda her yanit klasik LLM akisindan gecer.
     direct_answers_enabled: bool = field(
         default_factory=lambda: _env_bool("AGENT_DIRECT_ANSWERS", True)
+    )
+    # Kural tabanli router eslesme bulamazsa, kullanici metni once merkezi
+    # DLP'den gecirilip modele yalnizca NIYET SINIFLANDIRMA icin gonderilir.
+    # Model tool veya cevap uretemez; yalniz allowlist'teki pack adlarini secer.
+    router_model_fallback: bool = field(
+        default_factory=lambda: _env_bool("AGENT_ROUTER_MODEL_FALLBACK", True)
+    )
+    router_model_min_confidence: float = field(
+        default_factory=lambda: _env_float("AGENT_ROUTER_MODEL_MIN_CONFIDENCE", 0.70)
+    )
+    router_model_max_tokens: int = field(
+        default_factory=lambda: _env_int("AGENT_ROUTER_MODEL_MAX_TOKENS", 256)
     )
     # Muhakeme kademelendirmesinin tabani. Saglayiciya `thinking_level` olarak
     # gider; saglayici desteklemiyorsa yok sayilir.

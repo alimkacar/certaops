@@ -19,7 +19,7 @@ import logging
 import sqlite3
 import threading
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -174,6 +174,15 @@ class StateDatabase:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         self._shared: sqlite3.Connection | None = None
+        self._in_memory = str(self.path) == ":memory:"
+        # `:memory:` modunda TEK baglanti butun thread'lerce paylasilir
+        # (`check_same_thread=False`). Ayni baglanti uzerinde iki thread ayni
+        # anda `BEGIN IMMEDIATE` calistirinca sqlite "cannot start a
+        # transaction within a transaction" der ve iki islem birbirinin
+        # islemine yazar. Dosya modunda her thread kendi baglantisini
+        # kullandigi icin bu kilide gerek yoktur; orada seri hale getirmeyi
+        # sqlite'in kendi yazma kilidi yapar.
+        self._shared_write_lock = threading.RLock()
         self._init_lock = threading.Lock()
         self._initialized = False
         self._ensure_schema()
@@ -234,14 +243,16 @@ class StateDatabase:
         dizisi iki worker (ve iki process) arasinda bolunmez.
         """
         conn = self.connection
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            yield conn
-        except BaseException:
-            conn.execute("ROLLBACK")
-            raise
-        else:
-            conn.execute("COMMIT")
+        guard = self._shared_write_lock if self._in_memory else nullcontext()
+        with guard:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            else:
+                conn.execute("COMMIT")
 
     def query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
         return list(self.connection.execute(sql, params))

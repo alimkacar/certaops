@@ -208,6 +208,47 @@ _WORD_RE = re.compile(r"[0-9a-z]+")
 #: "4031234" icinde eslesir ve yanlis pack acilir.
 _MIN_PREFIX_LEN = 4
 
+# Sik gorulen, niyeti degistirmeyen yazim hatalari. Yalniz salt-okunur
+# kavramlar burada kanoniklestirilir; "onayla"/"gonder" gibi yazma
+# niyetleri fuzzy eslestirilmez.
+_WORD_ALIASES: dict[str, str] = {
+    "soku": "stoku",
+    "sotk": "stok",
+    "sotku": "stoku",
+    "stogu": "stoku",
+}
+
+_OPERATIONAL_PACKS = frozenset(
+    {
+        "master_data",
+        "procurement_read",
+        "procurement_write",
+        "p2p_visibility",
+        "p2p_finance",
+    }
+)
+# En az bir rakam tasiyan SAP nesne kimligi. Siradan Turkce kelimeler kod
+# sayilmaz; 10 haneli EBELN/BELNR ve harf-rakamli malzeme kodlari yakalanir.
+_SAP_REFERENCE_RE = re.compile(
+    r"\b(?=[a-z0-9._/-]{2,40}\b)(?=[a-z0-9._/-]*\d)[a-z0-9][a-z0-9._/-]*\b"
+)
+_MODEL_ROUTE_HINTS = frozenset(
+    {
+        "sap",
+        "malzeme",
+        "material",
+        "siparis",
+        "fatura",
+        "tedarik",
+        "vendor",
+        "stok",
+        "soku",
+        "mrp",
+        "odeme",
+        "satin",
+    }
+)
+
 
 def _trigger_hits(trigger: str, words: list[str]) -> bool:
     """Tetikleyici mesajda geciyor mu? Turkce ekleri tolere eder.
@@ -239,6 +280,8 @@ class RoutingDecision:
     matched_triggers: dict[str, tuple[str, ...]] = field(default_factory=dict)
     fallback: bool = False
     omitted_packs: tuple[str, ...] = ()
+    source: str = "rules"
+    confidence: float = 1.0
 
     @property
     def truncated(self) -> bool:
@@ -253,6 +296,8 @@ class RoutingDecision:
             "fallback": self.fallback,
             "omitted_packs": list(self.omitted_packs),
             "truncated": self.truncated,
+            "source": self.source,
+            "confidence": self.confidence,
         }
 
 
@@ -264,7 +309,7 @@ def route(message: str, actor: ActorContext, *, max_packs: int = 2) -> RoutingDe
     hedefini netlestirmesi beklenir. Mutating pack asla varsayilan acilmaz.
     """
     normalized = _normalize(message or "")
-    words = _WORD_RE.findall(normalized)
+    words = [_WORD_ALIASES.get(word, word) for word in _WORD_RE.findall(normalized)]
     scores: list[tuple[int, str, tuple[str, ...]]] = []
 
     for key, pack in PACKS.items():
@@ -295,7 +340,63 @@ def route(message: str, actor: ActorContext, *, max_packs: int = 2) -> RoutingDe
         matched_triggers=matched,
         fallback=fallback,
         omitted_packs=omitted,
+        source="fallback" if fallback else "rules",
+        confidence=0.0 if fallback else 1.0,
     )
+
+
+def route_from_packs(
+    pack_keys: Iterable[str], actor: ActorContext, *, confidence: float = 0.0
+) -> RoutingDecision:
+    """Model siniflandirmasini guvenli bir ``RoutingDecision``a cevir.
+
+    Model yalniz pack ADI onerir. Bilinmeyen veya actor'un acamayacagi pack
+    atilir; dependency genisletmesi yine kod tarafindan yapilir.
+    """
+    chosen = [
+        key
+        for key in normalize_pack_keys(pack_keys)
+        if key != BOOTSTRAP_PACK and _actor_may_open(key, actor)
+    ][:2]
+    if not chosen:
+        return route("", actor)
+    return RoutingDecision(
+        packs=_expand(chosen),
+        matched_triggers={key: ("model_fallback",) for key in chosen},
+        fallback=False,
+        source="model",
+        confidence=max(0.0, min(float(confidence), 1.0)),
+    )
+
+
+def requires_sap_grounding(message: str, decision: RoutingDecision) -> bool:
+    """Yaniti guncel SAP verisi olmadan uretmek guvenli mi?
+
+    Nesne kimligi + operasyonel domain, bunun bir kavramsal sohbet degil
+    gercek sistem sorgusu olduguna guclu kanittir. Bu sinyal saglayicida en
+    az bir tool secimini zorlamak icin kullanilir; policy katmani aynen
+    yerinde kalir.
+    """
+    active = set(decision.packs) & _OPERATIONAL_PACKS
+    if not active:
+        return False
+    normalized = _normalize(message or "")
+    has_reference = bool(_SAP_REFERENCE_RE.search(normalized))
+    # Kimliksiz "stok durumu" gibi bir istekte modelin once netlestirme
+    # sormasi mesrudur; bu nedenle zorunlu tool secimi yalniz somut SAP
+    # nesnesi bulunan sorgularda uygulanir.
+    return has_reference
+
+
+def should_model_route(message: str) -> bool:
+    """Fallback metni gercekten SAP niyeti tasiyor mu?
+
+    Selamlasma veya genel sohbet icin ikinci bir model cagrisi gereksizdir.
+    Somut SAP kodu ya da is-domaini ipucu varsa dar model-router devreye girer.
+    """
+    normalized = _normalize(message or "")
+    words = set(_WORD_RE.findall(normalized))
+    return bool(_SAP_REFERENCE_RE.search(normalized) or words & _MODEL_ROUTE_HINTS)
 
 
 def _actor_may_open(pack_key: str, actor: ActorContext) -> bool:

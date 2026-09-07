@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import uuid
 from contextlib import asynccontextmanager, suppress
 from typing import Any
@@ -138,6 +139,13 @@ _telemetry = TelemetryCollector()
 _agents: dict[str, SAPAgentRuntime] = {}
 #: Onbellekteki her runtime'in kuruldugu andaki actor guvenlik parmak izi.
 _agent_fingerprints: dict[str, str] = {}
+#: Runtime tablosunu koruyan kilit. FastAPI `def` (senkron) uc noktalari bir
+#: threadpool'da calistirir: iki istek ayni anda bu tabloyu okuyup yazabilir.
+#: Kilitsiz halde iki eszamanli istek ayni oturum icin iki runtime kurup
+#: birini sessizce ustune yaziyordu (kapatilmayan saglayici baglantisi =
+#: soket sizintisi) ve kapasite eviction'indaki `next(iter(...))` sozluk
+#: ayni anda degistiginde `RuntimeError` atabiliyordu.
+_agents_lock = threading.Lock()
 # Periyodik saklama temizligi ve paylasilan okuma cache'i.
 # Cache tek ornek olmak zorunda: invalidation ancak tum okuyucular ayni depoyu
 # goruyorsa ise yarar.
@@ -324,13 +332,19 @@ def _client_bucket(request: Request) -> str:
     """Kimlik yokken sayim icin istemci kimligi.
 
     Ters proxy arkasinda `request.client.host` proxy'nin adresidir; bu yuzden
-    guvenilir proxy basligi varsa ilk atlama tercih edilir. Deger yalnizca
-    SAYIM icin kullanilir - hicbir yetki karari buna dayanmaz, dolayisiyla
-    sahtelenmis bir baslik yetki kazandiramaz, yalnizca kendi kovasini degistirir.
+    ONUNDE guvenilir bir proxy oldugu YAPILANDIRMAYLA bildirilmisse ilk atlama
+    tercih edilir (`AGENT_TRUST_FORWARDED_FOR=true`).
+
+    Baslik kosulsuz okunamaz. Deger yetki kararinda kullanilmasa da kimlik
+    dogrulama BASARISIZLIKLARINI sayan kovanin anahtaridir: her istekte farkli
+    bir `X-Forwarded-For` gonderen bir istemci her defasinda bos bir kovaya
+    duser ve kaba kuvvet limiti hic devreye girmez. Ayni yolla kova tablosu da
+    saldirganin belirledigi anahtarlarla doldurulabilir.
     """
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    if forwarded:
-        return f"authfail:{forwarded.split(',')[0].strip()[:64]}"
+    if _settings.security.trust_forwarded_for:
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            return f"authfail:{forwarded.split(',')[0].strip()[:64]}"
     client = request.client
     return f"authfail:{client.host if client else 'unknown'}"
 
@@ -390,42 +404,70 @@ def _agent_for(actor: ActorContext, session_id: str) -> SAPAgentRuntime:
     """
     key = f"{actor.tenant}:{actor.subject}:{session_id}"
     fingerprint = actor.security_fingerprint()
-    cached = _agents.get(key)
-    if cached is not None and _agent_fingerprints.get(key) != fingerprint:
+
+    # 1) Tabloyu kilit altinda oku; parmak izi bayatlamissa dusur.
+    with _agents_lock:
+        cached = _agents.get(key)
+        if cached is not None and _agent_fingerprints.get(key) != fingerprint:
+            _agents.pop(key, None)
+            _agent_fingerprints.pop(key, None)
+            log.info("actor guvenlik baglami degisti; runtime yeniden kuruluyor (%s)", key)
+        else:
+            cached = None
+            hit = _agents.get(key)
+            if hit is not None:
+                return hit
+    if cached is not None:
+        # Kapatma kilit disinda: `close()` ag IO yapabilir.
         with suppress(Exception):
             cached.close()
-        _agents.pop(key, None)
-        _agent_fingerprints.pop(key, None)
-        log.info("actor guvenlik baglami degisti; runtime yeniden kuruluyor (%s)", key)
-    agent = _agents.get(key)
-    if agent is None:
-        try:
-            agent = SAPAgentRuntime(
-                _settings, actor=actor, channel="api", telemetry=_telemetry
-            )
-        except RuntimeError as exc:
-            raise HTTPException(
-                status_code=503, detail={"error": str(exc), "code": "AGENT_UNAVAILABLE"}
-            ) from exc
-        _agents[key] = agent
-        _agent_fingerprints[key] = fingerprint
-        if len(_agents) > _settings.state.max_sessions:
-            evicted = next(iter(_agents))
-            stale = _agents.pop(evicted, None)
-            _agent_fingerprints.pop(evicted, None)
-            # Kapasite eviction'i saglayici baglantisini de birakmali; aksi
-            # halde uzun sureli bir surecte soketler sizar.
-            if stale is not None:
-                with suppress(Exception):
-                    stale.close()
+
+    # 2) Runtime kurulumu kilit DISINDA yapilir: saglayici/SAP baglantisi
+    #    kurabilir ve bu is butun uc noktalari serilestirmemeli.
+    try:
+        agent = SAPAgentRuntime(_settings, actor=actor, channel="api", telemetry=_telemetry)
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=503, detail={"error": str(exc), "code": "AGENT_UNAVAILABLE"}
+        ) from exc
+
+    # 3) Yayimlama kilit altinda. Bu arada baska bir istek ayni anahtar icin
+    #    runtime kurmus olabilir: kazanan tektir, kaybeden KAPATILIR.
+    evicted_runtimes: list[SAPAgentRuntime] = []
+    with _agents_lock:
+        winner = _agents.get(key)
+        if winner is not None and _agent_fingerprints.get(key) == fingerprint:
+            evicted_runtimes.append(agent)
+            agent = winner
+        else:
+            # Parmak izi farkli bir ornek varsa o da kapatilmali; aksi halde
+            # ustune yazilip kapatilmadan kaybolur.
+            if winner is not None:
+                evicted_runtimes.append(winner)
+            _agents[key] = agent
+            _agent_fingerprints[key] = fingerprint
+            while len(_agents) > _settings.state.max_sessions:
+                evicted = next(iter(_agents))
+                if evicted == key:  # kendini atma
+                    break
+                stale = _agents.pop(evicted, None)
+                _agent_fingerprints.pop(evicted, None)
+                # Kapasite eviction'i saglayici baglantisini de birakmali;
+                # aksi halde uzun sureli bir surecte soketler sizar.
+                if stale is not None:
+                    evicted_runtimes.append(stale)
+    for stale in evicted_runtimes:
+        with suppress(Exception):
+            stale.close()
     return agent
 
 
 def _evict_runtime(actor: ActorContext, session_id: str) -> None:
     """Bir oturumun onbelleklenmis runtime'ini kapatir ve dusurur."""
     key = f"{actor.tenant}:{actor.subject}:{session_id}"
-    agent = _agents.pop(key, None)
-    _agent_fingerprints.pop(key, None)
+    with _agents_lock:
+        agent = _agents.pop(key, None)
+        _agent_fingerprints.pop(key, None)
     if agent is not None:
         with suppress(Exception):
             agent.close()
@@ -433,11 +475,13 @@ def _evict_runtime(actor: ActorContext, session_id: str) -> None:
 
 def _shutdown_runtimes() -> None:
     """Tum runtime'lari ve health icin kullanilan paylasilan backend'i kapatir."""
-    for agent in list(_agents.values()):
+    with _agents_lock:
+        agents = list(_agents.values())
+        _agents.clear()
+        _agent_fingerprints.clear()
+    for agent in agents:
         with suppress(Exception):
             agent.close()
-    _agents.clear()
-    _agent_fingerprints.clear()
     reset_backend()
 
 

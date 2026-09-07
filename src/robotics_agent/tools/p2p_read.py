@@ -96,6 +96,33 @@ def _iso(value: Any) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+def _sap_error_payload(exc: SAPError) -> dict[str, Any]:
+    """SAP hatasini tool cikti sozlesmesine cevirir.
+
+    `str(exc)` tek basina YETMEZ. Kullaniciya ne yapacagini soyleyen alan
+    `SAPFault.to_dict()` icindeki `remediation`'dir ve bu dal onu dusuruyordu.
+    Kisayol yolu (`direct answer`) yalniz `error`, `remediation` ve
+    `denial_code` okudugu icin 401'de ekrana ham ABAP logon metni cikiyor,
+    okuyan kisi de olmayan bir SAP rolu aramaya gidiyordu.
+
+    Kimlik hatasi ile yetki hatasi burada da ayrilir: 401 `denial_code`'u
+    kimlik (`SAP_AUTHENTICATION_FAILED`), 403 ise yetki
+    (`SAP_AUTHORIZATION_FAILED`) der.
+    """
+    payload = exc.as_dict()
+    out: dict[str, Any] = {"error": payload.get("error") or str(exc), "sap_code": exc.code}
+    for alan in ("http_status", "remediation", "authorization", "auth_challenge",
+                 "correlation_id", "target_api", "request_path"):
+        if payload.get(alan):
+            out[alan] = payload[alan]
+    durum = payload.get("http_status")
+    if durum == 401:
+        out["denial_code"] = "SAP_AUTHENTICATION_FAILED"
+    elif durum == 403:
+        out["denial_code"] = "SAP_AUTHORIZATION_FAILED"
+    return out
+
+
 @tool(
     name="sap_document_flow",
     group="p2p",
@@ -143,7 +170,7 @@ def sap_document_flow(
     except SAPNotSupported as exc:
         return {"error": str(exc), "remediation": exc.hint, "denial_code": "CAPABILITY_NOT_SUPPORTED"}
     except SAPError as exc:
-        return {"error": str(exc), "sap_code": exc.code}
+        return _sap_error_payload(exc)
 
     if not nodes:
         return {
@@ -307,7 +334,7 @@ def sap_purchase_order_360(
     except SAPNotSupported as exc:
         return {"error": str(exc), "remediation": exc.hint, "denial_code": "CAPABILITY_NOT_SUPPORTED"}
     except SAPError as exc:
-        return {"error": str(exc), "sap_code": exc.code}
+        return _sap_error_payload(exc)
 
     # Released PO API kismi teslim/fatura miktarini kalemde yayinlamaz. Bunlar
     # ayni kosuda okunan MSEG/RSEG referanslarindan netlestirilir; "complete"
@@ -524,7 +551,7 @@ def sap_supplier_invoice_status(
     except SAPNotSupported as exc:
         return {"error": str(exc), "remediation": exc.hint, "denial_code": "CAPABILITY_NOT_SUPPORTED"}
     except SAPError as exc:
-        return {"error": str(exc), "sap_code": exc.code}
+        return _sap_error_payload(exc)
 
     if not invoices:
         return {
@@ -720,7 +747,7 @@ def sap_invoice_block_explain(
     except SAPNotSupported as exc:
         return {"error": str(exc), "remediation": exc.hint, "denial_code": "CAPABILITY_NOT_SUPPORTED"}
     except SAPError as exc:
-        return {"error": str(exc), "sap_code": exc.code}
+        return _sap_error_payload(exc)
 
     if not invoices:
         return {

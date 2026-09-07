@@ -442,6 +442,82 @@ def test_prepare_asla_yazmaz(settings_factory, tmp_path):
     assert "account_assignment" in alanlar
 
 
+def test_cok_tesisli_pr_her_kalemi_kendi_tesisiyle_okur(settings_factory, tmp_path):
+    """Farkli tesislere ait kalemler kendi tesisleriyle okunmali.
+
+    Toplu okuma eskiden TUM kalemleri `items[0].plant` ile okuyordu. Malzeme
+    ana verisi tesise ozgudur (`_map_product` tesis satirini secer) ve
+    degerleme `ValuationArea eq <tesis>` ile filtrelenir; dolayisiyla ikinci
+    tesisin kalemi birinci tesisin fiyati ve temin suresiyle fiyatlaniyor,
+    o tesiste tanimsiz bir malzeme de yanlislikla "bulunamadi" sayiliyordu.
+    """
+    routes = {
+        "A_Product": [
+            {
+                "Product": "R-1000", "ProductType": "HALB", "BaseUnit": "ST",
+                "to_Description": {"results": [{"ProductDescription": "Robot kolu",
+                                                "Language": "TR"}]},
+                "to_Plant": {"results": [
+                    {"Plant": "1100", "PlndDelryDurnInDays": "30",
+                     "MinimumLotSizeQuantity": "5"},
+                    {"Plant": "1710", "PlndDelryDurnInDays": "7",
+                     "MinimumLotSizeQuantity": "1"},
+                ]},
+            },
+            {
+                "Product": "R-2000", "ProductType": "HALB", "BaseUnit": "ST",
+                "to_Description": {"results": [{"ProductDescription": "Gripper",
+                                                "Language": "TR"}]},
+                "to_Plant": {"results": [
+                    {"Plant": "1710", "PlndDelryDurnInDays": "7",
+                     "MinimumLotSizeQuantity": "1"},
+                ]},
+            },
+        ],
+        "A_PurchasingInfoRecord": [],
+        "A_Supplier": [],
+        "A_ProductValuation": [],
+    }
+    backend, fake = build(settings_factory, tmp_path, routes)
+    backend.prepare_purchase_requisition([
+        PurchaseRequisitionItem(material_id="R-1000", quantity=10, plant="1100",
+                                wbs_element="P-1.1"),
+        PurchaseRequisitionItem(material_id="R-2000", quantity=10, plant="1710",
+                                wbs_element="P-1.1"),
+    ])
+
+    areas = {
+        alan.split("ValuationArea eq '")[1].split("'")[0]
+        for alan in (
+            r.url.params.get("$filter", "") for r in fake.calls_to("A_ProductValuation")
+        )
+        if "ValuationArea eq '" in alan
+    }
+    assert areas == {"1100", "1710"}, (
+        f"degerleme yalniz {areas} tesisi icin okundu; her kalem kendi tesisiyle okunmali"
+    )
+    assert fake.writes == [], "prepare_* HICBIR kosulda yazmamali"
+
+
+def test_tek_tesisli_pr_tek_grup_okur(settings_factory, tmp_path):
+    """Tesise gore gruplama, tek tesisli talepte ek cagri URETMEZ."""
+    backend, fake = build(settings_factory, tmp_path, _pr_routes())
+    backend.prepare_purchase_requisition([
+        PurchaseRequisitionItem(material_id="R-1000", quantity=10, plant="1100"),
+        PurchaseRequisitionItem(material_id="R-1000", quantity=5, plant="1100"),
+    ])
+    # `calls_to` alt dizge esler: A_Product, A_ProductValuation'i da yakalar.
+    def tam(entity_set: str) -> int:
+        return len([
+            r for r in fake.requests
+            if r.url.path.rstrip("/").rsplit("/", 1)[-1].split("(")[0] == entity_set
+        ])
+
+    assert tam("A_Product") == 1
+    assert tam("A_ProductValuation") == 1
+    assert tam("A_PurchasingInfoRecord") == 1
+
+
 def test_submit_referans_token_basliga_gomer(settings_factory, tmp_path):
     """S/4'te PR baslik metni 40 karakterle sinirli: hash gomulur."""
     backend, fake = build(

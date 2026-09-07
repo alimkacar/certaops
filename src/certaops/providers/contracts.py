@@ -51,6 +51,7 @@ __all__ = [
     "ModelUnavailableError",
     "StopReason",
     "ThinkingLevel",
+    "ToolChoice",
     "TokenUsage",
 ]
 
@@ -59,6 +60,10 @@ StopReason = Literal["end_turn", "tool_use", "max_tokens", "safety", "other"]
 
 #: Muhakeme butcesi. Saglayici destegi yoksa yok sayilir.
 ThinkingLevel = Literal["minimal", "low", "medium", "high"]
+
+#: Model arac kullanmak zorunda mi? ``required`` yalnizca declaration
+#: listesinden en az bir arac SECMEYI zorlar; araci SDK calistirmaz.
+ToolChoice = Literal["auto", "required", "none"]
 
 _REDACTED = "<gizli>"
 
@@ -286,6 +291,10 @@ class ModelMessage:
     text: str = ""
     function_calls: tuple[FunctionCall, ...] = ()
     function_results: tuple[FunctionResult, ...] = ()
+    #: Mesajin uretildigi dinamik domain kumesi. Saglayiciya gonderilmez;
+    #: farkli domainlerin rol/tool iddialarini birbirine karistirmamak icin
+    #: runtime tarafindan gecmis izolasyonunda kullanilir.
+    context_key: str = ""
     #: Saglayiciya ait opak devam bilgisi. Gizlilik kurallari FunctionCall ile ayni.
     provider_state: Any = field(default=None, repr=False, compare=False)
 
@@ -311,6 +320,7 @@ class ModelMessage:
             "text": self.text,
             "function_calls": [c.to_dict() for c in self.function_calls],
             "function_results": [r.to_dict() for r in self.function_results],
+            "context_key": self.context_key,
             "provider_state": _state_to_json(self.provider_state),
         }
 
@@ -328,6 +338,7 @@ class ModelMessage:
             function_results=tuple(
                 FunctionResult.from_dict(r) for r in (data.get("function_results") or [])
             ),
+            context_key=str(data.get("context_key", "") or ""),
             provider_state=_state_from_json(data.get("provider_state")),
         )
 
@@ -372,6 +383,7 @@ class ModelRequest:
     system: str
     messages: Sequence[ModelMessage]
     functions: Sequence[FunctionDeclaration] = ()
+    tool_choice: ToolChoice = "auto"
     max_output_tokens: int = 4096
     thinking_level: ThinkingLevel = "low"
     stream: bool = False
@@ -386,6 +398,7 @@ class ModelRequest:
             "message_count": len(self.messages),
             "function_count": len(self.functions),
             "function_names": [f.name for f in self.functions],
+            "tool_choice": self.tool_choice,
             "max_output_tokens": self.max_output_tokens,
             "thinking_level": self.thinking_level,
             "store": self.store,

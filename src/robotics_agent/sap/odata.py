@@ -1522,20 +1522,36 @@ class ODataSAPBackend(SAPBackend):
         total = 0.0
 
         # Kalem basina ayri okuma yerine toplu okuma: 10 kalemli bir talep
-        # 30+ SAP cagrisi yerine 3 cagri ile hazirlanir.
-        wanted_ids = [item.material_id for item in items]
-        masters = self.get_materials(wanted_ids, plant=items[0].plant or cfg.plant)
-        info_by_material = self.get_info_records_bulk(wanted_ids)
+        # 30+ SAP cagrisi yerine birkac cagri ile hazirlanir.
+        #
+        # Toplu okuma TESISE gore gruplanir. Onceki hal tum kalemleri
+        # `items[0].plant` ile okuyordu; bu, farkli tesislere ait kalemler
+        # iceren bir talepte yanlis veri uretiyordu: `_map_product` tesise ozgu
+        # MRP alanini secer ve degerleme `ValuationArea eq <tesis>` ile
+        # filtrelenir. Yani 1010'da acilmis bir talebin 1710 kalemi 1010'un
+        # hareketli ortalama fiyatiyla fiyatlaniyor, o tesiste tanimli olmayan
+        # bir malzeme de "malzeme ana verisinde bulunamadi" diye reddediliyordu.
+        # Tek tesisli talepte davranis aynidir (tek grup, tek cagri).
+        ids_by_plant: dict[str, list[str]] = {}
+        for item in items:
+            ids_by_plant.setdefault(item.plant or cfg.plant, []).append(item.material_id)
+        masters_by_plant: dict[str, dict[str, Material]] = {}
+        info_by_plant: dict[str, dict[str, list[InfoRecord]]] = {}
+        for item_plant, plant_ids in ids_by_plant.items():
+            masters_by_plant[item_plant] = self.get_materials(plant_ids, plant=item_plant)
+            info_by_plant[item_plant] = self.get_info_records_bulk(plant_ids, plant=item_plant)
 
         for idx, item in enumerate(items, start=1):
             item_no = idx * 10
-            master = masters.get(item.material_id)
+            item_plant = item.plant or cfg.plant
+            master = masters_by_plant.get(item_plant, {}).get(item.material_id)
             if master is None:
                 raise SAPError(
-                    f"Malzeme {item.material_id} malzeme ana verisinde bulunamadi.",
+                    f"Malzeme {item.material_id} malzeme ana verisinde bulunamadi "
+                    f"(tesis {item_plant}).",
                     code="MM_MATNR_NOT_FOUND",
                 )
-            records = info_by_material.get(item.material_id, [])
+            records = info_by_plant.get(item_plant, {}).get(item.material_id, [])
             chosen = None
             if item.preferred_vendor:
                 chosen = next((r for r in records if r.vendor_id == item.preferred_vendor), None)

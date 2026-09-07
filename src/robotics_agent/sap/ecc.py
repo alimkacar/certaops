@@ -517,6 +517,35 @@ class ECCSAPBackend(SAPBackend):
         )
         return self._map_material(rows[0]) if rows else None
 
+    def get_materials(
+        self, material_ids: Sequence[str], *, plant: str | None = None
+    ) -> dict[str, Material]:
+        """N malzemeyi **tek** cagride okur.
+
+        Taban sinif varsayilani kalem basina bir GET atar; 10 kalemli bir
+        talep hazirligi 10 round-trip demekti. `MaterialSet` zaten MBEW
+        join'ini tasidigi icin tek `$filter` yeterli, ek degerleme cagrisi
+        gerekmez. Bulunamayan id sonuca GIRMEZ - "yok" bilgisi korunur.
+        """
+        ids = [m for m in dict.fromkeys(material_ids) if m]
+        if not ids:
+            return {}
+        target_plant = plant or self.settings.sap.plant
+        rows = self._read(
+            "product",
+            "MaterialSet",
+            filter_expr=_and(
+                _or_filter("Material", ids), f"Plant eq '{quote(target_plant)}'"
+            ),
+            top=len(ids),
+        )
+        out: dict[str, Material] = {}
+        for row in rows:
+            material = self._map_material(row)
+            if material.material_id:
+                out[material.material_id] = material
+        return out
+
     def get_valuation(self, material_id: str, *, plant: str | None = None) -> dict[str, Any] | None:
         """Degerleme (MBEW). `MaterialSet` zaten fiyat tasir; bu port ayri
         okuma yolu isteyen cagirici icindir (or. degerleme alani != tesis)."""
@@ -776,31 +805,62 @@ class ECCSAPBackend(SAPBackend):
             expand=("ToScales",),
             top=50,
         )
-        records: list[InfoRecord] = []
+        return [self._map_info_record(row, material_id) for row in rows]
+
+    def _map_info_record(self, row: dict[str, Any], material_id: str) -> InfoRecord:
+        cfg = self.settings.sap
+        scales: dict[str, float] = {}
+        for scale in expanded_rows(row, "ToScales"):
+            qty = _opt_num(scale.get("ScaleQuantity"))
+            price = _opt_num(scale.get("ScalePrice"))
+            if qty is not None and price is not None:
+                scales[str(qty)] = price
+        return InfoRecord(
+            material_id=material_id,
+            vendor_id=str(row.get("Supplier", "")),
+            vendor_name=str(row.get("SupplierName") or ""),
+            net_price=_num(row.get("NetPrice")),
+            currency=str(row.get("Currency") or cfg.currency),
+            price_unit=_int(row.get("PriceUnit"), 1) or 1,
+            min_order_qty=_num(row.get("MinimumQuantity"), 1.0) or 1.0,
+            planned_delivery_days=_int(row.get("PlannedDeliveryDays"), 14),
+            incoterms=str(row.get("Incoterms") or "DAP"),
+            payment_terms=str(row.get("PaymentTerms") or "NT30"),
+            valid_to=parse_odata_datetime(row.get("ValidTo")),
+            scale_prices=scales,
+        )
+
+    def get_info_records_bulk(
+        self, material_ids: Sequence[str], *, plant: str | None = None
+    ) -> dict[str, list[InfoRecord]]:
+        """N malzemenin bilgi kaydini **tek** cagride okur.
+
+        Gruplama satirdaki `Material` alanina gore yapilir (ECC sozlesmesinde
+        zorunlu alan, bkz. docs/ECC_ABAP_REQUIREMENTS.md). Istenmeyen bir
+        malzeme donerse yok sayilir.
+        """
+        ids = [m for m in dict.fromkeys(material_ids) if m]
+        if not ids:
+            return {}
+        cfg = self.settings.sap
+        rows = self._read(
+            "inforecord",
+            "InfoRecordSet",
+            filter_expr=_and(
+                _or_filter("Material", ids),
+                f"PurchasingOrganization eq '{quote(cfg.purch_org)}'",
+                "DeletionIndicator eq ''",
+            ),
+            expand=("ToScales",),
+            top=max(50, len(ids) * 10),
+        )
+        out: dict[str, list[InfoRecord]] = {mid: [] for mid in ids}
         for row in rows:
-            scales: dict[str, float] = {}
-            for scale in expanded_rows(row, "ToScales"):
-                qty = _opt_num(scale.get("ScaleQuantity"))
-                price = _opt_num(scale.get("ScalePrice"))
-                if qty is not None and price is not None:
-                    scales[str(qty)] = price
-            records.append(
-                InfoRecord(
-                    material_id=material_id,
-                    vendor_id=str(row.get("Supplier", "")),
-                    vendor_name=str(row.get("SupplierName") or ""),
-                    net_price=_num(row.get("NetPrice")),
-                    currency=str(row.get("Currency") or cfg.currency),
-                    price_unit=_int(row.get("PriceUnit"), 1) or 1,
-                    min_order_qty=_num(row.get("MinimumQuantity"), 1.0) or 1.0,
-                    planned_delivery_days=_int(row.get("PlannedDeliveryDays"), 14),
-                    incoterms=str(row.get("Incoterms") or "DAP"),
-                    payment_terms=str(row.get("PaymentTerms") or "NT30"),
-                    valid_to=parse_odata_datetime(row.get("ValidTo")),
-                    scale_prices=scales,
-                )
-            )
-        return records
+            material_id = str(row.get("Material", ""))
+            if material_id not in out:
+                continue
+            out[material_id].append(self._map_info_record(row, material_id))
+        return out
 
     def get_vendor(self, vendor_id: str) -> Vendor | None:
         rows = self._read(
@@ -925,17 +985,30 @@ class ECCSAPBackend(SAPBackend):
         diff: list[dict[str, Any]] = []
         total = 0.0
 
+        # Toplu okuma, TESISE gore gruplanir: malzeme ana verisi tesise ozgudur
+        # (`Plant eq ...`), dolayisiyla farkli tesislerdeki kalemler ayni
+        # sorguda okunamaz. Onceki hal kalem basina iki GET atiyordu; 10
+        # kalemli bir talep 20 round-trip demekti.
+        ids_by_plant: dict[str, list[str]] = {}
+        for item in items:
+            ids_by_plant.setdefault(item.plant or cfg.plant, []).append(item.material_id)
+        masters_by_plant: dict[str, dict[str, Material]] = {}
+        info_by_plant: dict[str, dict[str, list[InfoRecord]]] = {}
+        for item_plant, plant_ids in ids_by_plant.items():
+            masters_by_plant[item_plant] = self.get_materials(plant_ids, plant=item_plant)
+            info_by_plant[item_plant] = self.get_info_records_bulk(plant_ids, plant=item_plant)
+
         for idx, item in enumerate(items, start=1):
             item_no = idx * 10
             item_plant = item.plant or cfg.plant
-            master = self.get_material(item.material_id, plant=item_plant)
+            master = masters_by_plant.get(item_plant, {}).get(item.material_id)
             if master is None:
                 raise SAPError(
                     f"Malzeme {item.material_id} malzeme ana verisinde bulunamadi "
                     f"(tesis {item_plant}).",
                     code="MM_MATNR_NOT_FOUND",
                 )
-            records = self.get_info_records(item.material_id, plant=item_plant)
+            records = info_by_plant.get(item_plant, {}).get(item.material_id, [])
 
             chosen = None
             if item.preferred_vendor:

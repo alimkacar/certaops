@@ -161,6 +161,8 @@ def test_connection_health_reports_guardrails(ctx, run_tool):
     result = run_tool("sap_connection_health", ctx)
     assert result["sap"]["status"] == "ok"
     assert "dry_run" in result["guardrails"]
+    assert result["guardrails"]["agent_auth_mode"] == ctx.settings.security.auth_mode
+    assert result["guardrails"]["sap_auth_mode"] == ctx.settings.sap.auth_mode
     assert result["actor"]["subject"]
     # Allowlist tanimli degilse uyarilmali.
     assert any("allowlist" in w for w in result.get("warnings", []))

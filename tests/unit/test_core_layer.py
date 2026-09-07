@@ -420,6 +420,12 @@ def test_router_falls_back_without_keyword_match(purchaser):
     assert "procurement_write" not in decision.packs
 
 
+def test_router_tolerates_common_stock_typo(purchaser):
+    decision = route("4500000015 malzeme soku ne durumda", purchaser)
+    assert "procurement_read" in decision.packs
+    assert not decision.fallback
+
+
 def test_router_reports_packs_omitted_by_max_pack_limit(purchaser):
     decision = route(
         "baglanti malzeme stok satinalma talebi fatura maliyet rapor",

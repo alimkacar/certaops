@@ -177,7 +177,7 @@ class GeminiProvider:
         from google.genai import types
 
         tools = []
-        if request.functions:
+        if request.functions and request.tool_choice != "none":
             tools = [
                 types.Tool(
                     function_declarations=[
@@ -204,6 +204,13 @@ class GeminiProvider:
         }
         if tools:
             kwargs["tools"] = tools
+            if request.tool_choice == "required":
+                # ANY yalniz modelin bir declaration secmesini zorlar.
+                # automatic_function_calling kapali kaldigi icin SDK araci
+                # kendi basina yurutemez.
+                kwargs["tool_config"] = types.ToolConfig(
+                    function_calling_config=types.FunctionCallingConfig(mode="ANY")
+                )
         # DIKKAT: temperature/top_p/top_k/candidate_count BILEREK yok.
         # Gemini 3 bunlari kaldirdi; gondermek istegi bozar.
 

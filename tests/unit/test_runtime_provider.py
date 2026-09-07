@@ -14,6 +14,7 @@ degismezleri**:
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -33,6 +34,9 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setenv("MODEL_PROVIDER", "fake")
     monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("AGENT_DIRECT_ANSWERS", "true")
+    # Eski testlerin provider senaryolari yalniz ana yanit dongusunu surer.
+    # Model-router davranisi asagidaki ozel testlerde acikca etkinlestirilir.
+    monkeypatch.setenv("AGENT_ROUTER_MODEL_FALLBACK", "false")
     monkeypatch.setenv("SAP_DRY_RUN", "true")
     # Bu modul gelecek write paketinin tekrar/timeout degismezlerini de sinar.
     # Urun varsayilani baska testlerde read-only olarak dogrulanir.
@@ -89,6 +93,118 @@ def test_domain_ayrimi_prompt_ve_pack_olarak_korunur(env):
     closed = set(DOMAIN_PROFILES) - {p.key for p in opened}
     for key in closed:
         assert DOMAIN_PROFILES[key].mission[:40] not in request.system
+
+
+def test_domain_gecisinde_eski_rol_iddiasi_modele_tasinmaz(env):
+    from certaops.providers import ModelMessage
+
+    configured = replace(
+        env, agent=replace(env.agent, direct_answers_enabled=False)
+    )
+    runtime, provider = build(
+        configured,
+        [
+            tool_call("sap_stock_overview", {"material_ids": ["4500000015"]}),
+            reply("SAP sonucu ozetlendi."),
+        ],
+    )
+    runtime.messages = [
+        ModelMessage(role="user", text="baglantiyi kontrol et", context_key="platform"),
+        ModelMessage(
+            role="assistant",
+            text="Ben Platform ve Teshis agentiyim; stok tool'um yok.",
+            context_key="platform",
+        ),
+    ]
+
+    turn = runtime.chat("4500000015 malzeme stoku ne durumda")
+
+    first = provider.requests[0]
+    sent_text = " ".join(message.text for message in first.messages)
+    assert "stok tool'um yok" not in sent_text
+    assert first.tool_choice == "required"
+    assert "sap_stock_overview" in provider.offered_tools(0)
+    assert turn.tool_calls[0].name == "sap_stock_overview"
+
+
+def test_guncel_sap_sorgusunda_aracsiz_model_metni_reddedilir(env):
+    configured = replace(
+        env, agent=replace(env.agent, direct_answers_enabled=False)
+    )
+    runtime, provider = build(
+        configured, [reply("Yetkim yok; stok aracina erisimim yok.")]
+    )
+
+    turn = runtime.chat("4500000015 malzeme stoku ne durumda")
+
+    assert provider.last_request.tool_choice == "required"
+    assert not turn.tool_calls
+    assert "Yetkim yok" not in turn.text
+    assert "Veri dogrulanmadi" in turn.text
+    assert turn.needs_review
+
+
+def test_belirsiz_router_metni_dlp_sonrasi_modelle_siniflandirir(env):
+    configured = replace(
+        env,
+        agent=replace(
+            env.agent,
+            direct_answers_enabled=False,
+            router_model_fallback=True,
+        ),
+    )
+    runtime, provider = build(
+        configured,
+        [
+            tool_call(
+                "select_sap_packs",
+                {
+                    "packs": ["procurement_read"],
+                    "confidence": 0.93,
+                    "needs_clarification": False,
+                },
+            ),
+            tool_call("sap_stock_overview", {"material_ids": ["M-100"]}),
+            reply("Sonuc hazir."),
+        ],
+    )
+
+    turn = runtime.chat(
+        "Bearer abcdefghijklmnop M-100 kullanilabilirlik fotografini cikar "
+        "john@example.com"
+    )
+
+    router_request = provider.requests[0]
+    routed_text = router_request.messages[0].text
+    assert router_request.tool_choice == "required"
+    assert [f.name for f in router_request.functions] == ["select_sap_packs"]
+    assert "abcdefghijklmnop" not in routed_text
+    assert "john@example.com" not in routed_text
+    assert runtime.last_routing is not None
+    assert runtime.last_routing.source == "model"
+    assert "procurement_read" in turn.active_packs
+    assert turn.tool_calls[0].name == "sap_stock_overview"
+
+
+def test_model_router_da_emin_degilse_yanlis_rol_cevabi_uretmez(env):
+    configured = replace(
+        env,
+        agent=replace(
+            env.agent,
+            direct_answers_enabled=False,
+            router_model_fallback=True,
+        ),
+    )
+    runtime, provider = build(configured, [reply("Platform agentiyim; bu isi yapamam.")])
+
+    turn = runtime.chat("M-100 icin SAP kaydina bir bakabilir misin")
+
+    assert provider.call_count == 1
+    assert not turn.tool_calls
+    assert turn.stop_reason == "routing_clarification"
+    assert "Platform agentiyim" not in turn.text
+    assert "netlestiremedim" in turn.text
+    assert "SAP'ta sorgu yapilmadi" in turn.text
 
 
 # --- 3. Yetkisiz tool modele HIC gosterilmez --------------------------------

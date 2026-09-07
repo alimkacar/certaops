@@ -12,12 +12,18 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from html import unescape
 from typing import Any
 
 # Yeniden denenebilir HTTP durumlari (yazma islemlerinde yalniz idempotent
 # baglamda kullanilir; bkz. core.execution).
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 _HTML_TAG = re.compile(r"<[^>]+>")
+_ICF_LOGON = re.compile(r"logon failed|not authorized", re.IGNORECASE)
+_HTML_NOISE = re.compile(
+    r"<(?:style|script|svg|noscript)\b[^>]*>.*?</(?:style|script|svg|noscript)\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 class SAPError(RuntimeError):
@@ -93,6 +99,17 @@ class SAPFault:
     retry_after_s: float | None = None
     request_path: str = ""
     odata_version: str = ""
+    #: 401 yanitinda sunucunun gonderdigi `WWW-Authenticate` basligi.
+    #: Bir API gecidi arkasinda bu baslik BELIRLEYICIDIR: gecit kendi teknik
+    #: kullanicisini enjekte ediyorsa arkadaki ABAP sistemi cagirandan kimlik
+    #: ISTEMEZ. `Basic realm="SAP NetWeaver Application Server [EJS/100]"`
+    #: gorunuyorsa istek gecitten kimliksiz gecmistir; anahtari yenilemek
+    #: bunu degistirmez.
+    auth_challenge: str = ""
+    #: Ham govde ABAP ICF logon sayfasiydi. Ayristirma aninda isaretlenir:
+    #: mesaj temiz bir cumleye cevrildikten SONRA sayfayi metninden tanimak
+    #: mumkun olmuyor, ve tanima bilgisi remediation'i secen sey.
+    icf_logon_page: bool = False
 
     @property
     def is_retryable(self) -> bool:
@@ -115,6 +132,30 @@ class SAPFault:
     def is_csrf(self) -> bool:
         return self.http_status == 403 and "csrf" in self.message.lower()
 
+    @property
+    def is_icf_logon_page(self) -> bool:
+        """Yanit govdesi ABAP'in ICF logon sayfasi mi?
+
+        Ayrim teshis icin belirleyicidir: bir API gecidi (ornegin API Business
+        Hub'in Apigee katmani) gecersiz anahtarda JSON `fault` dondurur, HTML
+        degil. Bu sayfa gorunuyorsa istek gecidi GECMIS ve arkadaki ABAP
+        sistemine ulasmistir; reddeden odur. Anahtari yenilemek bu durumu
+        cozmez - servisin o sistemde acik olup olmadigina bakilir.
+        """
+        if self.http_status != 401:
+            return False
+        if self.icf_logon_page:
+            return True
+        if self.auth_challenge.strip().lower().startswith("basic"):
+            # ABAP dogrudan CAGIRANDAN Basic kimlik istiyor. Gecit kendi
+            # teknik kullanicisini eklemis olsaydi bu baslik hic gelmezdi.
+            # Mesaj temizlenmis olsa bile bu tek basina kesin kanittir.
+            return True
+        alt = self.message.lower()
+        if "apikey" in alt or "api key" in alt:
+            return False
+        return bool(_ICF_LOGON.search(alt))
+
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "http_status": self.http_status,
@@ -133,7 +174,35 @@ class SAPFault:
             payload["retry_after_s"] = self.retry_after_s
         if self.is_concurrency:
             payload["conflict"] = "ETag uyusmazligi; kaydi yeniden okuyup diff'i tekrar onaylatin."
-        if self.is_authorization:
+        if self.http_status == 401:
+            # 401 bir YETKI hatasi degildir: sistem cagiranin kim oldugunu
+            # dogrulayamamistir. Ikisini ayni cumleyle anlatmak kullaniciyi
+            # rol/yetki nesnesi aramaya gonderir - yanlis yere.
+            payload["authorization"] = (
+                "Kimlik dogrulama reddedildi (401). Bu bir is yetkisi sorunu degil, "
+                "baglanti kimligi sorunudur."
+            )
+            if self.auth_challenge:
+                payload["auth_challenge"] = self.auth_challenge
+            if self.is_icf_logon_page:
+                payload["remediation"] = (
+                    "Yanit ABAP ICF logon sayfasi: istek API gecidini GECTI, "
+                    "arkadaki SAP sistemi logon'u reddetti"
+                    + (f" ({self.auth_challenge})" if self.auth_challenge else "")
+                    + ". Bu bir anahtar sorunu DEGILDIR: gecersiz anahtarda gecit "
+                    "JSON `fault` dondururdu, kota asiminda 429 donerdi. Anahtarin "
+                    "canli oldugunu ayni anahtarla farkli bir sandbox urunune "
+                    "istek atarak dogrulayin: python scripts/teshis_401.py. "
+                    "Tum servislerde ayni hata varsa hedef sistem topluca "
+                    "erisilemez durumdadir ve duzeltme SAP tarafindadir; yalniz "
+                    f"bazi servislerde varsa '{self.target_api}' o sistemde acik degildir."
+                )
+            else:
+                payload["remediation"] = (
+                    "API anahtari/token gecerliligini dogrulayin; ardindan "
+                    "sap_connection_health tool'unu calistirin."
+                )
+        elif self.is_authorization:
             payload["authorization"] = "Eksik SAP yetkisi. Yetki nesnesi/rol kontrolu gerekiyor."
         return payload
 
@@ -147,7 +216,12 @@ class SAPFault:
 
 
 def _strip_html(text: str) -> str:
-    cleaned = _HTML_TAG.sub(" ", text)
+    # Etiketleri tek basina silmek yetmez: <style> govdesindeki CSS, onceki
+    # uygulamada kullaniciya yuzlerce karakter olarak siziyordu. Once gorunur
+    # olmayan bloklari govdesiyle birlikte at, sonra kalan metni duzlestir.
+    cleaned = _HTML_NOISE.sub(" ", text)
+    cleaned = _HTML_TAG.sub(" ", cleaned)
+    cleaned = unescape(cleaned)
     return " ".join(cleaned.split())
 
 
@@ -224,8 +298,37 @@ def parse_sap_error(
                 int(numeric_severity), "error"
             )
 
+    if not message and isinstance(parsed, dict):
+        # API gecidi (Apigee) kendi hatasini OData semasiyla degil `fault` ile
+        # dondurur. Ham JSON'u kullaniciya bosaltmak yerine okunur alani al:
+        # "Invalid ApiKey" ile "Failed to resolve API Key" ayrimi teshiste
+        # dogrudan kullaniliyor (anahtar yanlis mi, hic gitmedi mi).
+        gecit = parsed.get("fault")
+        if isinstance(gecit, dict):
+            message = str(gecit.get("faultstring", "") or "")
+            ayrinti = gecit.get("detail")
+            if isinstance(ayrinti, dict) and not code:
+                code = str(ayrinti.get("errorcode", "") or "")
+
+    challenge = ""
+    if hasattr(headers, "get"):
+        challenge = str(headers.get("www-authenticate") or "")
+
+    icf = False
     if not message:
-        message = _strip_html(body)[:500] or f"HTTP {status_code}"
+        duz = _strip_html(body)
+        icf = status_code == 401 and bool(
+            challenge.strip().lower().startswith("basic") or _ICF_LOGON.search(duz)
+        )
+        if icf:
+            # Ham logon sayfasini kullaniciya bosaltmak teshis degil gurultu:
+            # sayfa hep ayni ve cagiranin dilinde geliyor. Belirleyici bilgi
+            # sayfanin metni degil, sunucunun kimlik istemesidir.
+            message = "Oturum acma reddedildi (ABAP ICF logon sayfasi)"
+            if challenge:
+                message += f"; sunucu kimlik istiyor: {challenge.strip()[:120]}"
+        else:
+            message = duz[:500] or f"HTTP {status_code}"
 
     if not correlation_id and hasattr(headers, "get"):
         correlation_id = (
@@ -246,6 +349,8 @@ def parse_sap_error(
         retry_after_s=_retry_after(headers),
         request_path=request_path,
         odata_version=odata_version,
+        auth_challenge=challenge,
+        icf_logon_page=icf,
     )
 
 

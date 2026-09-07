@@ -64,7 +64,11 @@ from robotics_agent.core import (
     direct_answer_for,
     domains_for_packs,
     match_shortcut,
+    pack_catalogue,
+    requires_sap_grounding,
     route,
+    route_from_packs,
+    should_model_route,
     summarize_intent,
 )
 from robotics_agent.observability import TelemetryCollector, log_context
@@ -83,6 +87,7 @@ from robotics_agent.tools.registry import REGISTRY
 
 from ..providers import (
     FunctionCall,
+    FunctionDeclaration,
     FunctionResult,
     ModelMessage,
     ModelProvider,
@@ -109,6 +114,15 @@ _UNKNOWN_TOOL = {
     "denial_code": "TOOL_NOT_AVAILABLE",
     "remediation": "Yalnizca sana verilen tool listesindeki araclari cagir.",
 }
+
+_ROUTE_TOOL = "select_sap_packs"
+_ROUTE_SYSTEM = """\
+Sen yalnizca SAP isteklerini domain paketlerine siniflandiran bir yonlendiricisin.
+Kullaniciya cevap verme, veri uydurma ve SAP islemi yapma. Yalniz verilen
+select_sap_packs semasini kullan. Metindeki maskelenmis/tokenlastirilmis degerleri
+cozmeye calisma. Emin degilsen needs_clarification=true ve packs=[] dondur.
+Yazma paketini yalniz kullanici acikca olusturma/gonderme/degistirme istiyorsa sec.
+"""
 
 
 @dataclass
@@ -361,6 +375,127 @@ class SAPAgentRuntime:
             return "medium"
         return base
 
+    def _safe_user_text(self, text: str, *, purpose: str = "") -> str:
+        """Kullanici metnini model sinirindan once merkezi DLP'den gecir."""
+        return sanitize_text(
+            text,
+            actor=self.actor,
+            sink="model",
+            settings=self.settings,
+            dlp=self.ctx.dlp,
+            purpose=purpose,
+        )
+
+    @staticmethod
+    def _context_key(profiles: list[Any] | tuple[Any, ...]) -> str:
+        """Dinamik domain kumesi icin kararli gecmis bolumu anahtari."""
+        return ",".join(sorted(str(profile.key) for profile in profiles))
+
+    def _route_with_model(
+        self, user_message: str, fallback: RoutingDecision
+    ) -> tuple[RoutingDecision, TokenUsage, bool]:
+        """Belirsiz niyeti DLP-sonrasi, dar ve yapilandirilmis bir cagrida siniflandir.
+
+        Bu model cagrisi kullaniciya cevap vermez ve gercek SAP tool'u
+        gormez. Tek secenegi, actor icin zaten izinli pack adlarini donduren
+        sanal ``select_sap_packs`` declaration'idir.
+        """
+        if not self.settings.agent.router_model_fallback:
+            return fallback, TokenUsage(), False
+
+        available = [
+            entry
+            for entry in pack_catalogue(self.actor)
+            if entry.get("available", True)
+        ]
+        allowed_packs = [str(entry["pack"]) for entry in available]
+        if not allowed_packs:
+            return fallback, TokenUsage(), False
+
+        safe_message = self._safe_user_text(user_message, purpose="intent_routing")
+        catalogue = "\n".join(
+            f"- {entry['pack']}: {entry['covers']}" for entry in available
+        )
+        declaration = FunctionDeclaration(
+            name=_ROUTE_TOOL,
+            description=(
+                "Kullanici istegine uyan en fazla iki SAP tool paketini sec. "
+                "Emin degilsen clarification iste."
+            ),
+            parameters={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "packs": {
+                        "type": "array",
+                        "maxItems": 2,
+                        "items": {"type": "string", "enum": allowed_packs},
+                    },
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "needs_clarification": {"type": "boolean"},
+                },
+                "required": ["packs", "confidence", "needs_clarification"],
+            },
+        )
+        request = ModelRequest(
+            system=f"{_ROUTE_SYSTEM}\n# Izinli paketler\n{catalogue}",
+            messages=(ModelMessage(role="user", text=safe_message),),
+            functions=(declaration,),
+            tool_choice="required",
+            max_output_tokens=max(
+                64, min(self.settings.agent.router_model_max_tokens, 512)
+            ),
+            thinking_level="minimal",
+            stream=False,
+            timeout_s=self.settings.model.timeout_s,
+            store=False,
+        )
+        try:
+            response = self.provider.generate(request)
+        except ModelProviderError as exc:
+            log.warning("model router kullanilamadi | %s | %s", exc.kind, exc.provider)
+            return fallback, TokenUsage(), True
+
+        selected: list[str] = []
+        confidence = 0.0
+        clarification = True
+        if response.status in HEALTHY_PROVIDER_STATUSES:
+            call = next((c for c in response.function_calls if c.name == _ROUTE_TOOL), None)
+            if call is not None:
+                raw_packs = call.arguments.get("packs")
+                if isinstance(raw_packs, list):
+                    selected = [str(pack) for pack in raw_packs]
+                try:
+                    confidence = float(call.arguments.get("confidence", 0.0))
+                except (TypeError, ValueError):
+                    confidence = 0.0
+                clarification = bool(call.arguments.get("needs_clarification", False))
+
+        threshold = max(
+            0.0, min(float(self.settings.agent.router_model_min_confidence), 1.0)
+        )
+        accepted = bool(selected) and not clarification and confidence >= threshold
+        decision = (
+            route_from_packs(selected, self.actor, confidence=confidence)
+            if accepted
+            else fallback
+        )
+        assert self.ctx.audit and self.ctx.execution
+        self.ctx.audit.append(
+            "router.model_fallback",
+            execution=self.ctx.execution,
+            outcome="ok" if accepted else "needs_clarification",
+            detail={
+                "accepted": accepted,
+                "packs": list(decision.packs) if accepted else [],
+                "confidence": round(confidence, 3),
+                "input_redacted": safe_message != user_message,
+            },
+            model=self.ctx.model,
+            prompt_version=self.prompt_version,
+        )
+        return decision, response.usage, True
+
     # --- Yardimcilar --------------------------------------------------------
     def _compact_history(self) -> int:
         """Eski tool sonuclarini kisaltir; son N tanesi tam kalir."""
@@ -393,6 +528,7 @@ class SAPAgentRuntime:
                 text=message.text,
                 function_calls=message.function_calls,
                 function_results=tuple(updated),
+                context_key=message.context_key,
                 provider_state=message.provider_state,
             )
         return trimmed
@@ -483,7 +619,9 @@ class SAPAgentRuntime:
         return result
 
     # --- Kisayol (model cagrilmadan) ---------------------------------------
-    def _try_shortcut(self, user_message: str, execution: ExecutionContext) -> AgentTurn | None:
+    def _try_shortcut(
+        self, user_message: str, execution: ExecutionContext, *, context_key: str
+    ) -> AgentTurn | None:
         """Soru deterministik olarak tek bir okuma tool'una esleniyor mu?
 
         Eslesirse tool yine ``execute_tool`` uzerinden (policy + DLP + audit)
@@ -542,8 +680,13 @@ class SAPAgentRuntime:
                 model="(atlandi)",
                 prompt_version=self.prompt_version,
             )
-            self.messages.append(ModelMessage(role="user", text=user_message))
-            self.messages.append(ModelMessage(role="assistant", text=text))
+            safe_user = self._safe_user_text(user_message, purpose="conversation")
+            self.messages.append(
+                ModelMessage(role="user", text=safe_user, context_key=context_key)
+            )
+            self.messages.append(
+                ModelMessage(role="assistant", text=text, context_key=context_key)
+            )
             return AgentTurn(
                 text=text,
                 tool_calls=[
@@ -557,6 +700,7 @@ class SAPAgentRuntime:
                 execution_id=execution.execution_id,
                 correlation_id=execution.correlation_id,
                 active_packs=list(self.active_packs),
+                active_domains=context_key.split(",") if context_key else [],
                 direct_answer=True,
                 direct_answer_reason="shortcut_error",
                 model_calls=0,
@@ -579,8 +723,13 @@ class SAPAgentRuntime:
             prompt_version=self.prompt_version,
         )
         log.info("dogrudan yanit | kisayol=%s | saglayici cagrilmadi", match.shortcut.name)
-        self.messages.append(ModelMessage(role="user", text=user_message))
-        self.messages.append(ModelMessage(role="assistant", text=answer.text))
+        safe_user = self._safe_user_text(user_message, purpose="conversation")
+        self.messages.append(
+            ModelMessage(role="user", text=safe_user, context_key=context_key)
+        )
+        self.messages.append(
+            ModelMessage(role="assistant", text=answer.text, context_key=context_key)
+        )
         return AgentTurn(
             text=answer.text,
             tool_calls=[
@@ -589,6 +738,7 @@ class SAPAgentRuntime:
             execution_id=execution.execution_id,
             correlation_id=execution.correlation_id,
             active_packs=list(self.active_packs),
+            active_domains=context_key.split(",") if context_key else [],
             direct_answer=True,
             direct_answer_reason=answer.reason,
             model_calls=0,
@@ -653,17 +803,108 @@ class SAPAgentRuntime:
         )
         self.ctx.metrics = metrics
 
-        shortcut = self._try_shortcut(user_message, execution)
+        # Once ucuz kural tabanli route hesaplanir. Boylece kisayol turu da
+        # onceki turun pack bilgisini tasimaz ve dogru domainle kaydedilir.
+        decision = route(user_message, self.actor)
+        self.active_packs = list(decision.packs)
+        self.last_routing = decision
+        profiles = profiles_for_packs(self.active_packs)
+        context_key = self._context_key(profiles)
+
+        shortcut = self._try_shortcut(
+            user_message, execution, context_key=context_key
+        )
         if shortcut is not None:
             self.telemetry.finish_turn(metrics)
             self.ctx.metrics = None
             return shortcut
 
-        # Deterministik router: LLM KULLANMAZ.
-        decision = route(user_message, self.actor)
+        # Kural tabanli router emin degilse yalnizca DLP'den gecirilmis soru,
+        # gercek SAP tool'larini gormeyen dar bir model siniflandiricisina gider.
+        routing_usage = TokenUsage()
+        routing_model_calls = 0
+        if decision.fallback and should_model_route(user_message):
+            decision, routing_usage, routed_by_model = self._route_with_model(
+                user_message, decision
+            )
+            routing_model_calls = int(routed_by_model)
         self.active_packs = list(decision.packs)
         self.last_routing = decision
         profiles = profiles_for_packs(self.active_packs)
+        context_key = self._context_key(profiles)
+
+        # Dar model-router da yeterince emin degilse diagnostics profiliyle
+        # genel cevap modeline devam etmek eski hatayi yeniden uretir:
+        # model, aslinda var olan stok/fatura araclari icin "yetkim yok"
+        # diyebilir. Belirsizligi burada durdurup kullanicidan nesne/domain
+        # isteriz; hicbir SAP cagrisi yapilmaz ve tahmin uretilmez.
+        if routing_model_calls and decision.fallback:
+            safe_user_message = self._safe_user_text(
+                user_message, purpose="conversation"
+            )
+            clarification_text = sanitize_for_client(
+                "[Istegi hangi SAP alaninda calistiracagimi netlestiremedim. "
+                "Malzeme/stok, satinalma siparisi, fatura/odeme veya baglanti "
+                "kontrolunden hangisini istediginizi ve varsa SAP numarasini "
+                "yazin. SAP'ta sorgu yapilmadi.]",
+                actor=self.actor,
+                settings=self.settings,
+                dlp=self.ctx.dlp,
+            )
+            self.messages.append(
+                ModelMessage(
+                    role="user", text=safe_user_message, context_key=context_key
+                )
+            )
+            self.messages.append(
+                ModelMessage(
+                    role="assistant",
+                    text=clarification_text,
+                    context_key=context_key,
+                )
+            )
+            turn = AgentTurn(
+                text=clarification_text,
+                input_tokens=routing_usage.input_tokens,
+                output_tokens=routing_usage.output_tokens,
+                cache_read_tokens=routing_usage.cached_input_tokens,
+                reasoning_tokens=routing_usage.reasoning_tokens,
+                stop_reason="routing_clarification",
+                active_packs=list(self.active_packs),
+                active_domains=[p.key for p in profiles],
+                execution_id=execution.execution_id,
+                correlation_id=execution.correlation_id,
+                model_calls=routing_model_calls,
+                provider=self.provider.name,
+                model=self.provider.model,
+                needs_review=True,
+            )
+            metrics.active_packs = tuple(self.active_packs)
+            metrics.uncached_input_tokens += routing_usage.input_tokens
+            metrics.cache_read_tokens += routing_usage.cached_input_tokens
+            metrics.output_tokens += routing_usage.output_tokens
+            metrics.reasoning_tokens += routing_usage.reasoning_tokens
+            metrics.needs_review = True
+            assert self.ctx.audit
+            self.ctx.audit.append(
+                "turn.completed",
+                execution=execution,
+                outcome="needs_clarification",
+                detail={
+                    "provider": self.provider.name,
+                    "model": self.provider.model,
+                    "model_calls": routing_model_calls,
+                    "tool_calls": 0,
+                    "domains": turn.active_domains,
+                    "usage": routing_usage.to_dict(),
+                },
+                model=self.ctx.model,
+                prompt_version=self.prompt_version,
+            )
+            self.telemetry.finish_turn(metrics)
+            self.ctx.metrics = None
+            return turn
+
         log.info(
             "router | packs=%s | domains=%s | intent=%r",
             ",".join(self.active_packs),
@@ -687,6 +928,7 @@ class SAPAgentRuntime:
             provider=self.provider.name,
             model=self.provider.model,
             schema_tokens=sum(estimate_tokens(d.to_dict()) for d in declarations),
+            model_calls=routing_model_calls,
         )
         metrics.schema_tokens = turn.schema_tokens
         metrics.active_packs = tuple(self.active_packs)
@@ -694,15 +936,21 @@ class SAPAgentRuntime:
             {"domain": p.key, "title": p.title, "packs": list(p.domain_packs)} for p in profiles
         ]
 
-        self.messages.append(ModelMessage(role="user", text=user_message))
+        safe_user_message = self._safe_user_text(user_message, purpose="conversation")
+        self.messages.append(
+            ModelMessage(
+                role="user", text=safe_user_message, context_key=context_key
+            )
+        )
         artifacts_before = len(self.ctx.artifacts)
         max_iterations = min(
             iteration_budget_for(self.active_packs), self.settings.agent.max_tool_iterations
         )
         executed: dict[str, FunctionResult] = {}
         fingerprints: dict[str, FunctionResult] = {}
-        usage = TokenUsage()
+        usage = routing_usage
         budget_exhausted = False
+        grounding_required = requires_sap_grounding(user_message, decision)
 
         for iteration in range(1, max_iterations + 1):
             turn.iterations = iteration
@@ -721,11 +969,22 @@ class SAPAgentRuntime:
             turn.thinking_level = level
             request = ModelRequest(
                 system=system,
-                messages=self._history_for_provider(),
+                messages=self._history_for_provider(context_key=context_key),
                 functions=declarations if allow_tools else (),
+                tool_choice=(
+                    "required"
+                    if grounding_required and iteration == 1 and allow_tools and declarations
+                    else "auto"
+                ),
                 max_output_tokens=self.settings.agent.max_tokens,
                 thinking_level=level,  # type: ignore[arg-type]
-                stream=self.stream and on_text is not None,
+                # Zorunlu-grounding turunda once function call dogrulanir;
+                # modelin aracsiz bir metni akisla erken gostermesine izin yok.
+                stream=(
+                    self.stream
+                    and on_text is not None
+                    and not (grounding_required and iteration == 1)
+                ),
                 timeout_s=self.settings.model.timeout_s,
                 store=self.settings.model.store_interactions,
             )
@@ -809,9 +1068,34 @@ class SAPAgentRuntime:
                     if self.actor is not None
                     else response.text
                 )
-                if on_text and not request.stream:
-                    on_text(turn.text)
-            self.messages.append(response.to_assistant_message())
+            assistant_message = replace(
+                response.to_assistant_message(), context_key=context_key
+            )
+            if (
+                not response.function_calls
+                and grounding_required
+                and iteration == 1
+                and not executed
+            ):
+                # Saglayici required tool secimini ihlal etse bile, kanitsiz
+                # "yetkim yok/tool yok" metni son kullaniciya gecmez.
+                turn.text = sanitize_for_client(
+                    "[Bu istek guncel SAP verisi gerektiriyor ancak model bir sorgu "
+                    "araci secmedi. Veri dogrulanmadi; yetki veya stok durumu hakkinda "
+                    "tahmin uretilmedi.]",
+                    actor=self.actor,
+                    settings=self.settings,
+                    dlp=self.ctx.dlp,
+                )
+                turn.needs_review = True
+                metrics.needs_review = True
+                assistant_message = ModelMessage(
+                    role="assistant", text=turn.text, context_key=context_key
+                )
+            self.messages.append(assistant_message)
+
+            if on_text and not request.stream and turn.text:
+                on_text(turn.text)
 
             if not response.function_calls:
                 break
@@ -878,11 +1162,27 @@ class SAPAgentRuntime:
             # Son tur atlama: sonuc kendi kendine yeterliyse payload'i
             # saglayiciya GERI GONDERMEYIZ.
             if self._finish_locally(turn, response.function_calls, results, iteration):
-                self.messages.append(ModelMessage(role="tool", function_results=tuple(results)))
-                self.messages.append(ModelMessage(role="assistant", text=turn.text))
+                self.messages.append(
+                    ModelMessage(
+                        role="tool",
+                        function_results=tuple(results),
+                        context_key=context_key,
+                    )
+                )
+                self.messages.append(
+                    ModelMessage(
+                        role="assistant", text=turn.text, context_key=context_key
+                    )
+                )
                 break
 
-            self.messages.append(ModelMessage(role="tool", function_results=tuple(results)))
+            self.messages.append(
+                ModelMessage(
+                    role="tool",
+                    function_results=tuple(results),
+                    context_key=context_key,
+                )
+            )
             turn.compacted_chars += self._compact_history()
             metrics.compacted_chars = turn.compacted_chars
         else:
@@ -933,7 +1233,7 @@ class SAPAgentRuntime:
         self.ctx.metrics = None
         return turn
 
-    def _history_for_provider(self) -> list[Any]:
+    def _history_for_provider(self, *, context_key: str = "") -> list[Any]:
         """Saglayiciya gidecek konusma gecmisi.
 
         Runtime'in bu surecte urettigi kayitlar zaten DLP'den gecmistir. Bir
@@ -945,16 +1245,23 @@ class SAPAgentRuntime:
         `messages_from_dicts()` ile ModelMessage olarak geri yuklendigi anda
         her sey "guvenilir" dalina dustu ve temizleme fiilen durdu.
         """
-        if self.actor is None or self._untrusted_before <= 0:
-            return list(self._messages)
         out: list[Any] = []
         for index, message in enumerate(self._messages):
-            if index >= self._untrusted_before:
-                out.append(message)
-                continue
-            out.append(
+            cleaned = (
                 _scrub(message, actor=self.actor, settings=self.settings, dlp=self.ctx.dlp)
+                if self.actor is not None and index < self._untrusted_before
+                else message
             )
+            # Tek runtime farkli domain prompt'lariyla calisir. Eski bir
+            # platform yanitindaki "stok tool'um yok" iddiasi supply-chain
+            # turuna tasinamaz. Mesajlar kalici oturumda korunur, fakat model
+            # yalniz ayni domain kumesinin gecmisini gorur.
+            if context_key and (
+                not isinstance(cleaned, ModelMessage)
+                or cleaned.context_key != context_key
+            ):
+                continue
+            out.append(cleaned)
         return out
 
     def _call_provider(self, request: ModelRequest, on_text):

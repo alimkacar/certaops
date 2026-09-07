@@ -367,3 +367,44 @@ def test_shared_rate_limit_is_not_divided_per_worker(tmp_path):
         ok, _ = limiters[index % 3].check("tenant:user")
         allowed += 1 if ok else 0
     assert allowed == 5
+
+
+def test_paylasilan_bellek_ici_baglanti_es_zamanli_yazmada_bozulmaz():
+    """`:memory:` durumunda tek baglanti tum thread'lerce paylasilir.
+
+    `check_same_thread=False` ile acilan bu baglanti uzerinde iki thread ayni
+    anda `BEGIN IMMEDIATE` calistirirsa sqlite "cannot start a transaction
+    within a transaction" atar ve iki islem ic ice girer. Sayacin toplami
+    limitten buyuk cikamaz: limit asilirsa yazma yolu serilestirilmemis
+    demektir.
+    """
+    import threading as _threading
+
+    from robotics_agent.channels.auth import SharedRateLimiter
+    from robotics_agent.core.store import StateDatabase
+
+    db = StateDatabase(":memory:")
+    limiter = SharedRateLimiter(20, db)
+    izinler: list[bool] = []
+    hatalar: list[BaseException] = []
+    kilit = _threading.Lock()
+
+    def calis() -> None:
+        for _ in range(10):
+            try:
+                allowed, _kalan = limiter.check("kova")
+            except BaseException as exc:  # noqa: BLE001 - hata testin konusu
+                with kilit:
+                    hatalar.append(exc)
+                return
+            with kilit:
+                izinler.append(allowed)
+
+    threads = [_threading.Thread(target=calis) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not hatalar, f"eszamanli yazma hata verdi: {hatalar[:3]}"
+    assert sum(izinler) == 20, f"limit 20 iken {sum(izinler)} istek gecti"

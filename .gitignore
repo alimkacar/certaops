@@ -53,3 +53,7 @@ schema-budget.txt
 # Arayuzden yapilan calisma zamani ayar degisiklikleri. Deployment'a ozgudur
 # ve surumlenmez; `.env` beyani her zaman kaynak dogrudur.
 config/overrides.json
+
+scripts/create_staj_defteri*.py
+scripts/create_certaops_uygulama_raporu.py
+docs/BILINEN_SORUN_SANDBOX_401.md

@@ -67,6 +67,9 @@ def agent(monkeypatch, tmp_path):
         "4500019014 numaralı siparişin durumu",
         "TG ile başlayan malzemeleri ara.",
         "1. HD-GEAR-CSF25-100 numaralı malzemenin stok durumunu göster.",
+        "4500000015 malzeme stoku ne durumda",
+        "4500000015 malzeme stoğu ne durumda",
+        "4500000015 malzeme soku ne durumda",
         "5105600118 numaralı tedarikçi faturasının durumunu göster.",
     ],
 )
@@ -114,6 +117,16 @@ def test_kisayol_tool_cagrisini_audit_eder(agent):
             "1. 21 numaralı malzemenin stok durumunu göster.",
             "sap_stock_overview",
             {"material_ids": ["21"]},
+        ),
+        (
+            "4500000015 malzeme stoku ne durumda",
+            "sap_stock_overview",
+            {"material_ids": ["4500000015"]},
+        ),
+        (
+            "4500000015 malzeme soku ne durumda",
+            "sap_stock_overview",
+            {"material_ids": ["4500000015"]},
         ),
         (
             "5100000001 numaralı tedarikçi faturasının durumunu göster.",
@@ -283,8 +296,20 @@ def test_kisayol_tool_hatasi_modele_dusmez(agent, monkeypatch):
     assert "SAP_UNAVAILABLE" in turn.text
 
 
-def test_bos_sonuc_dogrudan_donmez():
-    assert direct_answer_for("sap_stock_overview", {"materials": []}, reason="x") is None
+def test_bos_stok_sonucu_guvenli_bir_yokluk_cevabi_verir():
+    answer = direct_answer_for(
+        "sap_stock_overview",
+        {
+            "materials": [],
+            "not_found": ["M-404"],
+            "recommendation": "Malzeme numarasini ve tesisi dogrulayin.",
+        },
+        reason="shortcut",
+    )
+
+    assert answer is not None
+    assert "dogrulanamadi" in answer.text
+    assert "M-404" in answer.text
 
 
 def test_renderer_patlarsa_modele_duser(monkeypatch):

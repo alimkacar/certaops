@@ -344,6 +344,36 @@ def test_prepare_asla_yazmaz_ve_bulgulari_uretir(settings_factory, tmp_path, mat
     assert draft.is_submittable, "uyarilar engelleyici degildir"
 
 
+def test_cok_kalemli_pr_kalem_basina_cagri_yapmaz(settings_factory, tmp_path, material_row):
+    """Kalem sayisi artinca SAP cagri sayisi ARTMAMALI.
+
+    Onceki hal kalem basina bir `MaterialSet` ve bir `InfoRecordSet` GET'i
+    atiyordu (10 kalem = 20 round-trip). Taban sinif bunu zaten belgeliyor:
+    cagiran taraf toplu metodu kullanmali, adapter de onu ezmeli.
+    """
+    ikinci = dict(material_row)
+    ikinci["Material"] = "R-2000"
+    routes = _pr_routes(material_row)
+    routes["MaterialSet"] = [material_row, ikinci]
+    routes["InfoRecordSet"] = [
+        dict(routes["InfoRecordSet"][0]),
+        {**routes["InfoRecordSet"][0], "Material": "R-2000"},
+    ]
+    backend, fake = build_backend(settings_factory, tmp_path, routes)
+
+    draft = backend.prepare_purchase_requisition([
+        PurchaseRequisitionItem(material_id="R-1000", quantity=10, wbs_element="P-1"),
+        PurchaseRequisitionItem(material_id="R-2000", quantity=10, wbs_element="P-1"),
+    ])
+
+    assert len(fake.calls_to("MaterialSet")) == 1, "malzeme okumasi kalem basina yapiliyor"
+    assert len(fake.calls_to("InfoRecordSet")) == 1, "bilgi kaydi kalem basina okunuyor"
+    # Toplu okuma dogru kalemi dogru kayitla eslestirmeli.
+    assert [i["material_id"] for i in draft.items] == ["R-1000", "R-2000"]
+    assert all(i["vendor_id"] == "V-100" for i in draft.items)
+    assert fake.writes == []
+
+
 def test_submit_idempotency_anahtarini_govdeye_koyar(settings_factory, tmp_path, material_row):
     backend, fake = build_backend(
         settings_factory, tmp_path, _pr_routes(material_row),

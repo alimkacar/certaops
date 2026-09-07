@@ -427,6 +427,58 @@ def test_html_error_body_is_stripped():
     assert "Internal Error" in fault.message
 
 
+def test_html_error_drops_css_and_script_bodies():
+    fault = parse_sap_error(
+        status_code=401,
+        body=(
+            "<html><head><style>body { background: #fff; width: 100%; }</style>"
+            "<script>window.secret = 'x';</script></head>"
+            "<body><main>Logon failed</main></body></html>"
+        ),
+        headers={},
+        target_api="product",
+    )
+    # 401 + ICF logon sayfasi artik ham sayfa metni olarak degil, tek cumlelik
+    # deterministik mesaj olarak donuyor: sayfanin metni cagiranin diline gore
+    # degisiyor ve teshise hicbir sey katmiyordu.
+    assert fault.message.startswith("Oturum acma reddedildi")
+    assert fault.is_icf_logon_page
+    assert "background" not in fault.message
+    assert "window.secret" not in fault.message
+
+
+def test_icf_logon_challenge_is_decisive():
+    """`WWW-Authenticate` gelmesi = gecit kendi kimligini EKLEMEMIS.
+
+    Bu, "anahtarim mi olu" ile "arkadaki sistem mi reddediyor" ayrimini tek
+    basina kesinlestiriyor; sayfa metnine bakmaya gerek kalmiyor.
+    """
+    fault = parse_sap_error(
+        status_code=401,
+        body="<html><body>bilinmeyen sayfa</body></html>",
+        headers={"www-authenticate": 'Basic realm="SAP NetWeaver Application Server [EJS/100]"'},
+        target_api="supplier_invoice",
+    )
+    assert fault.is_icf_logon_page
+    payload = fault.to_dict()
+    assert "EJS/100" in payload["auth_challenge"]
+    assert "anahtar sorunu DEGILDIR" in payload["remediation"]
+
+
+def test_gateway_fault_is_not_confused_with_icf_logon():
+    """Gecersiz anahtar gecidin JSON `fault`'udur; ICF logon sayfasi degildir."""
+    fault = parse_sap_error(
+        status_code=401,
+        body='{"fault":{"faultstring":"Invalid ApiKey","detail":{"errorcode":"oauth.v2.InvalidApiKey"}}}',
+        headers={"content-type": "application/json"},
+        target_api="business_partner",
+    )
+    assert fault.message == "Invalid ApiKey"
+    assert fault.code == "oauth.v2.InvalidApiKey"
+    assert not fault.is_icf_logon_page
+    assert "anahtari/token gecerliligini" in fault.to_dict()["remediation"]
+
+
 def test_authorization_fault_is_classified():
     fault = parse_sap_error(status_code=403, body="", headers={}, target_api="x")
     assert fault.is_authorization
