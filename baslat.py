@@ -69,6 +69,16 @@ KIMLIKLER = [
 
 GEREKLI_MODULLER = ("fastapi", "uvicorn", "pydantic", "dotenv", "httpx")
 
+# `.env` yapilandirmasinin zorunlu kildigi pyproject extra'lari. Cekirdek
+# kurulum (`pip install -e .`) bunlari GETIRMEZ: anthropic saglayicisi ve
+# OIDC kimlik modu opsiyonel bagimliliktir. Secime gore kurulum hedefine
+# eklenir, yoksa "anthropic paketi kurulu degil" hatasi calisma aninda cikar.
+#   (.env anahtari, beklenen deger, pyproject extra, ice aktarma adi)
+EK_PAKETLER = (
+    ("MODEL_PROVIDER", "anthropic", "anthropic", "anthropic"),
+    ("AGENT_AUTH_MODE", "oidc", "oidc", "jwt"),
+)
+
 
 # ==========================================================================
 # Çıktı
@@ -270,41 +280,70 @@ def venv_python() -> Path:
 # ==========================================================================
 # 2) Bağımlılıklar
 # ==========================================================================
+def gerekli_ekler() -> list[tuple[str, str]]:
+    """`.env`in zorunlu kildigi (extra, ice_aktarma_adi) ciftleri."""
+    return [(extra, modul)
+            for anahtar, deger, extra, modul in EK_PAKETLER
+            if env_dosyasindan_oku(anahtar).lower() == deger]
+
+
 def moduller_var(py: Path) -> bool:
-    kod = "import " + ", ".join(GEREKLI_MODULLER)
+    moduller = list(GEREKLI_MODULLER) + [m for _, m in gerekli_ekler()]
+    kod = "import " + ", ".join(moduller)
+    basla = time.monotonic()
     try:
         subprocess.run([str(py), "-c", kod], check=True,
-                       capture_output=True, timeout=60)
+                       capture_output=True, timeout=180)
         return True
-    except (subprocess.SubprocessError, OSError):
+    except subprocess.TimeoutExpired:
+        uyari(f"içe aktarma denetimi {time.monotonic() - basla:.0f} sn'de yanıt vermedi")
+        return False
+    except subprocess.CalledProcessError as exc:
+        son = (exc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        if son:
+            uyari(f"içe aktarma başarısız: {son[-1]}")
+        return False
+    except OSError:
         return False
 
 
 def bagimliliklari_kur(py: Path) -> None:
+    bilgi("mevcut paketler denetleniyor…")
     if moduller_var(py):
         ok("kurulu")
         return
 
+    ekler = [e for e, _ in gerekli_ekler()]
+    hedef = f".[{','.join(ekler)}]" if ekler else "."
+    if ekler:
+        bilgi(f".env gereği ek paketler: {', '.join(ekler)}")
     bilgi("kuruluyor — ilk çalıştırmada birkaç dakika sürebilir…")
-    subprocess.run([str(py), "-m", "pip", "install", "--quiet", "--upgrade", "pip"],
-                   capture_output=True, timeout=300)
+    bilgi("pip çıktısı aşağıda akar; duruyorsa son satır nerede takıldığını gösterir")
+    print()
+    basla = time.monotonic()
+    subprocess.run([str(py), "-m", "pip", "install", "--upgrade", "pip"], timeout=300)
     try:
-        sonuc = subprocess.run([str(py), "-m", "pip", "install", "--quiet", "-e", "."],
-                               cwd=str(PROJE), capture_output=True, text=True, timeout=1800)
+        sonuc = subprocess.run([str(py), "-m", "pip", "install", "-e", hedef],
+                               cwd=str(PROJE), timeout=1800)
+    except subprocess.TimeoutExpired:
+        hata("Kurulum 30 dakikada bitmedi, iptal edildi.")
+        bilgi(f"Elle deneyin:  .venv/bin/python -m pip install -v -e '{hedef}'")
+        dur()
     except (subprocess.SubprocessError, OSError) as exc:
         hata(f"Kurulum çalıştırılamadı: {exc}")
         dur()
+    print()
+    bilgi(f"pip {time.monotonic() - basla:.0f} sn sürdü")
 
     if sonuc.returncode != 0:
-        hata("Bağımlılıklar kurulamadı.")
-        for satir in (sonuc.stderr or sonuc.stdout or "").strip().splitlines()[-15:]:
-            print(f"    {R.SOLUK}{satir}{R.SIFIR}")
+        hata("Bağımlılıklar kurulamadı — yukarıdaki pip çıktısına bakın.")
         bilgi("İnternet bağlantısını kontrol edip tekrar deneyin.")
-        bilgi("Elle kurulum:  .venv/bin/python -m pip install -e .")
+        bilgi(f"Elle kurulum:  .venv/bin/python -m pip install -e '{hedef}'")
         dur()
 
     if not moduller_var(py):
-        hata("Kurulum bitti ama fastapi/uvicorn içe aktarılamıyor.")
+        hata("Kurulum bitti ama gerekli paketler içe aktarılamıyor.")
+        bilgi(f"beklenen: {', '.join(list(GEREKLI_MODULLER) + [m for _, m in gerekli_ekler()])}")
         dur()
     ok("kuruldu")
 

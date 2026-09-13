@@ -57,3 +57,13 @@ config/overrides.json
 scripts/create_staj_defteri*.py
 scripts/create_certaops_uygulama_raporu.py
 docs/BILINEN_SORUN_SANDBOX_401.md
+
+# Kisisel calisma dosyalari: plan, karar notlari, gecici kopyalar.
+# Repo yalniz calisan kodu tasir; planlama not defteri disarida kalir.
+PROJE_KARAR_PLANI.md
+notes/
+_local/
+tmp/
+
+# Uretilen veya indirilen dokumanlar kaynak degildir (*.docx yukarida).
+*.pdf
