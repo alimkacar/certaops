@@ -14,8 +14,8 @@ Okuma anahtari
          Show API Key ile yenisini alin.
 
   ABAP HTML    ("Logon failed", "401 Not authorized", "SAP SE")
-      -> anahtar Apigee kapisini GECTI, arkadaki S/4HANA sandbox reddetti.
-         Sorun anahtarda degil: o servisin sandbox yolu/erisimi.
+      -> SAP oturum acmayi reddetti; sorgu sonucu alinamadi.
+         Bu yanit tek basina gecit kimliginin neden reddedildigini aciklamaz.
 
   HTTP 200     -> o servis calisiyor.
 
@@ -36,6 +36,7 @@ import urllib.error
 import urllib.request
 import zlib
 from pathlib import Path
+from urllib.parse import urlsplit
 
 KOK = Path(__file__).resolve().parents[1]
 
@@ -133,17 +134,28 @@ def tanı(kod: int, govde: bytes, ctype: str, challenge: str = "") -> str:
     if "apikey" in metin and "json" in ctype.lower():
         return "ANAHTAR GECERSIZ"
     if challenge.strip().lower().startswith("basic"):
-        # Belirleyici kanit: ABAP cagirandan Basic kimlik istiyor, yani gecit
-        # istegi kendi teknik kullanicisini EKLEMEDEN iletmis.
-        return "GECIT KIMLIK EKLEMEMIS"
+        return "SAP OTURUM REDDI" if "sap netweaver" in challenge.lower() else "KIMLIK REDDI"
     if "logon failed" in metin or "not authorized" in metin or "oturum" in metin:
-        return "ANAHTAR GECTI / SERVIS REDDETTI"
+        return "SAP OTURUM REDDI"
     return "?"
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """API anahtarini yonlendirmeyle baska hedefe tasima."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def main() -> int:
     cfg = env_yukle()
     taban = (cfg.get("SAP_BASE_URL") or "https://sandbox.api.sap.com/s4hanacloud").rstrip("/")
+    target = urlsplit(taban)
+    if (target.scheme, target.netloc, target.path.rstrip("/")) != (
+        "https", "sandbox.api.sap.com", "/s4hanacloud"
+    ):
+        print("Bu betik yalniz SAP S/4HANA sandbox icindir. Diger sistemlerde check_real_sap.py kullanin.", file=sys.stderr)
+        return 2
     anahtar = cfg.get("SAP_API_KEY", "")
     header = cfg.get("SAP_API_KEY_HEADER") or "APIKey"
 
@@ -153,7 +165,7 @@ def main() -> int:
 
     print(f"taban    : {taban}")
     print(f"header   : {header}")
-    print(f"anahtar  : {len(anahtar)} karakter, ilk4={anahtar[:4]} son4={anahtar[-4:]}")
+    print("anahtar  : ayarli (gizlendi)")
     print("-" * 78)
 
     baglam = ssl.create_default_context()
@@ -161,6 +173,7 @@ def main() -> int:
         baglam.check_hostname = False
         baglam.verify_mode = ssl.CERT_NONE
 
+    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=baglam), NoRedirect())
     sonuclar = []
     for etiket, servis, entity in HEDEFLER:
         url = f"{taban}/sap/opu/odata/sap/{servis}/{entity}?$top=1&$format=json"
@@ -174,7 +187,7 @@ def main() -> int:
             },
         )
         try:
-            with urllib.request.urlopen(istek, timeout=40, context=baglam) as yanit:
+            with opener.open(istek, timeout=20) as yanit:
                 kod, ham, ctype = yanit.status, yanit.read(8000), yanit.headers.get("content-type", "")
                 challenge = yanit.headers.get("www-authenticate", "") or ""
                 govde = coz(ham, yanit.headers.get("content-encoding", ""))
@@ -198,10 +211,8 @@ def main() -> int:
         print()
 
     # --- Kontrol grubu ------------------------------------------------------
-    # "Anahtar Apigee'yi geciyor" bir VARSAYIM. Kanit icin ayni URL'e iki
-    # bozuk istek atariz. Gecit devredeyse gecersiz anahtarda JSON `fault`
-    # dondurur; ayni Almanca logon sayfasi geliyorsa anahtarin dogru olup
-    # olmadigi yaniti hic degistirmiyor demektir - yani sorun anahtarda degil.
+    # Ayni sandbox icinde eksik ve gecersiz anahtar yanitlarini karsilastir.
+    # Bu kontrol tek basina SAP teknik kimligindeki arizanin nedenini kanitlamaz.
     print("-" * 78)
     print("KONTROL GRUBU (ayni URL, kasitli bozuk kimlik)")
     print()
@@ -210,14 +221,13 @@ def main() -> int:
         ("header HIC yok", None),
         ("uydurma anahtar", "x" * 32),
     ]
-    kontrol_ozetleri = []
     for etiket, sahte in denemeler:
         basliklar = {"Accept": "application/json", "Accept-Encoding": "identity"}
         if sahte is not None:
             basliklar[header] = sahte
         istek = urllib.request.Request(kontrol_url, headers=basliklar)
         try:
-            with urllib.request.urlopen(istek, timeout=40, context=baglam) as yanit:
+            with opener.open(istek, timeout=20) as yanit:
                 kod, ham, ctype = yanit.status, yanit.read(8000), yanit.headers.get("content-type", "")
                 govde = coz(ham, yanit.headers.get("content-encoding", ""))
         except urllib.error.HTTPError as exc:
@@ -226,77 +236,29 @@ def main() -> int:
         except Exception as exc:
             print(f"[ AG HATASI ] {etiket}: {exc}")
             continue
-        json_mu = "json" in ctype.lower() or govde.decode("utf-8", "replace").lstrip()[:1] in "{["
-        kontrol_ozetleri.append(json_mu)
         print(f"[ {kod} ] {etiket}")
         print(f"          content-type: {ctype or '(yok)'}")
         print(f"          {ozet(govde, ctype)}")
         print()
 
-    # --- Canlilik kontrolu --------------------------------------------------
-    # "Anahtar olmus mu, yoksa kota mi doldu?" sorusunu S/4 sandbox'i uzerinden
-    # cevaplayamayiz: o sistem zaten reddediyor. AYNI anahtari BASKA bir
-    # sandbox urunune gonderiyoruz. 200 gelirse anahtar canlidir ve hesap
-    # kotasi dolmamistir - o zaman sorun yalniz S/4 sandbox'inin arkasindadir.
-    print("-" * 78)
-    print("CANLILIK KONTROLU (ayni anahtar, farkli sandbox urunu)")
-    print()
-    canli = None
-    kontrol_urun = "https://sandbox.api.sap.com/successfactors/odata/v2/User?$top=1&$format=json"
-    istek = urllib.request.Request(
-        kontrol_urun,
-        headers={header: anahtar, "Accept": "application/json", "Accept-Encoding": "identity"},
-    )
-    try:
-        with urllib.request.urlopen(istek, timeout=40, context=baglam) as yanit:
-            kod, ham, ctype = yanit.status, yanit.read(4000), yanit.headers.get("content-type", "")
-            govde = coz(ham, yanit.headers.get("content-encoding", ""))
-    except urllib.error.HTTPError as exc:
-        kod, ham, ctype = exc.code, exc.read(4000), exc.headers.get("content-type", "")
-        govde = coz(ham, exc.headers.get("content-encoding", ""))
-    except Exception as exc:
-        kod, govde, ctype = 0, b"", ""
-        print(f"[ AG HATASI ] canlilik kontrolu: {exc}")
-    if kod:
-        canli = kod == 200
-        print(f"[ {kod} ] successfactors/odata/v2/User")
-        print(f"          {ozet(govde, ctype)}")
-        if canli:
-            print("          -> Anahtar CANLI ve kota dolmamis.")
-        elif kod == 429:
-            print("          -> KOTA ASILMIS: gunluk sandbox limitine takildiniz.")
-        else:
-            print("          -> Bu urun de reddetti; anahtarin kendisinden suphelenin.")
-    print()
-
     print("-" * 78)
     ok = [s for s in sonuclar if s[1] == 200]
-    olu = [s for s in sonuclar if s[2] == "ANAHTAR GECERSIZ"]
-    if olu and not ok:
-        print("SONUC: anahtar gecersiz/suresi dolmus. api.sap.com > Settings > Show API Key.")
-    elif ok:
-        print(f"SONUC: anahtar CALISIYOR ({len(ok)}/{len(sonuclar)} servis 200 dondu).")
-        print("       401 alan servisler sandbox'ta acik degil ya da yolu farkli;")
-        print("       kod tarafinda o alias'i devre disi birakin veya yolunu duzeltin.")
-    elif any(s[2] == "KOTA ASILDI" for s in sonuclar) or canli is False:
-        print("SONUC: kota/anahtar sorunu. Yukaridaki canlilik kontrolune bakin.")
-    elif kontrol_ozetleri and any(kontrol_ozetleri):
-        print("SONUC: gecit bozuk kimlikte JSON donuyor, senin anahtarinla ise")
-        print("       ABAP logon sayfasi geliyor. Yani anahtar KABUL EDILIYOR;")
-        print("       reddeden arkadaki S/4 sistemi. Yapilandirmanda duzeltilecek")
-        print("       bir sey yok.")
-        if canli:
-            print("       Canlilik kontrolu de ayni anahtarla 200 dondu:")
-            print("       anahtar da kota da saglam.")
-        if any(s[2] == "GECIT KIMLIK EKLEMEMIS" for s in sonuclar):
-            print("       WWW-Authenticate basligi geldi: ABAP CAGIRANDAN kimlik")
-            print("       istiyor. Gecit teknik kullanicisini eklemis olsaydi bu")
-            print("       baslik hic gelmezdi -> ariza SAP tarafinda.")
+    if len(ok) == len(sonuclar):
+        print("SONUC: Kontrol edilen tum servisler erisilebilir.")
+        return 0
+    if any(s[2] == "ANAHTAR GECERSIZ" for s in sonuclar):
+        print("SONUC: API anahtari reddedildi. Hub API Key ayarini kontrol edin.")
+    elif any(s[2] == "KOTA ASILDI" for s in sonuclar):
+        print("SONUC: Kota/hiz siniri bildirildi. Limitin yenilenmesini bekleyin.")
+    elif any(s[2] == "SAP OTURUM REDDI" for s in sonuclar):
+        print("SONUC: SAP oturum acmayi reddetti; is verisi dogrulanamadi.")
+        print("       Ayni servisi SAP Business Accelerator Hub Try Out ekraninda deneyin.")
+        print("       Orada da 401 varsa SAP destek kaydi acin veya erisilebilir bir sistem kullanin.")
+        print("       Bu yanit, teknik kimligin eksik/gecersiz/kilitli oldugunu ayirt etmez.")
     else:
-        print("SONUC: bozuk kimlikle de, dogru anahtarla da AYNI logon sayfasi geliyor.")
-        print("       Anahtarin dogru olup olmadigi yaniti degistirmiyor -> sorun")
-        print("       anahtarda degil, sandbox sisteminin kendisinde (SAP tarafi).")
-    return 0
+        print("SONUC: Bazi servisler erisilemedi; yukaridaki HTTP/ag hatalarini kontrol edin.")
+    print(f"       Erisilebilir servis: {len(ok)}/{len(sonuclar)}")
+    return 1
 
 
 if __name__ == "__main__":
